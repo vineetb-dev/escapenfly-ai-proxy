@@ -14,12 +14,12 @@ const WA_NUM = '919851739851';
 
 // ── TEAM ASSIGNMENT LOGIC ──
 const TEAM = {
-  domestic:   { name: 'Lalit Mehta',    email: 'lalit@escapenfly.com',    wa: '919XXXXXXXXX' },
-  shorthaul:  { name: 'Divya Nigam',    email: 'divya@escapenfly.com',    wa: '919XXXXXXXXX' },
-  longhaul:   { name: 'Anjan Pramanik', email: 'anjan@escapenfly.com',    wa: '919XXXXXXXXX' },
-  europe:     { name: 'Shubham',        email: 'shubham@escapenfly.com',   wa: '919XXXXXXXXX' },
-  flights:    { name: 'Prabhjot Singh', email: 'prabhjot@escapenfly.com', wa: '919XXXXXXXXX' },
-  visa:       { name: 'Damini',         email: 'damini@escapenfly.com',    wa: '919XXXXXXXXX' },
+  domestic:   { name: 'Lalit Mehta',    email: 'lalit@escapenfly.com',    wa: '916283285244' },
+  shorthaul:  { name: 'Divya Nigam',    email: 'divya@escapenfly.com',    wa: '917888871148' },
+  longhaul:   { name: 'Anjan Pramanik', email: 'anjan@escapenfly.com',    wa: '919875903349' },
+  europe:     { name: 'Shubham',        email: 'shubham@escapenfly.com',   wa: '919875921281' },
+  flights:    { name: 'Prabhjot Singh', email: 'prabhjot@escapenfly.com', wa: '919569933206' },
+  visa:       { name: 'Damini',         email: 'damini@escapenfly.com',    wa: '919888002635' },
   admin:      { name: 'Vineet Bansal',  email: 'vineet.b@escapenfly.com', wa: '919851739851' }
 };
 

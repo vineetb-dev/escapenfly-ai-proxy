@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto'); // FIX: was used but never imported — needed for randomUUID() to work reliably
 const app = express();
 
 app.use(cors({ origin: '*' }));
@@ -12,41 +13,61 @@ const SB_KEY = process.env.SUPABASE_KEY || 'sb_publishable_cXjJKnSOprBxp4CO0wQTs
 const AISENSY_KEY = process.env.AISENSY_KEY;
 const WA_NUM = '919851739851';
 
-// ── TEAM ASSIGNMENT LOGIC ──
+// ── TEAM ASSIGNMENT — FIXED to match real CRM emails (confirmed by Vineet 2 Jul 2026) ──
+// ⚠️ Previous version used lalit@escapenfly.com etc. — WRONG, did not match the CRM's
+// actual Admin panel emails. Fixed below. If any of the `wa` numbers are wrong/placeholder,
+// update them — they're used to send the WhatsApp notification to the assigned person.
 const TEAM = {
-  domestic:   { name: 'Lalit Mehta',    email: 'lalit@escapenfly.com',    wa: '916283285244' },
-  shorthaul:  { name: 'Divya Nigam',    email: 'divya@escapenfly.com',    wa: '917888871148' },
-  longhaul:   { name: 'Anjan Pramanik', email: 'anjan@escapenfly.com',    wa: '919875903349' },
-  europe:     { name: 'Shubham',        email: 'shubham@escapenfly.com',   wa: '919875921281' },
-  flights:    { name: 'Prabhjot Singh', email: 'prabhjot@escapenfly.com', wa: '919569933206' },
-  visa:       { name: 'Damini',         email: 'damini@escapenfly.com',    wa: '919888002635' },
-  admin:      { name: 'Vineet Bansal',  email: 'vineet.b@escapenfly.com', wa: '919851739851' }
+  lalit:   { name: 'Lalit Mehta',     email: 'sales6@escapenfly.com',   wa: '916283285244', dept: 'Domestic & Short Haul' },
+  divya:   { name: 'Divya Nigam',     email: 'sales1@escapenfly.com',   wa: '917888871148', dept: 'Short Haul & Island' },
+  anjan:   { name: 'Anjan Pramanick', email: 'sales3@escapenfly.com',   wa: '919875903349', dept: 'Long Haul' },
+  shubham: { name: 'Shubham',         email: 'sales7@escapenfly.com',   wa: '919875921281', dept: 'Short Haul & Long Haul' },
+  prabhjot:{ name: 'Prabhjot Singh',  email: 'support2@escapenfly.com', wa: '919569933206', dept: 'Air Tickets, Corporate & Catch-All' },
+  damini:  { name: 'Damini',          email: 'support3@escapenfly.com', wa: '919888002635', dept: 'Visa' },
+  admin:   { name: 'Vineet Bansal',   email: 'vineet.b@escapenfly.com', wa: '919851739851', dept: 'Admin' }
 };
 
-// Short haul destinations
-const SHORT_HAUL = ['dubai','uae','thailand','bangkok','phuket','bali','indonesia','singapore','malaysia','sri lanka','nepal','bhutan','maldives','mauritius','myanmar'];
-const LONG_HAUL  = ['usa','america','canada','australia','new zealand','japan','south korea','china','kenya','tanzania','africa','brazil','peru','argentina'];
-const EUROPE     = ['europe','france','paris','italy','rome','switzerland','spain','greece','germany','uk','london','amsterdam','portugal','croatia','turkey'];
+// Destination keyword lists — used only as a FALLBACK if the Claude call fails
+const ISLAND     = ['maldives','mauritius','seychelles','bali','lakshadweep'];
+const SHORT_HAUL = ['dubai','uae','thailand','bangkok','phuket','singapore','malaysia','sri lanka','nepal','bhutan','myanmar','middle east'];
+const LONG_HAUL  = ['usa','america','canada','australia','new zealand','japan','south korea','china','kenya','tanzania','africa','brazil','peru','argentina','europe','france','paris','italy','rome','switzerland','spain','greece','germany','uk','london','amsterdam','portugal','croatia','turkey'];
 const DOMESTIC   = ['india','kashmir','goa','rajasthan','himachal','kerala','ladakh','uttarakhand','northeast','andaman'];
 
-function assignTeam(data) {
-  const text = (data.destination + ' ' + data.query + ' ' + data.type).toLowerCase();
-  
-  if (text.includes('visa')) return TEAM.visa;
-  if (text.includes('flight') || text.includes('ticket') || text.includes('air')) return TEAM.flights;
-  if (EUROPE.some(d => text.includes(d))) return TEAM.europe;
-  if (LONG_HAUL.some(d => text.includes(d))) return TEAM.longhaul;
-  if (SHORT_HAUL.some(d => text.includes(d))) return TEAM.shorthaul;
-  if (DOMESTIC.some(d => text.includes(d))) return TEAM.domestic;
-  if (text.includes('group') || text.includes('corporate')) return TEAM.longhaul;
-  if (text.includes('honeymoon')) return TEAM.shorthaul;
-  
-  // Default round robin between Lalit and Divya for unknown
-  return Math.random() > 0.5 ? TEAM.domestic : TEAM.shorthaul;
-}
+// Round-robin state (resets on server restart — fine for current volume)
+let rrShortHaul = 0, rrLongHaul = 0;
+const shortHaulPool = ['lalit', 'divya', 'shubham'];
+const longHaulPool  = ['anjan', 'shubham'];
 
-// ── CLAUDE AI ──
-async function callClaude(system, message, maxTokens = 500) {
+// ── CLAUDE-BASED ASSIGNMENT (primary) ──
+async function assignTeamWithClaude(data) {
+  const teamList = Object.values(TEAM).filter(t => t.name !== 'Vineet Bansal')
+    .map(t => `- ${t.name}: ${t.dept}`).join('\n');
+
+  const prompt = `You are a routing assistant for a travel agency. Decide which team member should handle this enquiry.
+
+TEAM:
+${teamList}
+
+ROUTING RULES:
+- Visa-only → Damini
+- Flight/air-ticket-only, or Corporate/business travel → Prabhjot Singh
+- Domestic India → Lalit Mehta
+- Island (Maldives, Mauritius, Seychelles, Bali, Lakshadweep) → Divya Nigam
+- Short-haul international (Dubai, Thailand, Singapore, Sri Lanka, Nepal, Bhutan, Middle East) → split between Lalit Mehta, Divya Nigam, and Shubham
+- Long-haul international (Europe, UK, USA, Canada, Australia, Japan) → Anjan Pramanick or Shubham
+- If genuinely unclear or doesn't fit anywhere → Prabhjot Singh
+
+ENQUIRY:
+Name: ${data.name || 'Unknown'}
+Destination: ${data.destination || 'Not specified'}
+Travel Month: ${data.travelMonth || 'Not specified'}
+Pax: ${data.pax || 'Not specified'}
+Budget: ${data.budget || 'Not specified'}
+Query/Type: ${data.query || data.type || 'Not specified'}
+
+Respond with ONLY a JSON object, no other text:
+{"key": "lalit|divya|anjan|shubham|prabhjot|damini", "reasoning": "one short sentence"}`;
+
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -56,18 +77,43 @@ async function callClaude(system, message, maxTokens = 500) {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: maxTokens,
-        system,
-        messages: [{ role: 'user', content: message }]
+        model: 'claude-sonnet-4-6',
+        max_tokens: 200,
+        messages: [{ role: 'user', content: prompt }]
       })
     });
     const d = await r.json();
-    return d.content?.[0]?.text || '';
+    const text = d.content[0].text.trim().replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(text);
+    if (parsed.key && TEAM[parsed.key]) {
+      console.log(`Claude assigned → ${TEAM[parsed.key].name} (${parsed.reasoning})`);
+      return TEAM[parsed.key];
+    }
+    throw new Error('Claude returned unrecognized key: ' + parsed.key);
   } catch (e) {
-    console.error('Claude error:', e);
-    return '';
+    console.error('Claude assignment failed, using keyword fallback:', e.message);
+    return assignTeamFallback(data);
   }
+}
+
+// ── KEYWORD FALLBACK (only used if Claude call fails) ──
+function assignTeamFallback(data) {
+  const text = (data.destination + ' ' + data.query + ' ' + data.type).toLowerCase();
+
+  if (text.includes('visa')) return TEAM.damini;
+  if (text.includes('flight') || text.includes('ticket') || text.includes('air')) return TEAM.prabhjot;
+  if (text.includes('corporate') || text.includes('group')) return TEAM.prabhjot;
+  if (ISLAND.some(d => text.includes(d))) return TEAM.divya;
+  if (DOMESTIC.some(d => text.includes(d))) return TEAM.lalit;
+  if (LONG_HAUL.some(d => text.includes(d))) {
+    const key = longHaulPool[rrLongHaul % longHaulPool.length]; rrLongHaul++;
+    return TEAM[key];
+  }
+  if (SHORT_HAUL.some(d => text.includes(d)) || data.destination) {
+    const key = shortHaulPool[rrShortHaul % shortHaulPool.length]; rrShortHaul++;
+    return TEAM[key];
+  }
+  return TEAM.prabhjot; // unclear enquiry → catch-all
 }
 
 // ── SUPABASE ──
@@ -76,6 +122,9 @@ async function saveLead(data, assigned) {
     const id = crypto.randomUUID();
     const body = {
       id,
+      name: data.name || 'Unknown (WhatsApp)',
+      phone: data.phone || '',
+      dest: data.destination || '',
       assigned_to_email: assigned.email,
       assigned_to_name: assigned.name,
       source: data.source || 'whatsapp',
@@ -142,14 +191,10 @@ async function notifyTeam(assigned, leadData, leadId) {
     `🔗 Open CRM: https://escapenfly-crm.netlify.app\n\n` +
     `⚡ Please respond within 15 minutes!`;
 
-  // Send to assigned team member via AiSensy
   if (assigned.wa && assigned.wa !== '919XXXXXXXXX') {
     await sendWA(assigned.wa, 'team_lead_notification', [assigned.name, leadData.name, leadData.destination, 'https://escapenfly-crm.netlify.app']);
   }
-  
-  // Always notify Vineet too
   await sendWA(WA_NUM, 'team_lead_notification', ['Vineet', leadData.name, leadData.destination, assigned.name]);
-  
   console.log(`Team notified: ${assigned.name} for lead from ${leadData.phone}`);
 }
 
@@ -181,15 +226,14 @@ app.post('/ai', async (req, res) => {
 // ── AISENSY WEBHOOK (WhatsApp flow completion) ──
 app.post('/webhook/aisensy', async (req, res) => {
   res.json({ status: 'ok' }); // Respond immediately
-  
+
   try {
     const body = req.body;
     console.log('AiSensy webhook received:', JSON.stringify(body).slice(0, 200));
-    
-    // Extract data from AI Sensy flow attributes
+
     const phone = body.waId || body.phone || body.mobile;
     const attrs = body.attributes || body.customAttributes || {};
-    
+
     const leadData = {
       name: attrs.name || attrs.customer_name || body.userName || 'Unknown',
       phone: phone,
@@ -201,18 +245,13 @@ app.post('/webhook/aisensy', async (req, res) => {
       query: attrs.query || body.lastMessage || '',
       source: 'whatsapp-flow'
     };
-    
+
     if (!phone) return;
-    
-    // Assign team
-    const assigned = assignTeam(leadData);
-    
-    // Save to CRM
+
+    const assigned = await assignTeamWithClaude(leadData);
     const leadId = await saveLead(leadData, assigned);
-    
-    // Notify team
     await notifyTeam(assigned, leadData, leadId);
-    
+
     console.log(`Lead processed: ${leadData.name} → ${assigned.name}`);
   } catch (e) {
     console.error('Webhook error:', e);
@@ -221,7 +260,6 @@ app.post('/webhook/aisensy', async (req, res) => {
 
 // ── META LEAD ADS WEBHOOK ──
 app.get('/webhook/meta', (req, res) => {
-  // Meta webhook verification
   const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || 'escapenfly2024';
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -235,28 +273,27 @@ app.get('/webhook/meta', (req, res) => {
 
 app.post('/webhook/meta', async (req, res) => {
   res.json({ status: 'ok' });
-  
+
   try {
     const body = req.body;
     if (body.object !== 'page') return;
-    
+
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         if (change.field !== 'leadgen') continue;
-        
+
         const formData = change.value;
         const leadId_meta = formData.leadgen_id;
-        
-        // Fetch lead data from Meta Graph API
+
         if (process.env.META_ACCESS_TOKEN) {
           const metaR = await fetch(
             `https://graph.facebook.com/v18.0/${leadId_meta}?access_token=${process.env.META_ACCESS_TOKEN}`
           );
           const metaLead = await metaR.json();
-          
+
           const fields = {};
           (metaLead.field_data || []).forEach(f => { fields[f.name] = f.values?.[0] || ''; });
-          
+
           const leadData = {
             name: fields.full_name || fields.name || '',
             phone: fields.phone_number || fields.mobile || '',
@@ -266,12 +303,11 @@ app.post('/webhook/meta', async (req, res) => {
             query: fields.message || '',
             source: 'meta-ads'
           };
-          
-          const assigned = assignTeam(leadData);
+
+          const assigned = await assignTeamWithClaude(leadData);
           await saveLead(leadData, assigned);
           await notifyTeam(assigned, leadData, null);
-          
-          // Send immediate WhatsApp to the lead
+
           if (leadData.phone) {
             await sendWA(leadData.phone, 'meta_lead_welcome', [leadData.name || 'there', leadData.destination || 'your destination']);
           }
@@ -286,14 +322,13 @@ app.post('/webhook/meta', async (req, res) => {
 // ── WEBSITE LEAD ──
 app.post('/webhook/website', async (req, res) => {
   res.json({ status: 'ok' });
-  
+
   try {
     const leadData = { ...req.body, source: 'website-form' };
-    const assigned = assignTeam(leadData);
+    const assigned = await assignTeamWithClaude(leadData);
     const leadId = await saveLead(leadData, assigned);
     await notifyTeam(assigned, leadData, leadId);
-    
-    // Send welcome WhatsApp to customer
+
     if (leadData.phone) {
       await sendWA(
         leadData.phone,
@@ -307,10 +342,10 @@ app.post('/webhook/website', async (req, res) => {
 });
 
 // ── HEALTH ──
-app.get('/health', (req, res) => res.json({ 
-  status: 'ok', 
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '2.0',
+  version: '2.1',
   endpoints: ['/ai', '/webhook/aisensy', '/webhook/meta', '/webhook/website']
 }));
 

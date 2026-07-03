@@ -124,7 +124,7 @@ async function saveLead(data, assigned) {
       id,
       name: data.name || 'Unknown (WhatsApp)',
       phone: data.phone || '',
-      dest: data.destination || '',
+      destination: data.destination || '',
       assigned_to_email: assigned.email,
       assigned_to_name: assigned.name,
       source: data.source || 'whatsapp',
@@ -150,7 +150,12 @@ async function saveLead(data, assigned) {
       },
       body: JSON.stringify(body)
     });
-    console.log('Lead saved:', id, r.status);
+    if (r.ok) {
+      console.log('✅ Lead saved successfully:', id, r.status);
+    } else {
+      const errText = await r.text();
+      console.error('❌ Lead save FAILED:', id, r.status, '—', errText);
+    }
     return id;
   } catch (e) {
     console.error('Supabase error:', e);

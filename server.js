@@ -117,28 +117,66 @@ function assignTeamFallback(data) {
 }
 
 // ── SUPABASE ──
+// IMPORTANT (3 Jul 2026 fix v2): the enquiries table has NO top-level name/phone/destination
+// columns — the CRM (index.html sync('saveLead')) never writes them. It packs them inside
+// the original_message_text JSON, and mapLead() reads them back as ex.name / ex.phone / ex.dest.
+// The webhook body below now mirrors the CRM's own write exactly. Do not add columns here
+// unless the CRM also writes them.
 async function saveLead(data, assigned) {
   try {
     const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    // pax often arrives as free text (e.g. "2 adults, budget 1.5L") because the flow
+    // currently captures travellers+budget in one attribute — parse defensively.
+    const paxNum = parseInt(String(data.pax || '').match(/\d+/)?.[0], 10);
+    const budgetNum = parseFloat(String(data.budget || '').replace(/[^0-9.]/g, ''));
+
+    const notesText =
+      `Auto-captured via ${data.source || 'whatsapp'}\n` +
+      `Destination: ${data.destination || '-'}\n` +
+      `Travel: ${data.travelMonth || '-'}\n` +
+      `Pax: ${data.pax || '-'}\n` +
+      `Budget: ${data.budget || '-'}\n` +
+      `Query: ${data.query || '-'}`;
+
     const body = {
       id,
-      name: data.name || 'Unknown (WhatsApp)',
-      phone: data.phone || '',
-      destination: data.destination || '',
       assigned_to_email: assigned.email,
       assigned_to_name: assigned.name,
       source: data.source || 'whatsapp',
-      notes: `Name: ${data.name}\nPhone: ${data.phone}\nDestination: ${data.destination}\nBudget: ${data.budget}\nPax: ${data.pax}\nTravel: ${data.travelMonth}\nQuery: ${data.query}`,
-      original_message_text: JSON.stringify(data),
-      status: 'new',
+      enquiry_type: data.type || 'international',
+      pax_adults: Number.isFinite(paxNum) ? paxNum : 2,
+      pax_children: 0,
+      pax_infants: 0,
+      budget_max: Number.isFinite(budgetNum) && budgetNum > 0 ? budgetNum : null,
+      notes: notesText,
+      internal_notes: notesText,
+      // Keys here MUST match what the CRM's mapLead() reads: name, phone, email, dest, ...
+      original_message_text: JSON.stringify({
+        name: data.name || 'Unknown (WhatsApp)',
+        phone: data.phone || '',
+        email: data.email || '',
+        dest: data.destination || '',
+        dep: '', ret: '', nights: '',
+        hotelCat: '', isRepeat: 'no',
+        travelMonth: data.travelMonth || '',
+        pax: data.pax || '', budget: data.budget || '',
+        query: data.query || ''
+      }),
       priority: 'high',
+      status: 'new',
+      followup_date: null,
+      packages: [],
+      cost_rows: [],
+      cost_sets: [],
+      reminders: [],
+      history: [{ s: 'new', by: 'AutoBot', at: now, note: `Auto-assigned to ${assigned.name}` }],
       created_by: 'AutoBot',
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      last_activity_at: new Date().toISOString(),
-      is_deleted: false,
-      packages: [], reminders: [],
-      history: [{ s: 'new', by: 'AutoBot', at: new Date().toISOString(), note: `Auto-assigned to ${assigned.name}` }]
+      created_at: now,
+      updated_at: now,
+      last_activity_at: now,
+      is_deleted: false
     };
     const r = await fetch(`${SB_URL}/rest/v1/enquiries`, {
       method: 'POST',

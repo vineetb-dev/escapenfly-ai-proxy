@@ -267,29 +267,41 @@ app.post('/ai', async (req, res) => {
 });
 
 // ── AISENSY WEBHOOK (WhatsApp flow completion) ──
+// Guard (v2.2): if AiSensy ever fails to interpolate an attribute, the literal
+// string "$attribute_name" arrives. Treat any value starting with "$" as empty
+// so placeholder junk never lands in the CRM.
+const cleanAttr = v => {
+  if (typeof v !== 'string') return v;
+  const t = v.trim();
+  return t.startsWith('$') ? '' : t;
+};
+
 app.post('/webhook/aisensy', async (req, res) => {
   res.json({ status: 'ok' }); // Respond immediately
 
   try {
     const body = req.body;
-    console.log('AiSensy webhook received:', JSON.stringify(body).slice(0, 200));
+    console.log('AiSensy webhook received:', JSON.stringify(body).slice(0, 300));
 
-    const phone = body.waId || body.phone || body.mobile;
+    const phone = cleanAttr(body.waId || body.phone || body.mobile);
     const attrs = body.attributes || body.customAttributes || {};
 
     const leadData = {
-      name: attrs.name || attrs.customer_name || body.userName || 'Unknown',
+      name: cleanAttr(attrs.name || attrs.customer_name || body.userName) || 'Unknown (WhatsApp)',
       phone: phone,
-      destination: attrs.destination || attrs.dest || '',
-      travelMonth: attrs.travel_month || attrs.travel_date || '',
-      pax: attrs.pax || attrs.travellers || '',
-      budget: attrs.budget || '',
-      type: attrs.trip_type || '',
-      query: attrs.query || body.lastMessage || '',
+      destination: cleanAttr(attrs.destination || attrs.dest) || '',
+      travelMonth: cleanAttr(attrs.travel_month || attrs.travel_date) || '',
+      pax: cleanAttr(attrs.pax || attrs.travellers) || '',
+      budget: cleanAttr(attrs.budget) || '',
+      type: cleanAttr(attrs.trip_type) || '',
+      query: cleanAttr(attrs.query || body.lastMessage) || '',
       source: 'whatsapp-flow'
     };
 
-    if (!phone) return;
+    if (!phone) {
+      console.error('⚠️ Webhook had no usable phone number (waId/phone/mobile all empty or uninterpolated $placeholders) — lead NOT saved. Raw body logged above.');
+      return;
+    }
 
     const assigned = await assignTeamWithClaude(leadData);
     const leadId = await saveLead(leadData, assigned);
@@ -388,7 +400,7 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '2.1',
+  version: '2.2',
   endpoints: ['/ai', '/webhook/aisensy', '/webhook/meta', '/webhook/website']
 }));
 

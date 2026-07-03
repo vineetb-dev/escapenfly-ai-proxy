@@ -117,53 +117,101 @@ function assignTeamFallback(data) {
 }
 
 // ── SUPABASE ──
-// IMPORTANT (3 Jul 2026 fix v2): the enquiries table has NO top-level name/phone/destination
-// columns — the CRM (index.html sync('saveLead')) never writes them. It packs them inside
-// the original_message_text JSON, and mapLead() reads them back as ex.name / ex.phone / ex.dest.
-// The webhook body below now mirrors the CRM's own write exactly. Do not add columns here
-// unless the CRM also writes them.
+// v2.3: TWO-STAGE CAPTURE. The flow now fires the webhook twice — once early
+// (after month question: name/phone/destination/month) and once at the end
+// (with travellers/budget). First call CREATES the lead + notifies the team.
+// Second call MERGES the extra details into the same lead — no duplicates,
+// no double notifications. Dedupe memory is per-phone with a 24h window.
+const recentLeads = new Map(); // phone -> { id, at }
+const DEDUPE_MS = 24 * 60 * 60 * 1000;
+
+function rememberLead(phone, id) {
+  recentLeads.set(phone, { id, at: Date.now() });
+  // light cleanup so the map never grows unbounded
+  if (recentLeads.size > 500) {
+    for (const [k, v] of recentLeads) {
+      if (Date.now() - v.at > DEDUPE_MS) recentLeads.delete(k);
+    }
+  }
+}
+
+function findRecentLead(phone) {
+  const e = recentLeads.get(phone);
+  return (e && Date.now() - e.at < DEDUPE_MS) ? e.id : null;
+}
+
+// Shared: build the updatable field set from lead data (used by create + merge)
+function buildLeadFields(data) {
+  const paxNum = parseInt(String(data.pax || '').match(/\d+/)?.[0], 10);
+  const budgetNum = parseFloat(String(data.budget || '').replace(/[^0-9.]/g, ''));
+
+  const notesText =
+    `Auto-captured via ${data.source || 'whatsapp'}\n` +
+    `Destination: ${data.destination || '-'}\n` +
+    `Travel: ${data.travelMonth || '-'}\n` +
+    `Pax: ${data.pax || '-'}\n` +
+    `Budget: ${data.budget || '-'}\n` +
+    `Query: ${data.query || '-'}`;
+
+  return {
+    enquiry_type: data.type || 'international',
+    pax_adults: Number.isFinite(paxNum) ? paxNum : 2,
+    budget_max: Number.isFinite(budgetNum) && budgetNum > 0 ? budgetNum : null,
+    notes: notesText,
+    internal_notes: notesText,
+    original_message_text: JSON.stringify({
+      name: data.name || 'Unknown (WhatsApp)',
+      phone: data.phone || '',
+      email: data.email || '',
+      dest: data.destination || '',
+      dep: '', ret: '', nights: '',
+      hotelCat: '', isRepeat: 'no',
+      travelMonth: data.travelMonth || '',
+      pax: data.pax || '', budget: data.budget || '',
+      query: data.query || ''
+    }),
+    updated_at: new Date().toISOString(),
+    last_activity_at: new Date().toISOString()
+  };
+}
+
+// Merge fresh details into an existing lead (second webhook call)
+async function updateLead(existingId, data) {
+  try {
+    const fields = buildLeadFields(data);
+    const r = await fetch(`${SB_URL}/rest/v1/enquiries?id=eq.${existingId}`, {
+      method: 'PATCH',
+      headers: {
+        'apikey': SB_KEY,
+        'Authorization': `Bearer ${SB_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal'
+      },
+      body: JSON.stringify(fields)
+    });
+    if (r.ok) {
+      console.log('🔄 Lead enriched with final details:', existingId, r.status);
+    } else {
+      console.error('❌ Lead update FAILED:', existingId, r.status, '—', await r.text());
+    }
+  } catch (e) {
+    console.error('Supabase update error:', e);
+  }
+}
+
 async function saveLead(data, assigned) {
   try {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
-
-    // pax often arrives as free text (e.g. "2 adults, budget 1.5L") because the flow
-    // currently captures travellers+budget in one attribute — parse defensively.
-    const paxNum = parseInt(String(data.pax || '').match(/\d+/)?.[0], 10);
-    const budgetNum = parseFloat(String(data.budget || '').replace(/[^0-9.]/g, ''));
-
-    const notesText =
-      `Auto-captured via ${data.source || 'whatsapp'}\n` +
-      `Destination: ${data.destination || '-'}\n` +
-      `Travel: ${data.travelMonth || '-'}\n` +
-      `Pax: ${data.pax || '-'}\n` +
-      `Budget: ${data.budget || '-'}\n` +
-      `Query: ${data.query || '-'}`;
+    const fields = buildLeadFields(data);
 
     const body = {
       id,
       assigned_to_email: assigned.email,
       assigned_to_name: assigned.name,
       source: data.source || 'whatsapp',
-      enquiry_type: data.type || 'international',
-      pax_adults: Number.isFinite(paxNum) ? paxNum : 2,
       pax_children: 0,
       pax_infants: 0,
-      budget_max: Number.isFinite(budgetNum) && budgetNum > 0 ? budgetNum : null,
-      notes: notesText,
-      internal_notes: notesText,
-      // Keys here MUST match what the CRM's mapLead() reads: name, phone, email, dest, ...
-      original_message_text: JSON.stringify({
-        name: data.name || 'Unknown (WhatsApp)',
-        phone: data.phone || '',
-        email: data.email || '',
-        dest: data.destination || '',
-        dep: '', ret: '', nights: '',
-        hotelCat: '', isRepeat: 'no',
-        travelMonth: data.travelMonth || '',
-        pax: data.pax || '', budget: data.budget || '',
-        query: data.query || ''
-      }),
       priority: 'high',
       status: 'new',
       followup_date: null,
@@ -174,9 +222,8 @@ async function saveLead(data, assigned) {
       history: [{ s: 'new', by: 'AutoBot', at: now, note: `Auto-assigned to ${assigned.name}` }],
       created_by: 'AutoBot',
       created_at: now,
-      updated_at: now,
-      last_activity_at: now,
-      is_deleted: false
+      is_deleted: false,
+      ...fields
     };
     const r = await fetch(`${SB_URL}/rest/v1/enquiries`, {
       method: 'POST',
@@ -190,11 +237,11 @@ async function saveLead(data, assigned) {
     });
     if (r.ok) {
       console.log('✅ Lead saved successfully:', id, r.status);
-    } else {
-      const errText = await r.text();
-      console.error('❌ Lead save FAILED:', id, r.status, '—', errText);
+      return id;
     }
-    return id;
+    const errText = await r.text();
+    console.error('❌ Lead save FAILED:', id, r.status, '—', errText);
+    return null;
   } catch (e) {
     console.error('Supabase error:', e);
     return null;
@@ -276,6 +323,8 @@ const cleanAttr = v => {
   return t.startsWith('$') ? '' : t;
 };
 
+const attrsOf = body => body.attributes || body.customAttributes || {};
+
 app.post('/webhook/aisensy', async (req, res) => {
   res.json({ status: 'ok' }); // Respond immediately
 
@@ -283,18 +332,21 @@ app.post('/webhook/aisensy', async (req, res) => {
     const body = req.body;
     console.log('AiSensy webhook received:', JSON.stringify(body).slice(0, 300));
 
-    const phone = cleanAttr(body.waId || body.phone || body.mobile);
-    const attrs = body.attributes || body.customAttributes || {};
+    const phone = cleanAttr(body.waId || body.phone || body.mobile || attrsOf(body).phone);
+    const attrs = attrsOf(body);
 
+    // v2.4: AiSensy's flow API Request node sends fields FLAT at the top level
+    // ({"name":..,"destination":..}), while other senders may nest them under
+    // "attributes". Read both — attributes first, then top-level fallback.
     const leadData = {
-      name: cleanAttr(attrs.name || attrs.customer_name || body.userName) || 'Unknown (WhatsApp)',
+      name: cleanAttr(attrs.name || attrs.customer_name || body.name || body.customer_name || body.userName) || 'Unknown (WhatsApp)',
       phone: phone,
-      destination: cleanAttr(attrs.destination || attrs.dest) || '',
-      travelMonth: cleanAttr(attrs.travel_month || attrs.travel_date) || '',
-      pax: cleanAttr(attrs.pax || attrs.travellers) || '',
-      budget: cleanAttr(attrs.budget) || '',
-      type: cleanAttr(attrs.trip_type) || '',
-      query: cleanAttr(attrs.query || body.lastMessage) || '',
+      destination: cleanAttr(attrs.destination || attrs.dest || body.destination || body.dest) || '',
+      travelMonth: cleanAttr(attrs.travel_month || attrs.travel_date || body.travel_month || body.travel_date) || '',
+      pax: cleanAttr(attrs.pax || attrs.travellers || body.pax || body.travellers) || '',
+      budget: cleanAttr(attrs.budget || body.budget) || '',
+      type: cleanAttr(attrs.trip_type || body.type || body.trip_type) || '',
+      query: cleanAttr(attrs.query || body.query || body.lastMessage) || '',
       source: 'whatsapp-flow'
     };
 
@@ -303,8 +355,18 @@ app.post('/webhook/aisensy', async (req, res) => {
       return;
     }
 
+    // v2.3 TWO-STAGE: if this phone already created a lead in the last 24h,
+    // this is the completion webhook — merge details, don't duplicate/re-notify.
+    const existingId = findRecentLead(phone);
+    if (existingId) {
+      await updateLead(existingId, leadData);
+      console.log(`Lead enriched: ${leadData.name} (${phone}) → existing lead ${existingId}`);
+      return;
+    }
+
     const assigned = await assignTeamWithClaude(leadData);
     const leadId = await saveLead(leadData, assigned);
+    if (leadId) rememberLead(phone, leadId);
     await notifyTeam(assigned, leadData, leadId);
 
     console.log(`Lead processed: ${leadData.name} → ${assigned.name}`);
@@ -400,7 +462,7 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '2.2',
+  version: '2.4',
   endpoints: ['/ai', '/webhook/aisensy', '/webhook/meta', '/webhook/website']
 }));
 

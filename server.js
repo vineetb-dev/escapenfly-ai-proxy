@@ -143,7 +143,14 @@ function findRecentLead(phone) {
 // Shared: build the updatable field set from lead data (used by create + merge)
 function buildLeadFields(data) {
   const paxNum = parseInt(String(data.pax || '').match(/\d+/)?.[0], 10);
-  const budgetNum = parseFloat(String(data.budget || '').replace(/[^0-9.]/g, ''));
+  // Parse Indian budget notation: "2 lakh"/"2L" → 200000, "50k" → 50000, "1.5 cr" → 15000000
+  const bStr = String(data.budget || '').toLowerCase();
+  let budgetNum = parseFloat(bStr.replace(/[^0-9.]/g, ''));
+  if (Number.isFinite(budgetNum)) {
+    if (/crore|cr\b/.test(bStr)) budgetNum *= 10000000;
+    else if (/lakh|lac|\bl\b|[0-9]l\b/.test(bStr)) budgetNum *= 100000;
+    else if (/[0-9]k\b|thousand/.test(bStr)) budgetNum *= 1000;
+  }
 
   const notesText =
     `Auto-captured via ${data.source || 'whatsapp'}\n` +
@@ -569,7 +576,7 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '2.5',
+  version: '2.6',
   endpoints: ['/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/meta', '/webhook/website']
 }));
 

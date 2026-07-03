@@ -313,6 +313,113 @@ app.post('/ai', async (req, res) => {
   }
 });
 
+// ── CONVERSATIONAL AI CHAT (v2.5) ──
+// Free-flowing Claude-powered WhatsApp assistant. AiSensy loop: Question block
+// captures the user's message → API Request POSTs {phone, message} here →
+// response {"reply": "..."} is mapped to an attribute → next Question shows it →
+// loops back to the API Request. Claude chats naturally, quietly extracts lead
+// details, and the moment it has enough, the lead is saved + routed + notified
+// using the same proven machinery as the scripted flow.
+const chats = new Map(); // phone -> { msgs: [], at }
+const CHAT_TTL_MS = 24 * 60 * 60 * 1000;
+
+function getChat(phone) {
+  let c = chats.get(phone);
+  if (!c || Date.now() - c.at > CHAT_TTL_MS) {
+    c = { msgs: [], at: Date.now() };
+    chats.set(phone, c);
+  }
+  c.at = Date.now();
+  if (chats.size > 300) {
+    for (const [k, v] of chats) {
+      if (Date.now() - v.at > CHAT_TTL_MS) chats.delete(k);
+    }
+  }
+  return c;
+}
+
+const CHAT_SYSTEM = `You are Maya, the expert AI travel consultant for EscapeNFly Travel Agency, chatting with a customer on WhatsApp.
+
+ABOUT ESCAPENFLY: Chandigarh-based travel agency since 2016, 4.8★ rated, 90%+ repeat clients. Services: holiday packages (domestic + international), visa services, flight bookings. Phone: +91 98517 39851.
+
+STYLE:
+- Warm, helpful, concise. 2-4 short sentences per reply, WhatsApp style. Light emoji use is fine.
+- Answer travel questions genuinely and knowledgeably (best season, visa basics, destination ideas, rough budget guidance).
+- Never invent specific prices, availability, or visa guarantees — for specifics, say our travel expert will call them.
+- Reply in the language the customer writes in (English, Hindi, Hinglish all fine).
+
+YOUR QUIET MISSION: across the conversation, naturally learn: their name, destination, travel month, number of travellers, budget, and whether they need a holiday package, visa only, or flights only. Weave questions in naturally, ONE at a time — never interrogate, never list questions.
+
+OUTPUT FORMAT — respond ONLY with a JSON object, no other text, no markdown fences:
+{"reply": "<your WhatsApp message to the customer>", "lead": {"name": "", "destination": "", "travel_month": "", "pax": "", "budget": "", "type": "holiday|visa|flights"}, "ready": false}
+
+Fill lead fields with everything learned so far (empty string if unknown). Set "ready": true once you know at least name AND destination AND travel month, OR the customer asks to be called / talk to an expert. After ready, keep chatting and keep filling remaining fields.`;
+
+app.post('/webhook/chat', async (req, res) => {
+  const phone = cleanAttr(req.body.phone || req.body.waId || req.body.mobile || '') || '';
+  const message = cleanAttr(req.body.message || req.body.text || '') || 'Hi';
+
+  const FALLBACK_REPLY = 'Thanks for your message! Our travel expert will call you shortly. You can also reach us directly at +91 98517 39851. 😊';
+
+  try {
+    console.log(`AI chat [${phone}]: ${String(message).slice(0, 120)}`);
+    const chat = getChat(phone || 'unknown');
+    chat.msgs.push({ role: 'user', content: message });
+    if (chat.msgs.length > 24) chat.msgs = chat.msgs.slice(-24);
+
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 400,
+        system: CHAT_SYSTEM,
+        messages: chat.msgs
+      })
+    });
+    const d = await r.json();
+    const raw = d.content[0].text.trim().replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(raw);
+    chat.msgs.push({ role: 'assistant', content: raw });
+
+    // Reply to AiSensy FIRST so the customer isn't kept waiting
+    res.json({ reply: parsed.reply || FALLBACK_REPLY });
+
+    // Then handle lead capture in the background
+    if (parsed.ready && phone && parsed.lead) {
+      const leadData = {
+        name: parsed.lead.name || 'Unknown (WhatsApp)',
+        phone: phone,
+        destination: parsed.lead.destination || '',
+        travelMonth: parsed.lead.travel_month || '',
+        pax: parsed.lead.pax || '',
+        budget: parsed.lead.budget || '',
+        type: parsed.lead.type || '',
+        query: message,
+        source: 'whatsapp-ai-chat'
+      };
+      const existingId = findRecentLead(phone);
+      if (existingId) {
+        await updateLead(existingId, leadData);
+        console.log(`AI chat lead enriched: ${leadData.name} → ${existingId}`);
+      } else {
+        const assigned = await assignTeamWithClaude(leadData);
+        const leadId = await saveLead(leadData, assigned);
+        if (leadId) rememberLead(phone, leadId);
+        await notifyTeam(assigned, leadData, leadId);
+        console.log(`AI chat lead captured: ${leadData.name} → ${assigned.name}`);
+      }
+    }
+  } catch (e) {
+    console.error('AI chat error:', e.message);
+    if (!res.headersSent) res.json({ reply: FALLBACK_REPLY });
+  }
+});
+
 // ── AISENSY WEBHOOK (WhatsApp flow completion) ──
 // Guard (v2.2): if AiSensy ever fails to interpolate an attribute, the literal
 // string "$attribute_name" arrives. Treat any value starting with "$" as empty
@@ -462,8 +569,8 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '2.4',
-  endpoints: ['/ai', '/webhook/aisensy', '/webhook/meta', '/webhook/website']
+  version: '2.5',
+  endpoints: ['/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/meta', '/webhook/website']
 }));
 
 const PORT = process.env.PORT || 3000;

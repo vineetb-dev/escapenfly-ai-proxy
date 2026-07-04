@@ -362,15 +362,23 @@ OUTPUT FORMAT — respond ONLY with a JSON object, no other text, no markdown fe
 
 Fill lead fields with everything learned so far (empty string if unknown). Set "ready": true once you know at least name AND destination AND travel month, OR the customer asks to be called / talk to an expert. After ready, keep chatting and keep filling remaining fields.`;
 
-app.post('/webhook/chat', async (req, res) => {
-  const phone = cleanAttr(req.body.phone || req.body.waId || req.body.mobile || '') || '';
-  const message = cleanAttr(req.body.message || req.body.text || '') || 'Hi';
-
+// Core Maya turn: takes phone + message, returns the reply text (and handles lead capture)
+async function mayaTurn(phone, message) {
   const FALLBACK_REPLY = 'Thanks for your message! Our travel expert will call you shortly. You can also reach us directly at +91 98517 39851. 😊';
-
   try {
     console.log(`AI chat [${phone}]: ${String(message).slice(0, 120)}`);
     const chat = getChat(phone || 'unknown');
+
+    // Loop guard: if the exact same message arrives again within 8 seconds
+    // (flow glitch or webhook double-delivery), return the last reply without
+    // re-calling Claude or re-saving anything.
+    if (chat.lastMsg === message && Date.now() - chat.lastMsgAt < 8000) {
+      console.log(`↩️ Duplicate message within 8s from ${phone} — returning cached reply.`);
+      return chat.lastReply || FALLBACK_REPLY;
+    }
+    chat.lastMsg = message;
+    chat.lastMsgAt = Date.now();
+
     chat.msgs.push({ role: 'user', content: message });
     if (chat.msgs.length > 24) chat.msgs = chat.msgs.slice(-24);
 
@@ -382,7 +390,7 @@ app.post('/webhook/chat', async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001', // v2.7: faster replies (1-2s) to stay inside AiSensy's API timeout
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 400,
         system: CHAT_SYSTEM,
         messages: chat.msgs
@@ -392,12 +400,11 @@ app.post('/webhook/chat', async (req, res) => {
     const raw = d.content[0].text.trim().replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(raw);
     chat.msgs.push({ role: 'assistant', content: raw });
+    chat.lastReply = parsed.reply || FALLBACK_REPLY;
 
-    // Reply to AiSensy FIRST so the customer isn't kept waiting
     console.log(`AI reply [${phone}]: ${String(parsed.reply || '').slice(0, 100)}`);
-    res.json({ reply: parsed.reply || FALLBACK_REPLY });
 
-    // Then handle lead capture in the background
+    // Lead capture (non-blocking for the caller's purposes, but awaited here)
     if (parsed.ready && phone && parsed.lead) {
       const leadData = {
         name: parsed.lead.name || 'Unknown (WhatsApp)',
@@ -412,8 +419,13 @@ app.post('/webhook/chat', async (req, res) => {
       };
       const existingId = findRecentLead(phone);
       if (existingId) {
-        await updateLead(existingId, leadData);
-        console.log(`AI chat lead enriched: ${leadData.name} → ${existingId}`);
+        // Only PATCH if something actually changed since last time (loop protection)
+        const sig = JSON.stringify(leadData);
+        if (chat.lastLeadSig !== sig) {
+          chat.lastLeadSig = sig;
+          await updateLead(existingId, leadData);
+          console.log(`AI chat lead enriched: ${leadData.name} → ${existingId}`);
+        }
       } else {
         const assigned = await assignTeamWithClaude(leadData);
         const leadId = await saveLead(leadData, assigned);
@@ -422,9 +434,92 @@ app.post('/webhook/chat', async (req, res) => {
         console.log(`AI chat lead captured: ${leadData.name} → ${assigned.name}`);
       }
     }
+    return chat.lastReply;
   } catch (e) {
     console.error('AI chat error:', e.message);
-    if (!res.headersSent) res.json({ reply: FALLBACK_REPLY });
+    return FALLBACK_REPLY;
+  }
+}
+
+app.post('/webhook/chat', async (req, res) => {
+  const phone = cleanAttr(req.body.phone || req.body.waId || req.body.mobile || '') || '';
+  const message = cleanAttr(req.body.message || req.body.text || '') || 'Hi';
+  const reply = await mayaTurn(phone, message);
+  res.json({ reply });
+});
+
+// ── v2.8 PLAN B: DIRECT INCOMING-MESSAGE WEBHOOK ──
+// AiSensy Developer webhook ("Incoming Messages" event) posts every customer
+// message here. Maya thinks, then the server sends the reply DIRECTLY to the
+// customer via AiSensy's campaign API — no flow loops, no response mapping,
+// no attribute quirks. Requires on Render: AISENSY_KEY env var, and an API
+// Campaign in AiSensy (Live) whose template body is just "{{1}}" — name it
+// in MAYA_CAMPAIGN env var (default: maya_session).
+const MAYA_CAMPAIGN = process.env.MAYA_CAMPAIGN || 'maya_session';
+
+async function sendSessionMessage(phone, text) {
+  if (!AISENSY_KEY) {
+    console.error('❌ Cannot send Maya reply: AISENSY_KEY env var is not set on Render.');
+    return false;
+  }
+  try {
+    const r = await fetch('https://backend.aisensy.com/campaign/t1/api/v2', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        apiKey: AISENSY_KEY,
+        campaignName: MAYA_CAMPAIGN,
+        destination: phone,
+        userName: 'Traveller',
+        templateParams: [text]
+      })
+    });
+    const body = await r.text();
+    if (r.ok) {
+      console.log(`📤 Maya reply sent to ${phone} via campaign '${MAYA_CAMPAIGN}'`);
+      return true;
+    }
+    console.error(`❌ Maya send FAILED (${r.status}):`, body.slice(0, 200));
+    return false;
+  } catch (e) {
+    console.error('Maya send error:', e.message);
+    return false;
+  }
+}
+
+const TRIGGER_WORDS = ['hi', 'hello', 'hey', 'maya', 'plan', 'visa', 'flight', 'book', 'holiday', 'trip', 'package'];
+
+app.post('/webhook/incoming', async (req, res) => {
+  res.json({ status: 'ok' }); // ack immediately
+
+  try {
+    const b = req.body || {};
+    // AiSensy incoming payload variants: {from, message, timestamp} per Fin;
+    // handle common alternates defensively and log the raw body once.
+    console.log('Incoming webhook:', JSON.stringify(b).slice(0, 300));
+    const phone = String(b.from || b.waId || b.phone || b.mobile || b.sender || '').replace(/\D/g, '');
+    let text = b.message || b.text || b.body || '';
+    if (typeof text === 'object') text = text.text || text.body || '';
+    text = String(text || '').trim();
+
+    if (!phone || !text) return;
+    if (phone === WA_NUM.replace(/\D/g, '')) return; // never talk to ourselves
+
+    // Gate: reply only if a Maya conversation is already running (recent chat),
+    // or the message contains a trigger word. Keeps Maya out of agent
+    // conversations and random media messages.
+    const hasChat = chats.has(phone) && Date.now() - chats.get(phone).at < CHAT_TTL_MS;
+    const lower = text.toLowerCase();
+    const triggered = TRIGGER_WORDS.some(w => lower.includes(w));
+    if (!hasChat && !triggered) {
+      console.log(`Incoming from ${phone} ignored (no active chat, no trigger word).`);
+      return;
+    }
+
+    const reply = await mayaTurn(phone, text);
+    await sendSessionMessage(phone, reply);
+  } catch (e) {
+    console.error('Incoming webhook error:', e);
   }
 });
 
@@ -577,8 +672,8 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '2.7',
-  endpoints: ['/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/meta', '/webhook/website']
+  version: '2.8',
+  endpoints: ['/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/incoming', '/webhook/meta', '/webhook/website']
 }));
 
 const PORT = process.env.PORT || 3000;

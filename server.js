@@ -382,7 +382,7 @@ app.post('/webhook/chat', async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-haiku-4-5-20251001', // v2.7: faster replies (1-2s) to stay inside AiSensy's API timeout
         max_tokens: 400,
         system: CHAT_SYSTEM,
         messages: chat.msgs
@@ -394,6 +394,7 @@ app.post('/webhook/chat', async (req, res) => {
     chat.msgs.push({ role: 'assistant', content: raw });
 
     // Reply to AiSensy FIRST so the customer isn't kept waiting
+    console.log(`AI reply [${phone}]: ${String(parsed.reply || '').slice(0, 100)}`);
     res.json({ reply: parsed.reply || FALLBACK_REPLY });
 
     // Then handle lead capture in the background
@@ -576,7 +577,7 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '2.6',
+  version: '2.7',
   endpoints: ['/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/meta', '/webhook/website']
 }));
 

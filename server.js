@@ -646,28 +646,71 @@ app.post('/webhook/chat', async (req, res) => {
   res.json({ reply: reply || FALLBACK_REPLY });
 });
 
-// ── PRIMARY: AISENSY INCOMING-MESSAGE WEBHOOK (v3.0: ALWAYS-REPLY policy) ──
+// ── DEEP PAYLOAD SCANNER (v3.0.1) ──
+// AiSensy's incoming-message payload is nested ({data:{message:{phone_number:...}}})
+// and its exact structure was never confirmed (300-char log truncation hid it).
+// Instead of guessing field names, recursively scan the whole payload:
+// - phone: any 10–15 digit value under a key containing phone/waid/from/sender/mobile/contact
+// - text:  any non-empty string under a key named text/body/message/caption/content
+function deepExtract(obj) {
+  const phones = [];
+  const texts = [];
+  const seen = new Set();
+  const visit = (o, depth) => {
+    if (!o || typeof o !== 'object' || depth > 6 || seen.has(o)) return;
+    seen.add(o);
+    for (const [k, v] of Object.entries(o)) {
+      const kl = k.toLowerCase();
+      if (typeof v === 'string') {
+        const digits = v.replace(/\D/g, '');
+        if (digits.length >= 10 && digits.length <= 15 &&
+            (kl.includes('phone') || kl.includes('waid') || kl.includes('wa_id') ||
+             kl === 'from' || kl.includes('sender') || kl.includes('mobile') || kl.includes('contact'))) {
+          phones.push({ key: kl, digits });
+        }
+        if (v.trim() &&
+            (kl === 'text' || kl === 'body' || kl === 'message' || kl === 'caption' || kl === 'content' || kl === 'message_text')) {
+          texts.push({ key: kl, value: v.trim() });
+        }
+      } else if (Array.isArray(v)) {
+        v.forEach(item => visit(item, depth + 1));
+      } else if (typeof v === 'object') {
+        visit(v, depth + 1);
+      }
+    }
+  };
+  visit(obj, 0);
+  return { phones, texts };
+}
+
+// ── PRIMARY: AISENSY INCOMING-MESSAGE WEBHOOK (v3.0.1: ALWAYS-REPLY policy) ──
 app.post('/webhook/incoming', async (req, res) => {
   res.json({ status: 'ok' }); // ack immediately
 
   try {
     const b = req.body || {};
-    console.log('Incoming webhook:', JSON.stringify(b).slice(0, 300));
+    // v3.0.1: log the FULL payload (was 300 chars — truncation hid the structure)
+    console.log('Incoming webhook FULL:', JSON.stringify(b).slice(0, 2000));
 
-    // AiSensy nests the payload under data: {message:{...}} — handle flat + nested
-    const d = b.data || b;
-    const m = (typeof d.message === 'object' && d.message) ? d.message : d;
-    const phone = String(
-      d.from || d.waId || d.phone || d.mobile || d.sender ||
-      m.from || m.waId || m.phone || m.mobile || m.sender ||
-      b.from || b.waId || b.phone || b.mobile || b.sender || ''
-    ).replace(/\D/g, '');
-    let text = (typeof d.message === 'string' ? d.message : '') ||
-               m.text || m.body || d.text || d.body || b.message || b.text || b.body || '';
-    if (typeof text === 'object') text = text.text || text.body || '';
-    text = String(text || '').trim();
+    const { phones, texts } = deepExtract(b);
 
-    if (!phone) { console.log('Incoming ignored: no phone number in payload.'); return; }
+    // Phone: prefer any number that is NOT our own business number
+    const own = WA_NUM.replace(/\D/g, '');
+    const phoneEntry = phones.find(p => p.digits !== own) || phones[0];
+    const phone = phoneEntry ? phoneEntry.digits : '';
+
+    // Text: prefer explicit text/body keys over generic 'message'
+    const textEntry =
+      texts.find(t => t.key === 'text') ||
+      texts.find(t => t.key === 'body') ||
+      texts.find(t => t.key === 'message_text') ||
+      texts.find(t => t.key === 'caption' || t.key === 'content') ||
+      texts.find(t => t.key === 'message');
+    const text = textEntry ? textEntry.value : '';
+
+    console.log(`Extracted → phone:"${phone}" (via ${phoneEntry ? phoneEntry.key : 'none'}) | text:"${short(text)}" (via ${textEntry ? textEntry.key : 'none'})`);
+
+    if (!phone) { console.log('Incoming ignored: no phone number found anywhere in payload.'); return; }
     if (phone === WA_NUM.replace(/\D/g, '')) return;      // never talk to ourselves
     if (!text) { console.log(`Incoming from ${phone} ignored: empty/media-only message.`); return; }
 
@@ -820,10 +863,10 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '3.0',
-  state: 'persistent (Supabase ai_chats + enquiries.phone)',
+  version: '3.0.1',
+  state: 'persistent (Supabase ai_chats + enquiries.phone) + deep webhook parser',
   endpoints: ['/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/incoming', '/webhook/meta', '/webhook/website']
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.0.1 running on port ${PORT}`));

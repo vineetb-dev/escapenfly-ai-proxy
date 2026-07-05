@@ -7,26 +7,23 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ═══════════════════════════════════════════════════════════════
-// ESCAPENFLY AI ENGINE v3.1  (production hardening)
-// New in 3.1 (vs 3.0.1):
-// - REPLY-FIRST: Maya's reply is sent to the customer the moment Claude
-//   produces it; CRM save, routing, notifications all happen AFTER.
-//   Cuts customer-visible latency from 15-30s to ~5-8s.
-// - Maya brain v2: gives real knowledge (visa document checklists, best
-//   seasons, process steps) — only volatile specifics (fees, processing
-//   times, prices, approval promises) are deferred to the expert.
-// - Single-line replies enforced (WhatsApp template params cannot contain
-//   newlines) — prompt rule + sanitization at send layer.
-// - Token diet: history stores short reply text (not full JSON); known
-//   lead info persisted separately and injected each turn. ~60% fewer tokens.
-// - fetchRetry on every external call (Claude/Supabase/AiSensy): 1 retry
-//   on 5xx or network error.
-// - Webhook message-id dedupe + 8s duplicate guard + per-phone lock.
-// - Input validation (phone format, intent whitelist, budget sanity,
-//   field length caps) before anything touches the CRM.
-// - Execution-time (ms per stage) in every turn log.
-// - Env-first configuration with safe fallbacks.
-// REQUIRES: Phase-0 SQL already run (ai_chats table + enquiries.phone).
+// ESCAPENFLY AI ENGINE v3.2  (adds team notification cron jobs)
+// New in 3.2 (vs 3.1):
+// - 5 new cron-triggered endpoints, all protected by CRON_SECRET:
+//   /cron/daily-digest      → 10AM Mon-Sat: individual + team lead counts
+//   /cron/stale-check       → periodic: leads untouched >24h → rep + Vineet
+//   /cron/visa-appointments → daily: tomorrow's visa appts → Damini + Prabhjot
+//   /cron/booking-check     → periodic: newly booked leads → founder tier
+//   /cron/eod-summary       → 6-7PM: today's closed/lost/new + value → founder tier
+// - Requires 2 new Supabase columns (see Phase-1 SQL): visa_appointment_date,
+//   booking_notified.
+// - TEAM extended with Vivek (founder) and Abhishek (founder) — non-routing,
+//   notification-only entries.
+// v3.1 changes (unchanged, retained):
+// - REPLY-FIRST Maya replies, knowledge-giving brain v2, single-line
+//   sanitization, token diet, fetchRetry, dedupe, validation, timing logs.
+// REQUIRES: Phase-0 SQL (ai_chats, enquiries.phone) AND Phase-1 SQL
+// (visa_appointment_date, booking_notified) already run.
 // ═══════════════════════════════════════════════════════════════
 
 // ── CONFIG (env-first, current production values as fallbacks) ──
@@ -39,10 +36,12 @@ const MAYA_CAMPAIGN = process.env.MAYA_CAMPAIGN || 'maya_session';
 const CRM_URL       = process.env.CRM_URL || 'https://escapenfly-crm.netlify.app';
 const CHAT_MODEL    = process.env.CHAT_MODEL || 'claude-haiku-4-5-20251001';
 const ROUTING_MODEL = process.env.ROUTING_MODEL || 'claude-sonnet-4-6';
+const CRON_SECRET   = process.env.CRON_SECRET || 'change-me-please';
 
 const DEDUPE_MS   = 24 * 60 * 60 * 1000; // one lead per phone per 24h
 const CHAT_TTL_MS = 24 * 60 * 60 * 1000; // Maya memory window
 const HISTORY_MAX = 16;                  // messages kept in Maya's context
+const STALE_HOURS = 30;                  // "no follow-up" threshold (24-48h window, mid-point)
 
 const SB_HEADERS = {
   'apikey': SB_KEY,
@@ -79,15 +78,25 @@ async function fetchRetry(url, opts, label) {
 }
 
 // ── TEAM ASSIGNMENT (confirmed CRM emails, 2 Jul 2026) ──
+// v3.2: vivek + abhishek added as founder-tier notification-only entries
+// (not part of lead-routing pool — no `dept` used for assignment logic).
 const TEAM = {
-  lalit:   { name: 'Lalit Mehta',     email: 'sales6@escapenfly.com',   wa: '916283285244', dept: 'Domestic & Short Haul' },
-  divya:   { name: 'Divya Nigam',     email: 'sales1@escapenfly.com',   wa: '917888871148', dept: 'Short Haul & Island' },
-  anjan:   { name: 'Anjan Pramanick', email: 'sales3@escapenfly.com',   wa: '919875903349', dept: 'Long Haul' },
-  shubham: { name: 'Shubham',         email: 'sales7@escapenfly.com',   wa: '919875921281', dept: 'Short Haul & Long Haul' },
-  prabhjot:{ name: 'Prabhjot Singh',  email: 'support2@escapenfly.com', wa: '919569933206', dept: 'Air Tickets, Corporate & Catch-All' },
-  damini:  { name: 'Damini',          email: 'support3@escapenfly.com', wa: '919888002635', dept: 'Visa' },
-  admin:   { name: 'Vineet Bansal',   email: 'vineet.b@escapenfly.com', wa: '919851739851', dept: 'Admin' }
+  lalit:    { name: 'Lalit Mehta',     email: 'sales6@escapenfly.com',   wa: '916283285244', dept: 'Domestic & Short Haul' },
+  divya:    { name: 'Divya Nigam',     email: 'sales1@escapenfly.com',   wa: '917888871148', dept: 'Short Haul & Island' },
+  anjan:    { name: 'Anjan Pramanick', email: 'sales3@escapenfly.com',   wa: '919875903349', dept: 'Long Haul' },
+  shubham:  { name: 'Shubham',         email: 'sales7@escapenfly.com',   wa: '919875921281', dept: 'Short Haul & Long Haul' },
+  prabhjot: { name: 'Prabhjot Singh',  email: 'support2@escapenfly.com', wa: '919569933206', dept: 'Air Tickets, Corporate & Catch-All' },
+  damini:   { name: 'Damini',          email: 'support3@escapenfly.com', wa: '919888002635', dept: 'Visa' },
+  admin:    { name: 'Vineet Bansal',   email: 'vineet.b@escapenfly.com', wa: '919851739851', dept: 'Admin' },
+  vivek:    { name: 'Vivek Bansal',    email: 'vivek.b@escapenfly.com',  wa: '918427694918', dept: 'Founder' },
+  abhishek: { name: 'Abhishek Sharma', email: '',                       wa: '918146888811', dept: 'Founder' }
 };
+
+// v3.2 — recipient rosters for the new notification jobs
+const REP_KEYS = ['lalit', 'divya', 'anjan', 'shubham', 'prabhjot']; // individual digest, non-visa
+const VISA_REP_KEYS = ['damini', 'prabhjot'];                        // visa-specific individual + appt reminder
+const FOUNDER_KEYS = ['admin', 'vivek', 'abhishek', 'prabhjot'];      // team digest, booking alert, EOD summary
+const STALE_CC_KEY = 'admin';                                        // stale alert CC
 
 const ISLAND     = ['maldives','mauritius','seychelles','bali','lakshadweep'];
 const SHORT_HAUL = ['dubai','uae','thailand','bangkok','phuket','singapore','malaysia','sri lanka','nepal','bhutan','myanmar','middle east'];
@@ -102,7 +111,7 @@ const VALID_INTENTS = ['holiday','visa','flights','hotel','cruise','corporate','
 
 // ── CLAUDE-BASED ASSIGNMENT (primary) ──
 async function assignTeamWithClaude(data) {
-  const teamList = Object.values(TEAM).filter(t => t.name !== 'Vineet Bansal')
+  const teamList = Object.values(TEAM).filter(t => t.dept !== 'Admin' && t.dept !== 'Founder')
     .map(t => `- ${t.name}: ${t.dept}`).join('\n');
 
   const prompt = `You are a routing assistant for a travel agency. Decide which team member should handle this enquiry.
@@ -448,7 +457,7 @@ async function sendWA(phone, templateName, params) {
   }
 }
 
-// ── NOTIFY TEAM ──
+// ── NOTIFY TEAM (instant new-lead alert) ──
 async function notifyTeam(assigned, leadData) {
   let ok = true;
   if (assigned.wa && assigned.wa !== '919XXXXXXXXX') {
@@ -459,6 +468,228 @@ async function notifyTeam(assigned, leadData) {
     ['Vineet', leadData.name || 'Unknown', leadData.destination || 'TBD', assigned.name]) && ok;
   return ok;
 }
+
+// ═══════════════════ v3.2 — CRON JOBS ═══════════════════
+
+// Shared secret check — all /cron/* routes require ?secret=... or header
+// x-cron-secret matching CRON_SECRET. Prevents randoms from triggering
+// mass WhatsApp sends on your AiSensy account.
+function cronAuthOk(req) {
+  const supplied = req.query.secret || req.headers['x-cron-secret'] || '';
+  return CRON_SECRET && supplied === CRON_SECRET;
+}
+
+const OPEN_STATUSES = "(new,called,quoted,follow-up,followup)"; // adjust if your CRM uses different status strings
+
+// Count leads for one assignee by status bucket.
+async function countLeadsFor(assignedName, opts = {}) {
+  const base = `${SB_URL}/rest/v1/enquiries?is_deleted=eq.false&assigned_to_name=eq.${encodeURIComponent(assignedName)}`;
+  const extra = opts.enquiryType ? `&enquiry_type=eq.${opts.enquiryType}` : '';
+
+  async function countWhere(clause) {
+    const url = `${base}${extra}${clause}&select=id`;
+    const r = await fetchRetry(url, { headers: { ...SB_HEADERS, Prefer: 'count=exact' } }, 'SB-count');
+    if (!r.ok) { console.error('countLeadsFor failed:', assignedName, r.status, await r.text()); return 0; }
+    const range = r.headers.get('content-range'); // e.g. "0-4/5"
+    if (range && range.includes('/')) {
+      const total = range.split('/')[1];
+      return total === '*' ? (await r.json()).length : parseInt(total, 10) || 0;
+    }
+    return (await r.json()).length;
+  }
+
+  const [newCount, followupCount, urgentCount, liveCount] = await Promise.all([
+    countWhere(`&status=eq.new`),
+    countWhere(`&status=in.(follow-up,followup)`),
+    countWhere(`&priority=eq.high&status=neq.booked&status=neq.lost`),
+    countWhere(`&status=neq.booked&status=neq.lost`)
+  ]);
+  return { new: newCount, followup: followupCount, urgent: urgentCount, live: liveCount };
+}
+
+// ── /cron/daily-digest — 10AM Mon-Sat: individual + team lead status ──
+app.post('/cron/daily-digest', async (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json({ status: 'started' });
+
+  try {
+    const results = {};
+    for (const key of REP_KEYS) {
+      const t = TEAM[key];
+      const c = await countLeadsFor(t.name);
+      results[key] = c;
+      await sendWA(t.wa, 'individual_lead_digest', [t.name, String(c.new), String(c.followup), String(c.urgent)]);
+      console.log(`📊 [digest] ${t.name}: new=${c.new} followup=${c.followup} urgent=${c.urgent}`);
+    }
+
+    const damini = TEAM.damini;
+    const dC = await countLeadsFor(damini.name, { enquiryType: 'visa' });
+    results.damini = dC;
+    await sendWA(damini.wa, 'individual_lead_digest', [damini.name, String(dC.new), String(dC.followup), String(dC.urgent)]);
+    console.log(`📊 [digest] ${damini.name} (visa): new=${dC.new} followup=${dC.followup} urgent=${dC.urgent}`);
+
+    const totalLive = Object.values(results).reduce((sum, c) => sum + c.live, 0);
+    for (const key of FOUNDER_KEYS) {
+      const t = TEAM[key];
+      await sendWA(t.wa, 'team_lead_digest', [
+        t.name,
+        String(results.lalit.live), String(results.divya.live), String(results.anjan.live),
+        String(results.shubham.live), String(results.prabhjot.live), String(results.damini.live),
+        String(totalLive)
+      ]);
+    }
+    console.log(`📊 [digest] Team digest sent to founders. Total live leads: ${totalLive}`);
+  } catch (e) {
+    console.error('daily-digest error:', e);
+  }
+});
+
+// ── /cron/stale-check — leads untouched >STALE_HOURS with no status change ──
+app.post('/cron/stale-check', async (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json({ status: 'started' });
+
+  try {
+    const cutoff = new Date(Date.now() - STALE_HOURS * 60 * 60 * 1000).toISOString();
+    const url = `${SB_URL}/rest/v1/enquiries?is_deleted=eq.false&status=neq.booked&status=neq.lost` +
+      `&last_activity_at=lt.${encodeURIComponent(cutoff)}` +
+      `&select=id,assigned_to_name,original_message_text,last_activity_at&limit=200`;
+    const r = await fetchRetry(url, { headers: SB_HEADERS }, 'SB-staleQuery');
+    if (!r.ok) { console.error('stale-check query failed:', r.status, await r.text()); return; }
+    const rows = await r.json();
+
+    for (const row of rows) {
+      let lead = {};
+      try { lead = JSON.parse(row.original_message_text || '{}'); } catch (e) {}
+      const hoursStale = Math.round((Date.now() - new Date(row.last_activity_at).getTime()) / (60 * 60 * 1000));
+      const repEntry = Object.values(TEAM).find(t => t.name === row.assigned_to_name);
+      const repName = repEntry ? repEntry.name : (row.assigned_to_name || 'Unassigned');
+      const destination = lead.dest || 'their enquiry';
+      const customerName = lead.name || 'Unknown';
+
+      if (repEntry && repEntry.wa) {
+        await sendWA(repEntry.wa, 'stale_lead_alert', [repEntry.name, customerName, destination, String(hoursStale)]);
+      }
+      await sendWA(TEAM.admin.wa, 'stale_lead_alert', ['Vineet (CC)', customerName, destination, String(hoursStale)]);
+      console.log(`⏰ [stale] ${customerName} (${destination}) — ${hoursStale}h stale, rep: ${repName}`);
+    }
+    console.log(`⏰ [stale-check] ${rows.length} stale lead(s) flagged.`);
+  } catch (e) {
+    console.error('stale-check error:', e);
+  }
+});
+
+// ── /cron/visa-appointments — tomorrow's visa appointments → Damini + Prabhjot ──
+app.post('/cron/visa-appointments', async (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json({ status: 'started' });
+
+  try {
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10); // YYYY-MM-DD
+    const url = `${SB_URL}/rest/v1/enquiries?is_deleted=eq.false&enquiry_type=eq.visa` +
+      `&visa_appointment_date=eq.${tomorrow}&select=id,original_message_text,visa_appointment_date&limit=100`;
+    const r = await fetchRetry(url, { headers: SB_HEADERS }, 'SB-visaApptQuery');
+    if (!r.ok) { console.error('visa-appointments query failed:', r.status, await r.text()); return; }
+    const rows = await r.json();
+
+    for (const row of rows) {
+      let lead = {};
+      try { lead = JSON.parse(row.original_message_text || '{}'); } catch (e) {}
+      const customerName = lead.name || 'Unknown';
+      const destination = lead.dest || 'their visa';
+      for (const key of VISA_REP_KEYS) {
+        const t = TEAM[key];
+        await sendWA(t.wa, 'visa_appointment_reminder', [t.name, customerName, destination, tomorrow]);
+      }
+      console.log(`🛂 [visa-appt] Reminder sent for ${customerName} (${destination}) — appt ${tomorrow}`);
+    }
+    console.log(`🛂 [visa-appointments] ${rows.length} appointment(s) tomorrow.`);
+  } catch (e) {
+    console.error('visa-appointments error:', e);
+  }
+});
+
+// ── /cron/booking-check — newly booked leads → founder tier (run every ~15-30 min) ──
+app.post('/cron/booking-check', async (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json({ status: 'started' });
+
+  try {
+    const url = `${SB_URL}/rest/v1/enquiries?is_deleted=eq.false&status=eq.booked` +
+      `&booking_notified=eq.false&select=id,original_message_text,budget_max,pax_adults&limit=100`;
+    const r = await fetchRetry(url, { headers: SB_HEADERS }, 'SB-bookingQuery');
+    if (!r.ok) { console.error('booking-check query failed:', r.status, await r.text()); return; }
+    const rows = await r.json();
+
+    for (const row of rows) {
+      let lead = {};
+      try { lead = JSON.parse(row.original_message_text || '{}'); } catch (e) {}
+      const customerName = lead.name || 'Unknown';
+      const destination = lead.dest || 'their trip';
+      const pax = String(row.pax_adults || '-');
+      const value = row.budget_max ? String(row.budget_max) : '0';
+
+      for (const key of FOUNDER_KEYS) {
+        const t = TEAM[key];
+        await sendWA(t.wa, 'booking_confirmed_alert', [t.name, customerName, destination, pax, value]);
+      }
+
+      await fetchRetry(`${SB_URL}/rest/v1/enquiries?id=eq.${row.id}`, {
+        method: 'PATCH',
+        headers: { ...SB_HEADERS, Prefer: 'return=minimal' },
+        body: JSON.stringify({ booking_notified: true })
+      }, 'SB-markBookingNotified');
+      console.log(`🎉 [booking] Confirmed alert sent for ${customerName} (${destination}) — ₹${value}`);
+    }
+    console.log(`🎉 [booking-check] ${rows.length} new booking(s) notified.`);
+  } catch (e) {
+    console.error('booking-check error:', e);
+  }
+});
+
+// ── /cron/eod-summary — 6-7PM: today's closed/lost/new + value → founder tier ──
+app.post('/cron/eod-summary', async (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json({ status: 'started' });
+
+  try {
+    const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+    const sinceIso = startOfDay.toISOString();
+
+    async function countSince(clause) {
+      const url = `${SB_URL}/rest/v1/enquiries?is_deleted=eq.false${clause}&select=id`;
+      const r = await fetchRetry(url, { headers: { ...SB_HEADERS, Prefer: 'count=exact' } }, 'SB-eodCount');
+      if (!r.ok) { console.error('eod countSince failed:', r.status, await r.text()); return 0; }
+      const range = r.headers.get('content-range');
+      if (range && range.includes('/')) {
+        const total = range.split('/')[1];
+        return total === '*' ? (await r.json()).length : parseInt(total, 10) || 0;
+      }
+      return (await r.json()).length;
+    }
+
+    const bookedToday = await countSince(`&status=eq.booked&updated_at=gt.${encodeURIComponent(sinceIso)}`);
+    const lostToday    = await countSince(`&status=eq.lost&updated_at=gt.${encodeURIComponent(sinceIso)}`);
+    const newToday      = await countSince(`&created_at=gt.${encodeURIComponent(sinceIso)}`);
+
+    const valUrl = `${SB_URL}/rest/v1/enquiries?is_deleted=eq.false&status=eq.booked` +
+      `&updated_at=gt.${encodeURIComponent(sinceIso)}&select=budget_max`;
+    const valR = await fetchRetry(valUrl, { headers: SB_HEADERS }, 'SB-eodValue');
+    let totalValue = 0;
+    if (valR.ok) {
+      const valRows = await valR.json();
+      totalValue = valRows.reduce((sum, r) => sum + (r.budget_max || 0), 0);
+    }
+
+    for (const key of FOUNDER_KEYS) {
+      const t = TEAM[key];
+      await sendWA(t.wa, 'eod_summary', [t.name, String(bookedToday), String(lostToday), String(newToday), String(totalValue)]);
+    }
+    console.log(`🌆 [eod-summary] booked:${bookedToday} lost:${lostToday} new:${newToday} value:₹${totalValue}`);
+  } catch (e) {
+    console.error('eod-summary error:', e);
+  }
+});
 
 // ═══════════════════ MAYA BRAIN v3.1 ═══════════════════
 
@@ -967,10 +1198,13 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '3.1',
-  state: 'persistent + reply-first + knowledge-giving Maya',
-  endpoints: ['/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/incoming', '/webhook/meta', '/webhook/website']
+  version: '3.2',
+  state: 'persistent + reply-first + knowledge-giving Maya + team notification crons',
+  endpoints: [
+    '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
+    '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary'
+  ]
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.1 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.2 running on port ${PORT}`));

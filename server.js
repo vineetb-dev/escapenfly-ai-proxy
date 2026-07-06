@@ -7,7 +7,14 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ═══════════════════════════════════════════════════════════════
-// ESCAPENFLY AI ENGINE v3.5  (vendor/spam pitch filter)
+// ESCAPENFLY AI ENGINE v3.6  (manual-lead WhatsApp notify endpoint)
+// New in 3.6 (vs 3.5):
+// - New /notify/manual-lead endpoint: the CRM's "+ New Lead" form calls this
+//   right after saving, so a lead a human types in directly now triggers
+//   the same instant WhatsApp alert to the assigned rep + founder tier that
+//   Maya-created leads already got. Previously, manually-added leads never
+//   notified anyone at all.
+// v3.5 changes (retained):
 // New in 3.5 (vs 3.4):
 // - Keyword-based filter catches cold marketing/vendor pitches (content
 //   agencies, SEO/marketing services, etc.) BEFORE they reach Maya or
@@ -1267,6 +1274,24 @@ app.post('/webhook/meta', async (req, res) => {
   }
 });
 
+// ── MANUAL LEAD NOTIFY (CRM "+ New Lead" form) ──
+// v-fix: the instant WhatsApp notification previously only fired when Maya
+// (the WhatsApp AI) created a lead automatically. Leads a human types
+// directly into the CRM never triggered anything — the rep silently never
+// got pinged. The CRM now calls this endpoint right after a manual save.
+app.post('/notify/manual-lead', async (req, res) => {
+  try {
+    const { assignedEmail, leadName, destination } = req.body || {};
+    const assigned = Object.values(TEAM).find(t => t.email === assignedEmail);
+    if (!assigned) { return res.status(400).json({ error: 'Unknown assignedEmail — must match a TEAM entry.' }); }
+    const ok = await notifyTeam(assigned, { name: leadName || 'Unknown', destination: destination || 'TBD' });
+    res.json({ status: ok ? 'ok' : 'partial-failure' });
+  } catch (e) {
+    console.error('manual-lead notify error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── WEBSITE LEAD ──
 app.post('/webhook/website', async (req, res) => {
   res.json({ status: 'ok' });
@@ -1295,13 +1320,14 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '3.5',
-  state: 'persistent + reply-first + consultative Maya + unsupported-media auto-reply + spam filter + team notification crons',
+  version: '3.6',
+  state: 'persistent + reply-first + consultative Maya + unsupported-media auto-reply + spam filter + manual-lead notify + team notification crons',
   endpoints: [
     '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
+    '/notify/manual-lead',
     '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary'
   ]
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.5 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.6 running on port ${PORT}`));

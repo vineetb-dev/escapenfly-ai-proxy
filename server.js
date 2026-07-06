@@ -7,7 +7,16 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ═══════════════════════════════════════════════════════════════
-// ESCAPENFLY AI ENGINE v3.7  (sales-consultant rewrite — qualify before describing)
+// ESCAPENFLY AI ENGINE v3.8  (forced tool-use — structured output, no more JSON parse errors)
+// New in 3.8 (vs 3.7):
+// - Maya's turn now uses forced tool-use (tool_choice: maya_reply) instead
+//   of asking Claude to "respond only with JSON" as free text. Previously,
+//   an unescaped quote/apostrophe in a generated reply could occasionally
+//   break JSON.parse — caught by the retry+fallback safety net, but the
+//   customer still got a generic reply on those turns. The API now
+//   guarantees schema-valid structured output directly, eliminating that
+//   failure mode rather than just catching it after the fact.
+// v3.7 changes (retained):
 // New in 3.7 (vs 3.6):
 // - CHAT_SYSTEM fully rewritten per direct feedback: Maya was giving
 //   travel-blog-style destination essays (attractions, history, scenery)
@@ -821,28 +830,60 @@ TONE — sound like a real consultant typing on their phone, not an AI:
 
 YOUR QUIET MISSION: qualify the lead and move it toward a quotation or booking, naturally learning their name, destination, travel month, number of travellers, budget, and service type along the way — never as an interrogation, and never by burying the ask in unnecessary description. Every message should end with a clear direction forward.
 
-OUTPUT FORMAT — respond ONLY with this JSON object. No markdown fences, no text before or after:
-{"reply":"<your single-paragraph WhatsApp message>","intent":"<one intent from the list>","lead":{"name":"","destination":"","travel_month":"","pax":"","budget":"","type":"holiday|visa|flights|hotel|cruise|corporate|other"},"lead_summary":"<one actionable line for the sales team, e.g. 'Singapore tourist visa for Sept 2026, 2 pax, awaiting expert callback'>","next_action":"<the first thing the assigned expert should do>","handover":false,"ready":false}
-
-- lead fields are CUMULATIVE — include everything from KNOWN LEAD INFO plus anything new this turn; empty string if unknown.
-- "ready": true once you know name AND destination AND travel month — OR whenever "handover" is true.
-- "handover": true when the customer requests a call/human, has a complaint, or asks about an existing booking.
+OUTPUT — you will call the maya_reply tool on every turn with these fields:
+- reply: your single-paragraph WhatsApp message (no line breaks, no signature).
+- intent: one of the classified intents.
+- lead: name, destination, travel_month, pax, budget, type — CUMULATIVE, include everything from KNOWN LEAD INFO plus anything new this turn; empty string if a field is still unknown.
+- lead_summary: one actionable line for the sales team, e.g. "Singapore tourist visa for Sept 2026, 2 pax, awaiting expert callback".
+- next_action: the first thing the assigned expert should do.
+- handover: true when the customer requests a call/human, has a complaint, or asks about an existing booking.
+- ready: true once you know name AND destination AND travel month — OR whenever handover is true.
 - After ready, keep the conversation moving toward quotation/booking — don't keep adding descriptive content once qualifying is done.`;
 
-// Claude call with 1 automatic retry on invalid JSON.
+// ── v3.8 — FORCED TOOL-USE SCHEMA (structured output) ──
+// Previously Maya was asked to "respond only with JSON" as free text, which
+// occasionally broke JSON.parse when her generated reply contained a stray
+// quote/apostrophe the model didn't escape cleanly — caught by the retry +
+// fallback safety net, but the customer still got a generic reply on those
+// turns. Forcing a tool call with this schema makes Claude's API itself
+// guarantee valid structured output — the SDK handles the escaping, not us.
+const MAYA_REPLY_TOOL = {
+  name: 'maya_reply',
+  description: "Maya's structured WhatsApp reply and lead-capture data for this turn.",
+  input_schema: {
+    type: 'object',
+    properties: {
+      reply: { type: 'string', description: 'Single-paragraph WhatsApp message, no line breaks, no signature.' },
+      intent: { type: 'string', enum: VALID_INTENTS },
+      lead: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          destination: { type: 'string' },
+          travel_month: { type: 'string' },
+          pax: { type: 'string' },
+          budget: { type: 'string' },
+          type: { type: 'string', enum: ['holiday', 'visa', 'flights', 'hotel', 'cruise', 'corporate', 'other'] }
+        },
+        required: ['name', 'destination', 'travel_month', 'pax', 'budget', 'type']
+      },
+      lead_summary: { type: 'string', description: "One actionable line for the sales team, e.g. 'Singapore tourist visa for Sept 2026, 2 pax, awaiting expert callback'." },
+      next_action: { type: 'string', description: 'The first thing the assigned expert should do.' },
+      handover: { type: 'boolean' },
+      ready: { type: 'boolean' }
+    },
+    required: ['reply', 'intent', 'lead', 'lead_summary', 'next_action', 'handover', 'ready']
+  }
+};
+
+// Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
 async function callMayaJSON(msgs, known, phone) {
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
-  let lastRaw = '';
   for (let attempt = 0; attempt < 2; attempt++) {
-    const messages = attempt === 0 ? msgs : [
-      ...msgs,
-      { role: 'assistant', content: lastRaw || '(invalid output)' },
-      { role: 'user', content: 'Your previous output was not valid JSON. Respond ONLY with the JSON object in the exact specified format — no other text, no markdown fences.' }
-    ];
     try {
       const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -855,20 +896,23 @@ async function callMayaJSON(msgs, known, phone) {
           model: CHAT_MODEL,
           max_tokens: 600,
           system: CHAT_SYSTEM + knownLine,
-          messages
+          messages: msgs,
+          tools: [MAYA_REPLY_TOOL],
+          tool_choice: { type: 'tool', name: 'maya_reply' }
         })
       }, 'Claude-chat');
       const d = await r.json();
-      lastRaw = (d.content?.[0]?.text || '').trim().replace(/```json|```/g, '').trim();
-      const parsed = JSON.parse(lastRaw);
-      if (parsed && typeof parsed.reply === 'string') {
-        // Validation: intent whitelist
+      const toolBlock = (d.content || []).find(b => b.type === 'tool_use' && b.name === 'maya_reply');
+      if (toolBlock && toolBlock.input && typeof toolBlock.input.reply === 'string') {
+        const parsed = toolBlock.input;
+        // Validation: intent whitelist (belt-and-suspenders — schema enum
+        // already constrains this, but guard against edge-case drift)
         if (!VALID_INTENTS.includes(parsed.intent)) parsed.intent = 'other_travel';
         return parsed;
       }
-      throw new Error('JSON missing reply field');
+      throw new Error('No valid maya_reply tool_use block in response');
     } catch (e) {
-      console.error(`Maya JSON attempt ${attempt + 1} failed [${phone}]:`, e.message);
+      console.error(`Maya tool-call attempt ${attempt + 1} failed [${phone}]:`, e.message);
     }
   }
   return null;
@@ -1341,8 +1385,8 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '3.7',
-  state: 'persistent + reply-first + sales-consultant Maya (qualify-first) + unsupported-media auto-reply + spam filter + manual-lead notify + team notification crons',
+  version: '3.8',
+  state: 'persistent + reply-first + sales-consultant Maya + forced-tool-use structured output + unsupported-media auto-reply + spam filter + manual-lead notify + team notification crons',
   endpoints: [
     '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
     '/notify/manual-lead',
@@ -1351,4 +1395,4 @@ app.get('/health', (req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.7 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.8 running on port ${PORT}`));

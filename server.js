@@ -7,8 +7,18 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ═══════════════════════════════════════════════════════════════
-// ESCAPENFLY AI ENGINE v3.3  (consultative brain rewrite)
-// New in 3.3 (vs 3.2):
+// ESCAPENFLY AI ENGINE v3.4  (unsupported-media auto-reply, no paid Flow needed)
+// New in 3.4 (vs 3.3):
+// - Incoming images/documents/stickers/forwards (anything with no text) now
+//   get an automatic reply pointing the customer to a phone number, instead
+//   of being silently ignored. This replaces the old AiSensy Flow-based
+//   fallback (which cost extra) — it's sent via the same free maya_session
+//   campaign Maya already uses, so there's no additional AiSensy cost.
+// - 60s per-phone cooldown so a burst of images (e.g. passport/Aadhaar photos
+//   sent one after another) only triggers ONE reply, not one per image.
+// - The old AiSensy Flow-based fallback (Vivek/Abhishek numbers) can now be
+//   safely left disabled — this server-side reply fully replaces it.
+// v3.3 changes (retained):
 // - CHAT_SYSTEM fully rewritten: Maya now leads every reply with genuine
 //   destination expertise (highlights, best season, sample routes/duration)
 //   BEFORE asking her one question. A bare question with no value-add is
@@ -819,6 +829,11 @@ function withPhoneLock(phone, fn) {
 
 // ── WEBHOOK MESSAGE-ID DEDUPE (catches AiSensy re-deliveries beyond 8s) ──
 const seenMsgIds = new Set();
+// v3.4 — cooldown so a burst of images/docs (e.g. Aadhaar/passport photos sent
+// one after another) triggers the "I can't read media" reply only once, not
+// once per image.
+const mediaFallbackSentAt = new Map(); // phone -> last-sent timestamp (ms)
+const MEDIA_FALLBACK_COOLDOWN_MS = 60 * 1000;
 function isDuplicateMsgId(id) {
   if (!id) return false;
   if (seenMsgIds.has(id)) return true;
@@ -835,6 +850,7 @@ function isDuplicateMsgId(id) {
 // onReply(replyText) is awaited the MOMENT the reply exists — before any
 // CRM/routing/notification work. Customer latency = Claude time + send time.
 const FALLBACK_REPLY = 'Thanks for your message! Our travel expert will call you shortly. You can also reach us directly at +91 98517 39851. 😊';
+const UNSUPPORTED_MEDIA_REPLY = "Thanks for sharing that! I work best with text messages right now, so I can't open images, documents, or links yet. For general enquiries, please call us at +91 98517 39851. For partner & DMC queries, contact Vivek Bansal at 9988740145. For complaints or urgent issues, contact Vineet Bansal at 9216320050. Just type your travel query in words and I'll help right away!";
 
 async function mayaTurn(phone, message, onReply) {
   const t0 = Date.now();
@@ -1073,7 +1089,17 @@ app.post('/webhook/incoming', async (req, res) => {
 
     if (!phone || !validPhone(phone)) { console.log('Incoming ignored: no valid phone in payload.'); return; }
     if (phone === WA_NUM) return;                          // never talk to ourselves
-    if (!text) { console.log(`Incoming from ${phone} ignored: empty/media-only (${msgType || 'unknown type'}).`); return; }
+    if (!text) {
+      console.log(`Incoming from ${phone}: empty/media-only (${msgType || 'unknown type'}) — sending fallback reply.`);
+      const lastSent = mediaFallbackSentAt.get(phone) || 0;
+      if (Date.now() - lastSent > MEDIA_FALLBACK_COOLDOWN_MS) {
+        mediaFallbackSentAt.set(phone, Date.now());
+        await sendSessionMessage(phone, UNSUPPORTED_MEDIA_REPLY);
+      } else {
+        console.log(`↩️ [${phone}] media fallback suppressed — sent one within the last ${MEDIA_FALLBACK_COOLDOWN_MS / 1000}s (e.g. multiple images in a row).`);
+      }
+      return;
+    }
     if (isDuplicateMsgId(msgId)) { console.log(`↩️ [${phone}] duplicate message id ${msgId} — ignored.`); return; }
 
     // ALWAYS-REPLY policy; muted phones handled inside mayaTurn.
@@ -1225,8 +1251,8 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '3.3',
-  state: 'persistent + reply-first + consultative expert-led Maya + team notification crons',
+  version: '3.4',
+  state: 'persistent + reply-first + consultative Maya + unsupported-media auto-reply + team notification crons',
   endpoints: [
     '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
     '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary'
@@ -1234,4 +1260,4 @@ app.get('/health', (req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.3 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.4 running on port ${PORT}`));

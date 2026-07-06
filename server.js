@@ -7,8 +7,16 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ═══════════════════════════════════════════════════════════════
-// ESCAPENFLY AI ENGINE v3.4  (unsupported-media auto-reply, no paid Flow needed)
-// New in 3.4 (vs 3.3):
+// ESCAPENFLY AI ENGINE v3.5  (vendor/spam pitch filter)
+// New in 3.5 (vs 3.4):
+// - Keyword-based filter catches cold marketing/vendor pitches (content
+//   agencies, SEO/marketing services, etc.) BEFORE they reach Maya or
+//   create a CRM lead. Previously, a generic follow-up like "can we connect
+//   on a call?" from such a contact got misread as a genuine customer
+//   handover request. Once a phone sends one spam pitch, ALL future
+//   messages from that number are silently skipped (in-memory, resets on
+//   restart). Saves Anthropic API cost on obvious junk too.
+// v3.4 changes (retained):
 // - Incoming images/documents/stickers/forwards (anything with no text) now
 //   get an automatic reply pointing the customer to a phone number, instead
 //   of being silently ignored. This replaces the old AiSensy Flow-based
@@ -125,6 +133,28 @@ const shortHaulPool = ['lalit', 'divya', 'shubham'];
 const longHaulPool  = ['anjan', 'shubham'];
 
 const VALID_INTENTS = ['holiday','visa','flights','hotel','cruise','corporate','mice','existing_booking','complaint','human_support','other_travel','off_topic'];
+
+// ── v3.4 — VENDOR/SPAM FILTER ──
+// Cold marketing pitches (content agencies, SEO/marketing services, etc.)
+// sometimes message the business number, and phrases like "can we connect
+// on a call" get misread by the intent classifier as a genuine customer
+// handover request — creating a junk lead and pinging a rep for nothing.
+// This is a cheap keyword check that runs BEFORE any Claude call, so it
+// also saves API cost on obvious junk.
+const SPAM_KEYWORDS = [
+  'ugc', 'content creation', 'content creator', 'marketing services', 'digital marketing',
+  'grow your business', 'boost your business', 'increase your sales', 'seo services',
+  'social media services', 'social media management', 'influencer marketing',
+  'video editing services', 'product shoot', 'brand collaboration', 'sponsorship opportunity',
+  'web development services', 'app development services', 'website development',
+  'backlink', 'guest post', 'link building', 'google ranking', 'run ads for you',
+  'investment opportunity', 'crypto', 'loan approved', 'lottery', 'work from home job',
+  'limited slots', 'reply "ugc"', 'book now!'
+];
+function looksLikeSpam(text) {
+  const t = String(text || '').toLowerCase();
+  return SPAM_KEYWORDS.some(k => t.includes(k));
+}
 
 // ── CLAUDE-BASED ASSIGNMENT (primary) ──
 async function assignTeamWithClaude(data) {
@@ -834,6 +864,13 @@ const seenMsgIds = new Set();
 // once per image.
 const mediaFallbackSentAt = new Map(); // phone -> last-sent timestamp (ms)
 const MEDIA_FALLBACK_COOLDOWN_MS = 60 * 1000;
+// Once a phone sends one spam/vendor pitch, remember it so later messages
+// from the same number (e.g. "can we connect on a call?" follow-ups) are
+// also silently skipped, even if that later message alone has no keyword
+// match. In-memory only — resets on server restart, same tradeoff as
+// seenMsgIds; fine since spam contacts also get flagged fresh via keywords
+// if they message again after a restart.
+const knownSpamPhones = new Set();
 function isDuplicateMsgId(id) {
   if (!id) return false;
   if (seenMsgIds.has(id)) return true;
@@ -1089,6 +1126,13 @@ app.post('/webhook/incoming', async (req, res) => {
 
     if (!phone || !validPhone(phone)) { console.log('Incoming ignored: no valid phone in payload.'); return; }
     if (phone === WA_NUM) return;                          // never talk to ourselves
+
+    if (knownSpamPhones.has(phone) || looksLikeSpam(text)) {
+      knownSpamPhones.add(phone);
+      console.log(`🚫 [${phone}] vendor/spam pitch detected — skipping Maya, no lead created. Message: "${short(text)}"`);
+      return;
+    }
+
     if (!text) {
       console.log(`Incoming from ${phone}: empty/media-only (${msgType || 'unknown type'}) — sending fallback reply.`);
       const lastSent = mediaFallbackSentAt.get(phone) || 0;
@@ -1251,8 +1295,8 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '3.4',
-  state: 'persistent + reply-first + consultative Maya + unsupported-media auto-reply + team notification crons',
+  version: '3.5',
+  state: 'persistent + reply-first + consultative Maya + unsupported-media auto-reply + spam filter + team notification crons',
   endpoints: [
     '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
     '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary'
@@ -1260,4 +1304,4 @@ app.get('/health', (req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.4 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.5 running on port ${PORT}`));

@@ -335,6 +335,72 @@ async function saveChat(chat) {
   }
 }
 
+// ── CUSTOMER_PROFILE — cross-visit memory keyed by phone (§11 Phase 1) ──
+// Distinct from ai_chats (24h conversation window) and enquiries.original_message_text
+// (per-enquiry blob): this is the one place info survives across SEPARATE enquiries,
+// weeks or months apart. Non-destructive merge, same spirit as mergeLeadData — a
+// later visit enriches the profile, it never erases what an earlier visit learned.
+async function loadCustomerProfile(phone) {
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/customer_profile?phone=eq.${phone}&select=profile`, { headers: SB_HEADERS }, 'SB-loadProfile');
+    if (!r.ok) { console.error('loadCustomerProfile failed:', r.status, await r.text()); return {}; }
+    const rows = await r.json();
+    return rows[0]?.profile || {};
+  } catch (e) {
+    console.error('loadCustomerProfile error:', e.message);
+    return {};
+  }
+}
+
+async function upsertCustomerProfile(phone, known) {
+  if (!validPhone(phone)) return false;
+  try {
+    const existing = await loadCustomerProfile(phone);
+    // Only carry over fields that actually say something — same non-empty-wins
+    // rule as mergeLeadData, applied field-by-field into the jsonb blob.
+    const merged = { ...existing };
+    for (const k of ['name', 'destination', 'travelMonth', 'pax', 'budget', 'type', 'intent']) {
+      const v = String(known?.[k] || '').trim();
+      if (v && v.toLowerCase() !== 'unknown' && !v.startsWith('Unknown (')) merged[k] = v;
+    }
+    merged.lastSeen = new Date().toISOString();
+    const r = await fetchRetry(`${SB_URL}/rest/v1/customer_profile?on_conflict=phone`, {
+      method: 'POST',
+      headers: { ...SB_HEADERS, 'Prefer': 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify({ phone, profile: merged, updated_at: new Date().toISOString() })
+    }, 'SB-saveProfile');
+    if (!r.ok) { console.error('upsertCustomerProfile failed:', r.status, await r.text()); return false; }
+    return true;
+  } catch (e) {
+    console.error('upsertCustomerProfile error:', e.message);
+    return false;
+  }
+}
+
+// ── SESSION → PHONE GRADUATION (§11 unresolved-design-problem) ──
+// A website visitor has no phone until partway through the conversation, so
+// their chat is keyed by a temporary session id (fails validPhone()) instead
+// of a phone. The moment Maya's structured output captures a real phone
+// (lead.phone — added to the schema specifically for this), this does a
+// one-time handoff: re-save the accumulated conversation under the phone key
+// and start a customer_profile row for it.
+// KNOWN LIMITATION, not solved here: if that phone already has an active
+// ai_chats row from a separate WhatsApp conversation in the last 24h, this
+// will overwrite it (saveChat upserts on phone). True cross-channel
+// conversation merging is future work.
+async function graduateSessionToPhone(sessionKey, phone, chat) {
+  try {
+    chat.phone = phone;
+    await saveChat(chat);
+    await upsertCustomerProfile(phone, chat.known || {});
+    console.log(`🔗 [website] session ${sessionKey} graduated to phone ${phone}`);
+    return true;
+  } catch (e) {
+    console.error('graduateSessionToPhone error:', e.message);
+    return false;
+  }
+}
+
 // ── Lead dedupe via enquiries.phone ──
 async function findRecentLeadDB(phone) {
   try {
@@ -786,14 +852,16 @@ const CHANNEL_ADAPTERS = {
     formatRule: 'CRITICAL FORMAT RULE: your reply must be a SINGLE PARAGRAPH with NO line breaks (technical requirement of WhatsApp templates). For short lists, use "•" separators inline.',
     signatureRule: 'NEVER add a signature, greeting header, or "— Team EscapeNFly" — the message template adds branding automatically.',
     // Describes the `reply` field to Claude inside the OUTPUT contract.
-    replyFieldDesc: 'your single-paragraph WhatsApp message (no line breaks, no signature).'
+    replyFieldDesc: 'your single-paragraph WhatsApp message (no line breaks, no signature).',
+    contactCaptureRule: ''
   },
   website: {
     context: ", chatting with a visitor in EscapeNFly's website chat widget",
     toneClause: 'typing in a live chat window',
     formatRule: 'FORMAT: relaxed vs WhatsApp — short paragraphs, and a line break between a brief intro and a 3-4 item "•" list is fine for Stage 2 recommendations. Do not overuse line breaks — most replies should still read as 2-4 sentences, not a wall of bullets.',
     signatureRule: 'NEVER add a signature or "— Team EscapeNFly" — the chat widget already shows Maya\'s name and avatar.',
-    replyFieldDesc: 'your chat message. Plain text; a line break before a short "•" list is allowed for Stage 2, otherwise keep it a short block with no line breaks.'
+    replyFieldDesc: 'your chat message. Plain text; a line break before a short "•" list is allowed for Stage 2, otherwise keep it a short block with no line breaks.',
+    contactCaptureRule: '\n\nUnlike WhatsApp, you do NOT already know this visitor\'s phone number. Once you reach Stage 3 (or handover), naturally ask for their name and a phone/WhatsApp number as part of moving to the next step — e.g. "Let me get our expert to send you a detailed quotation, what\'s the best number to reach you on?" — not as a separate, bureaucratic ask. Capture it in lead.phone the moment they give it.'
   }
 };
 
@@ -804,7 +872,8 @@ function buildChatSystem(channel) {
     .replace('{{TONE_CHANNEL_CLAUSE}}', a.toneClause)
     .replace('{{FORMAT_RULE}}', a.formatRule)
     .replace('{{SIGNATURE_RULE}}', a.signatureRule)
-    .replace('{{REPLY_FIELD_DESC}}', a.replyFieldDesc);
+    .replace('{{REPLY_FIELD_DESC}}', a.replyFieldDesc)
+    .replace('{{CONTACT_CAPTURE_RULE}}', a.contactCaptureRule || '');
 }
 
 const CHAT_CORE = `You are Maya, one of EscapeNFly's senior travel consultants{{CHANNEL_CONTEXT}}. You are not a travel blog, not ChatGPT, and not a destination encyclopedia. You are a salesperson whose one job is converting this enquiry into a qualified lead and, eventually, a booking.
@@ -841,7 +910,7 @@ RIGHT:
 "For a 5-day trip we usually base you in Almaty city and cover Big Almaty Lake, Charyn Canyon, Kok Tobe and the main city sights. Depending on your budget we can do this with 3-star, 4-star or premium hotels, and private or group (SIC) tours. When are you looking to travel, and how many people?"
 
 STAGE 3 — enough is known (destination + month + pax, ideally budget/hotel preference too):
-Stop asking more questions. Move explicitly toward conversion: offer to prepare a customised itinerary/quotation, offer hotel options, offer visa assistance, or offer a callback. Never end a qualified conversation without proposing this next step.
+Stop asking more questions. Move explicitly toward conversion: offer to prepare a customised itinerary/quotation, offer hotel options, offer visa assistance, or offer a callback. Never end a qualified conversation without proposing this next step.{{CONTACT_CAPTURE_RULE}}
 
 VISA DOCUMENT CHECKLISTS — still give these in full immediately when asked, since this is decision-relevant, not blog content:
 Example — Singapore tourist visa for Indian passport holders: passport with 6+ months validity and blank pages, recent passport-size photos (white background, 35x45mm), completed Form 14A, last 3 months bank statements, covering letter, confirmed return flight details and hotel booking, applied through an authorised agent like EscapeNFly (Indians cannot apply directly). Give equivalent genuine checklists for other countries you know.
@@ -873,7 +942,7 @@ YOUR QUIET MISSION: qualify the lead and move it toward a quotation or booking, 
 OUTPUT — you will call the maya_reply tool on every turn with these fields:
 - reply: {{REPLY_FIELD_DESC}}
 - intent: one of the classified intents.
-- lead: name, destination, travel_month, pax, budget, type — CUMULATIVE, include everything from KNOWN LEAD INFO plus anything new this turn; empty string if a field is still unknown.
+- lead: name, destination, travel_month, pax, budget, type — CUMULATIVE, include everything from KNOWN LEAD INFO plus anything new this turn; empty string if a field is still unknown. phone: only relevant on website chat (see contact-capture rule above) — leave empty until captured.
 - lead_summary: one actionable line for the sales team, e.g. "Singapore tourist visa for Sept 2026, 2 pax, awaiting expert callback".
 - next_action: the first thing the assigned expert should do.
 - handover: true when the customer requests a call/human, has a complaint, or asks about an existing booking.
@@ -903,7 +972,8 @@ const MAYA_REPLY_TOOL = {
           travel_month: { type: 'string' },
           pax: { type: 'string' },
           budget: { type: 'string' },
-          type: { type: 'string', enum: ['holiday', 'visa', 'flights', 'hotel', 'cruise', 'corporate', 'other'] }
+          type: { type: 'string', enum: ['holiday', 'visa', 'flights', 'hotel', 'cruise', 'corporate', 'other'] },
+          phone: { type: 'string', description: "Website-only: the visitor's phone/WhatsApp number once captured (per the contact-capture rule). Leave empty on WhatsApp (already known) and on website before it's been given." }
         },
         required: ['name', 'destination', 'travel_month', 'pax', 'budget', 'type']
       },
@@ -1066,9 +1136,23 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp') {
     };
     chat.known = mergeLeadData(chat.known || {}, freshData);
 
+    // ── WEBSITE SESSION → PHONE GRADUATION (§11) ──
+    let effectivePhone = phone;
+    const capturedPhoneRaw = parsed.lead?.phone ? String(parsed.lead.phone).replace(/\D/g, '') : '';
+    if (channel === 'website' && !validPhone(phone) && validPhone(capturedPhoneRaw)) {
+      await graduateSessionToPhone(phone, capturedPhoneRaw, chat);
+      effectivePhone = capturedPhoneRaw;
+    } else if (validPhone(phone)) {
+      // Already phone-keyed (WhatsApp, or a website session past graduation) —
+      // keep customer_profile current every turn, not just at graduation.
+      await upsertCustomerProfile(phone, chat.known);
+    }
+    chat.phone = effectivePhone;
+    chat.known.phone = effectivePhone;
+
     // ── LEAD CAPTURE (background from customer's perspective) ──
-    if ((parsed.ready || parsed.handover) && validPhone(phone)) {
-      const recent = await findRecentLeadDB(phone);
+    if ((parsed.ready || parsed.handover) && validPhone(effectivePhone)) {
+      const recent = await findRecentLeadDB(effectivePhone);
       if (recent) {
         const merged = mergeLeadData(recent.existing, chat.known);
         const sig = JSON.stringify(merged);
@@ -1095,7 +1179,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp') {
     }
 
     await saveChat(chat);
-    console.log(`▶ [${phone}] IN:"${short(message)}" | intent:${log.intent} | ready:${!!parsed.ready} handover:${!!parsed.handover} | reply:"${short(reply, 60)}" | CRM:${log.crm} | notify:${log.notify} | load:${tLoad - t0}ms ai:${tAI - tLoad}ms send:${tSent - tAI}ms post:${Date.now() - tSent}ms total:${Date.now() - t0}ms`);
+    console.log(`▶ [${phone}${effectivePhone !== phone ? '→' + effectivePhone : ''}] IN:"${short(message)}" | intent:${log.intent} | ready:${!!parsed.ready} handover:${!!parsed.handover} | reply:"${short(reply, 60)}" | CRM:${log.crm} | notify:${log.notify} | load:${tLoad - t0}ms ai:${tAI - tLoad}ms send:${tSent - tAI}ms post:${Date.now() - tSent}ms total:${Date.now() - t0}ms`);
     return reply;
   } catch (e) {
     console.error(`AI chat error [${phone}]:`, e.message);
@@ -1450,4 +1534,4 @@ app.get('/health', (req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.8 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.9 running on port ${PORT}`));

@@ -1497,23 +1497,49 @@ app.post('/notify/manual-lead', async (req, res) => {
 });
 
 // ── WEBSITE LEAD ──
+// v3.9 fix (§9 debt #6, §11): previously always created a new enquiries row,
+// unlike the WhatsApp path — a repeat form submission from the same visitor
+// created a duplicate lead every time. Now checks findRecentLeadDB first,
+// same dedupe-and-enrich pattern as /webhook/aisensy. Only fires the
+// assignment notification + WhatsApp welcome template on genuinely NEW leads —
+// a repeat submission enriches the existing lead quietly instead of re-pinging
+// the assigned rep and re-messaging the customer every time they resubmit.
 app.post('/webhook/website', async (req, res) => {
   res.json({ status: 'ok' });
 
   try {
     const leadData = mergeLeadData({}, { ...req.body, phone: String(req.body.phone || '').replace(/\D/g, ''), source: 'website-form' });
     if (!leadData.name) leadData.name = 'Unknown (Website)';
-    const assigned = await assignTeamWithClaude(leadData);
-    const leadId = await saveLead(leadData, assigned);
-    const nOk = await notifyTeam(assigned, leadData);
-    console.log(`Lead processed (website): ${leadData.name} → ${assigned.name} | CRM:${leadId ? 'ok' : 'FAILED'} | notify:${nOk ? 'ok' : 'FAILED'}`);
+
+    const process = async () => {
+      if (validPhone(leadData.phone)) {
+        const recent = await findRecentLeadDB(leadData.phone);
+        if (recent) {
+          const merged = mergeLeadData(recent.existing, leadData);
+          const ok = await updateLead(recent.id, merged);
+          console.log(`Lead enriched (website): ${merged.name} (${leadData.phone}) → ${recent.id} | CRM:${ok ? 'ok' : 'FAILED'}`);
+          return;
+        }
+      }
+      const assigned = await assignTeamWithClaude(leadData);
+      const leadId = await saveLead(leadData, assigned);
+      const nOk = await notifyTeam(assigned, leadData);
+      console.log(`Lead processed (website): ${leadData.name} → ${assigned.name} | CRM:${leadId ? 'ok' : 'FAILED'} | notify:${nOk ? 'ok' : 'FAILED'}`);
+
+      if (validPhone(leadData.phone)) {
+        await sendWA(
+          leadData.phone,
+          'website_lead_welcome',
+          [leadData.name || 'there', leadData.destination || 'your trip', assigned.name]
+        );
+      }
+    };
 
     if (validPhone(leadData.phone)) {
-      await sendWA(
-        leadData.phone,
-        'website_lead_welcome',
-        [leadData.name || 'there', leadData.destination || 'your trip', assigned.name]
-      );
+      await withPhoneLock(leadData.phone, process);
+    } else {
+      // No phone to dedupe or lock on — behaves exactly as before.
+      await process();
     }
   } catch (e) {
     console.error('Website webhook error:', e);

@@ -1071,7 +1071,7 @@ function isDuplicateMsgId(id) {
 const FALLBACK_REPLY = 'Thanks for your message! Our travel expert will call you shortly. You can also reach us directly at +91 98517 39851. 😊';
 const UNSUPPORTED_MEDIA_REPLY = "Thanks for sharing that! I work best with text messages right now, so I can't open images, documents, or links yet. For general enquiries, please call us at +91 98517 39851. For partner & DMC queries, contact Vivek Bansal at 9988740145. For complaints or urgent issues, contact Vineet Bansal at 9216320050. Just type your travel query in words and I'll help right away!";
 
-async function mayaTurn(phone, message, onReply, channel = 'whatsapp') {
+async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef = null) {
   const t0 = Date.now();
   const log = { intent: '-', crm: 'none', notify: '-' };
   let tAI = t0, tSent = t0;
@@ -1102,6 +1102,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp') {
       chat.lastReply = FALLBACK_REPLY;
       if (onReply) await onReply(FALLBACK_REPLY);
       await saveChat(chat);
+      if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = phone; }
       console.log(`▶ [${phone}] IN:"${short(message)}" | intent:ERR | reply:FALLBACK | ai:${tAI - tLoad}ms total:${Date.now() - t0}ms`);
       return FALLBACK_REPLY;
     }
@@ -1179,11 +1180,13 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp') {
     }
 
     await saveChat(chat);
+    if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = effectivePhone; }
     console.log(`▶ [${phone}${effectivePhone !== phone ? '→' + effectivePhone : ''}] IN:"${short(message)}" | intent:${log.intent} | ready:${!!parsed.ready} handover:${!!parsed.handover} | reply:"${short(reply, 60)}" | CRM:${log.crm} | notify:${log.notify} | load:${tLoad - t0}ms ai:${tAI - tLoad}ms send:${tSent - tAI}ms post:${Date.now() - tSent}ms total:${Date.now() - t0}ms`);
     return reply;
   } catch (e) {
     console.error(`AI chat error [${phone}]:`, e.message);
     if (onReply) { try { await onReply(FALLBACK_REPLY); } catch (_) {} }
+    if (resultRef) { resultRef.known = {}; resultRef.effectivePhone = phone; }
     return FALLBACK_REPLY;
   }
 }
@@ -1254,19 +1257,28 @@ app.post('/webhook/chat', async (req, res) => {
   res.json({ reply: reply || FALLBACK_REPLY });
 });
 
-// ── WEBSITE CHAT — BRAIN-ONLY TEST ENDPOINT (§11 Phase 1, step 1 of build) ──
-// Forces channel='website' so the split prompt/adapter can be verified in
-// isolation. TEMPORARY: keys the conversation by phone (or a client-supplied
-// session id passed as `phone`) exactly like /webhook/chat does today — this
-// does NOT yet implement the pre-phone session-key → customer_profile merge
-// flagged in §11 as an unresolved design problem. That, plus the
-// customer_profile table and the /webhook/website dedupe fix, are the next
-// build steps once this split is confirmed working.
+// ── WEBSITE CHAT (§11 Phase 1 — real endpoint, not just a test harness now) ──
+// Client sends a session id in `phone` until a real phone is captured (see
+// graduateSessionToPhone). Response now also returns the structured trip
+// details Maya has gathered so far (for a live-updating summary UI) and
+// `sessionKey` — the id the client should send on its NEXT message. Usually
+// unchanged; changes to the real phone the turn graduation happens.
 app.post('/webhook/website-chat', async (req, res) => {
   const sessionKey = String(cleanAttr(req.body.phone || req.body.sessionId || '') || '').replace(/[^a-zA-Z0-9]/g, '') || 'unknown';
   const message = cleanAttr(req.body.message || req.body.text || '') || 'Hi';
-  const reply = await withPhoneLock(sessionKey, () => mayaTurn(sessionKey, message, null, 'website'));
-  res.json({ reply: reply || FALLBACK_REPLY });
+  const out = {};
+  const reply = await withPhoneLock(sessionKey, () => mayaTurn(sessionKey, message, null, 'website', out));
+  res.json({
+    reply: reply || FALLBACK_REPLY,
+    lead: {
+      destination: out.known?.destination || '',
+      travelMonth: out.known?.travelMonth || '',
+      pax: out.known?.pax || '',
+      budget: out.known?.budget || '',
+      name: out.known?.name || ''
+    },
+    sessionKey: out.effectivePhone || sessionKey
+  });
 });
 
 // ── DEEP PAYLOAD SCANNER (fallback if AiSensy changes payload shape) ──

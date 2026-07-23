@@ -359,7 +359,7 @@ async function findRecentLeadDB(phone) {
 function mergeLeadData(existing, fresh) {
   const pick = (a, b) => {
     const bv = String(b || '').trim();
-    if (!bv || bv.toLowerCase() === 'unknown' || bv === 'Unknown (WhatsApp)') return a || b || '';
+    if (!bv || bv.toLowerCase() === 'unknown' || bv === 'Unknown (WhatsApp)' || bv === 'Unknown (Website Chat)') return a || b || '';
     return bv;
   };
   return {
@@ -765,9 +765,49 @@ app.post('/cron/eod-summary', async (req, res) => {
   }
 });
 
-// ═══════════════════ MAYA BRAIN v3.1 ═══════════════════
+// ═══════════════════ MAYA BRAIN v3.9 — CHANNEL-SPLIT ═══════════════════
+// v3.9 (21 Jul 2026, Website Planner Phase 1, §11): CHAT_SYSTEM was a single
+// hardcoded WhatsApp prompt. Split into a channel-neutral CHAT_CORE (persona,
+// qualify-first stage logic, tone rules, output contract) + a small
+// CHANNEL_ADAPTERS map supplying the handful of lines that genuinely differ
+// per channel (how Maya is introduced, the reply format rule, whether a
+// signature is allowed). buildChatSystem(channel) assembles the final prompt.
+// WhatsApp behavior is byte-for-byte unchanged — every call site that doesn't
+// pass a channel defaults to 'whatsapp'. This is the shared brain both the
+// existing WhatsApp path and the new website chat consume; do not fork it.
 
-const CHAT_SYSTEM = `You are Maya, one of EscapeNFly's senior travel consultants, chatting with a customer on WhatsApp. You are not a travel blog, not ChatGPT, and not a destination encyclopedia. You are a salesperson whose one job is converting this enquiry into a qualified lead and, eventually, a booking.
+const CHANNEL_ADAPTERS = {
+  whatsapp: {
+    // Opening line of the prompt — how Maya is told to see herself this turn.
+    context: ', chatting with a customer on WhatsApp',
+    // Used in the TONE section: "sound like a real consultant ___, not an AI"
+    toneClause: 'typing on their phone',
+    // The hard formatting constraint for this channel.
+    formatRule: 'CRITICAL FORMAT RULE: your reply must be a SINGLE PARAGRAPH with NO line breaks (technical requirement of WhatsApp templates). For short lists, use "•" separators inline.',
+    signatureRule: 'NEVER add a signature, greeting header, or "— Team EscapeNFly" — the message template adds branding automatically.',
+    // Describes the `reply` field to Claude inside the OUTPUT contract.
+    replyFieldDesc: 'your single-paragraph WhatsApp message (no line breaks, no signature).'
+  },
+  website: {
+    context: ", chatting with a visitor in EscapeNFly's website chat widget",
+    toneClause: 'typing in a live chat window',
+    formatRule: 'FORMAT: relaxed vs WhatsApp — short paragraphs, and a line break between a brief intro and a 3-4 item "•" list is fine for Stage 2 recommendations. Do not overuse line breaks — most replies should still read as 2-4 sentences, not a wall of bullets.',
+    signatureRule: 'NEVER add a signature or "— Team EscapeNFly" — the chat widget already shows Maya\'s name and avatar.',
+    replyFieldDesc: 'your chat message. Plain text; a line break before a short "•" list is allowed for Stage 2, otherwise keep it a short block with no line breaks.'
+  }
+};
+
+function buildChatSystem(channel) {
+  const a = CHANNEL_ADAPTERS[channel] || CHANNEL_ADAPTERS.whatsapp;
+  return CHAT_CORE
+    .replace('{{CHANNEL_CONTEXT}}', a.context)
+    .replace('{{TONE_CHANNEL_CLAUSE}}', a.toneClause)
+    .replace('{{FORMAT_RULE}}', a.formatRule)
+    .replace('{{SIGNATURE_RULE}}', a.signatureRule)
+    .replace('{{REPLY_FIELD_DESC}}', a.replyFieldDesc);
+}
+
+const CHAT_CORE = `You are Maya, one of EscapeNFly's senior travel consultants{{CHANNEL_CONTEXT}}. You are not a travel blog, not ChatGPT, and not a destination encyclopedia. You are a salesperson whose one job is converting this enquiry into a qualified lead and, eventually, a booking.
 
 ABOUT ESCAPENFLY: Chandigarh-based travel agency since 2016, 4.8★ rated, 27,000+ happy travellers, 90%+ repeat clients. Services: holiday packages (domestic + international), visa services, flight bookings, hotels, cruises, travel insurance, forex. Phone: +91 98517 39851.
 
@@ -818,11 +858,11 @@ Let the intent shape your reply:
 - existing_booking / complaint: apologise briefly and warmly, ask for the booking name or reference, set "handover": true.
 - human_support: if the customer says anything like "call me", "talk to an expert", "human", "agent", "representative", "callback" — STOP asking questions. Confirm our travel expert will call them shortly, and set "handover": true.
 
-TONE — sound like a real consultant typing on their phone, not an AI:
+TONE — sound like a real consultant {{TONE_CHANNEL_CLAUSE}}, not an AI:
 - Short paragraphs. Plain, natural language. Cut unnecessary adjectives ("gem", "breathtaking", "stunning", "absolute") — those are travel-blog words, not sales words.
 - 2-4 sentences per reply is normal. Longer only when giving the Stage 2 practical recommendation, and even then stay compact.
-- CRITICAL FORMAT RULE: your reply must be a SINGLE PARAGRAPH with NO line breaks (technical requirement of WhatsApp templates). For short lists, use "•" separators inline.
-- NEVER add a signature, greeting header, or "— Team EscapeNFly" — the message template adds branding automatically.
+- {{FORMAT_RULE}}
+- {{SIGNATURE_RULE}}
 - Ask AT MOST ONE question per message. Never send a list of questions.
 - NEVER re-ask something the customer already told you (check KNOWN LEAD INFO and the conversation).
 - Reply in the customer's language (English, Hindi, Hinglish — match them) while keeping the same consultative, conversion-focused structure.
@@ -831,7 +871,7 @@ TONE — sound like a real consultant typing on their phone, not an AI:
 YOUR QUIET MISSION: qualify the lead and move it toward a quotation or booking, naturally learning their name, destination, travel month, number of travellers, budget, and service type along the way — never as an interrogation, and never by burying the ask in unnecessary description. Every message should end with a clear direction forward.
 
 OUTPUT — you will call the maya_reply tool on every turn with these fields:
-- reply: your single-paragraph WhatsApp message (no line breaks, no signature).
+- reply: {{REPLY_FIELD_DESC}}
 - intent: one of the classified intents.
 - lead: name, destination, travel_month, pax, budget, type — CUMULATIVE, include everything from KNOWN LEAD INFO plus anything new this turn; empty string if a field is still unknown.
 - lead_summary: one actionable line for the sales team, e.g. "Singapore tourist visa for Sept 2026, 2 pax, awaiting expert callback".
@@ -853,7 +893,7 @@ const MAYA_REPLY_TOOL = {
   input_schema: {
     type: 'object',
     properties: {
-      reply: { type: 'string', description: 'Single-paragraph WhatsApp message, no line breaks, no signature.' },
+      reply: { type: 'string', description: "Maya's reply for this turn. Formatting (line breaks, signature) follows the channel-specific rule given in the system prompt." },
       intent: { type: 'string', enum: VALID_INTENTS },
       lead: {
         type: 'object',
@@ -879,7 +919,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp') {
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
@@ -895,7 +935,7 @@ async function callMayaJSON(msgs, known, phone) {
         body: JSON.stringify({
           model: CHAT_MODEL,
           max_tokens: 600,
-          system: CHAT_SYSTEM + knownLine,
+          system: buildChatSystem(channel) + knownLine,
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }
@@ -961,7 +1001,7 @@ function isDuplicateMsgId(id) {
 const FALLBACK_REPLY = 'Thanks for your message! Our travel expert will call you shortly. You can also reach us directly at +91 98517 39851. 😊';
 const UNSUPPORTED_MEDIA_REPLY = "Thanks for sharing that! I work best with text messages right now, so I can't open images, documents, or links yet. For general enquiries, please call us at +91 98517 39851. For partner & DMC queries, contact Vivek Bansal at 9988740145. For complaints or urgent issues, contact Vineet Bansal at 9216320050. Just type your travel query in words and I'll help right away!";
 
-async function mayaTurn(phone, message, onReply) {
+async function mayaTurn(phone, message, onReply, channel = 'whatsapp') {
   const t0 = Date.now();
   const log = { intent: '-', crm: 'none', notify: '-' };
   let tAI = t0, tSent = t0;
@@ -984,7 +1024,7 @@ async function mayaTurn(phone, message, onReply) {
     chat.msgs.push({ role: 'user', content: cap(message, 2000) });
     if (chat.msgs.length > HISTORY_MAX) chat.msgs = chat.msgs.slice(-HISTORY_MAX);
 
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel);
     tAI = Date.now();
 
     if (!parsed) {
@@ -1022,7 +1062,7 @@ async function mayaTurn(phone, message, onReply) {
       nextAction: parsed.next_action || '',
       handover: !!parsed.handover,
       query: message,
-      source: 'whatsapp-ai-chat'
+      source: channel === 'website' ? 'website-ai-chat' : 'whatsapp-ai-chat'
     };
     chat.known = mergeLeadData(chat.known || {}, freshData);
 
@@ -1045,7 +1085,7 @@ async function mayaTurn(phone, message, onReply) {
         }
       } else {
         const merged = { ...chat.known };
-        if (!merged.name) merged.name = 'Unknown (WhatsApp)';
+        if (!merged.name) merged.name = channel === 'website' ? 'Unknown (Website Chat)' : 'Unknown (WhatsApp)';
         const assigned = await assignTeamWithClaude(merged);
         const leadId = await saveLead(merged, assigned);
         log.crm = leadId ? `created:${leadId.slice(0, 8)}→${assigned.name}` : 'create-FAILED';
@@ -1127,6 +1167,21 @@ app.post('/webhook/chat', async (req, res) => {
   const phone = String(cleanAttr(req.body.phone || req.body.waId || req.body.mobile || '') || '').replace(/\D/g, '');
   const message = cleanAttr(req.body.message || req.body.text || '') || 'Hi';
   const reply = await withPhoneLock(phone || 'unknown', () => mayaTurn(phone || 'unknown', message, null));
+  res.json({ reply: reply || FALLBACK_REPLY });
+});
+
+// ── WEBSITE CHAT — BRAIN-ONLY TEST ENDPOINT (§11 Phase 1, step 1 of build) ──
+// Forces channel='website' so the split prompt/adapter can be verified in
+// isolation. TEMPORARY: keys the conversation by phone (or a client-supplied
+// session id passed as `phone`) exactly like /webhook/chat does today — this
+// does NOT yet implement the pre-phone session-key → customer_profile merge
+// flagged in §11 as an unresolved design problem. That, plus the
+// customer_profile table and the /webhook/website dedupe fix, are the next
+// build steps once this split is confirmed working.
+app.post('/webhook/website-chat', async (req, res) => {
+  const sessionKey = String(cleanAttr(req.body.phone || req.body.sessionId || '') || '').replace(/[^a-zA-Z0-9]/g, '') || 'unknown';
+  const message = cleanAttr(req.body.message || req.body.text || '') || 'Hi';
+  const reply = await withPhoneLock(sessionKey, () => mayaTurn(sessionKey, message, null, 'website'));
   res.json({ reply: reply || FALLBACK_REPLY });
 });
 
@@ -1385,10 +1440,10 @@ app.post('/webhook/website', async (req, res) => {
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
-  version: '3.8',
-  state: 'persistent + reply-first + sales-consultant Maya + forced-tool-use structured output + unsupported-media auto-reply + spam filter + manual-lead notify + team notification crons',
+  version: '3.9',
+  state: 'persistent + reply-first + sales-consultant Maya + forced-tool-use structured output + channel-split brain (whatsapp/website) + unsupported-media auto-reply + spam filter + manual-lead notify + team notification crons',
   endpoints: [
-    '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
+    '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/website-chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
     '/notify/manual-lead',
     '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary'
   ]

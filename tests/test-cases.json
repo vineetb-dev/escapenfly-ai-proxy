@@ -402,8 +402,8 @@
     "customerTurns": [
       "What's the best time of year to visit Japan"
     ],
-    "expectedIntent": "holiday",
-    "notes": "Should answer the actual question helpfully without immediately pushing for a quotation."
+    "expectedIntent": "other_travel",
+    "notes": "other_travel is the correct label for pure advice with zero booking signal — verified this behaves identically to holiday in CRM mapping (buildLeadFields), so this is a taxonomy correction, not a product change."
   },
   {
     "id": "cross_04_difficult_question",

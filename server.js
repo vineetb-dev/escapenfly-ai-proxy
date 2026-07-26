@@ -377,6 +377,29 @@ async function upsertCustomerProfile(phone, known) {
   }
 }
 
+// ── FOUNDER NOTES — Vineet's verified per-destination facts (§Phase 3) ──
+// Direct response to a real accuracy failure: Maya was generating plausible-
+// sounding but WRONG visa processing times and document lists from her own
+// general knowledge (e.g. claiming Dubai takes 4-6 weeks when it actually
+// takes ~2 days). Prompt instructions alone can't guarantee accuracy on
+// facts the model doesn't actually know — this table is the real fix:
+// Vineet's own verified answers, looked up per destination and injected as
+// authoritative context that overrides general knowledge. Keyed by a
+// lowercased, trimmed destination name for simple exact-match lookup.
+async function loadFounderNotes(destination) {
+  const key = String(destination || '').trim().toLowerCase();
+  if (!key) return null;
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/founder_notes?destination=eq.${encodeURIComponent(key)}&select=visa_info,tips`, { headers: SB_HEADERS }, 'SB-founderNotes');
+    if (!r.ok) return null;
+    const rows = await r.json();
+    return rows[0] || null;
+  } catch (e) {
+    console.error('loadFounderNotes error:', e.message);
+    return null;
+  }
+}
+
 // ── SESSION → PHONE GRADUATION (§11 unresolved-design-problem) ──
 // A website visitor has no phone until partway through the conversation, so
 // their chat is keyed by a temporary session id (fails validPhone()) instead
@@ -869,7 +892,7 @@ const CHANNEL_ADAPTERS = {
     proactiveContentRule: '\n\nUnlike WhatsApp, do NOT wait for the customer to explicitly ask "what should we cover" before giving this. The moment destination + travel month are known (pax/budget can still be open), proactively include this Stage 2-style compact recommendation in your very next reply — you don\'t need to be asked.',
     visaSnapshotRule: ' For INTERNATIONAL destinations specifically, do NOT defer visa info with phrasing like "our visa expert will send you the checklist" or "will reach out with the requirements" — you already know general visa requirements yourself (see VISA DOCUMENT CHECKLISTS below). GIVE the actual 2-3 line checklist yourself, in THIS message, right now — then hand over for the exact quotation/pricing/booking (that part genuinely needs the expert; the checklist does not). ALSO include ONE genuine practical tip in the same message (packing note, money-saving trick, best time for a specific sight, a common first-timer mistake). Both are mandatory, not optional, the moment the trip is qualified.\n\nWRONG (deferring information you already have):\n"Perfect! I have got everything I need. Let me get our visa expert to send you the full document checklist, plus a customised itinerary. What is the best number to reach you on?"\n\nRIGHT (give the checklist yourself, hand off only for pricing):\n"Perfect! For Singapore, as Indian passport holders you will need: a tourist visa applied through an authorised agent like us (no direct applications), passport valid 6+ months with blank pages, recent photos, and confirmed return flights/hotel booking — apply about 3-4 weeks ahead. One tip: book Universal Studios tickets online in advance, it is noticeably cheaper than at the gate. I will get our expert to send your exact itinerary and quotation — what is the best number to reach you on?"',
     fullAnswerRule: '\n\nANSWER TRAVEL QUESTIONS COMPLETELY, IMMEDIATELY, AT ANY POINT — not just at handover, and unlike WhatsApp do not wait for Stage 3 to be generous with real information. If the visitor asks something you genuinely know (visa process, packing for the climate, best time to visit, how many days makes sense, safety, local currency, sim cards, what a specific area is like), give the FULL real answer right then, in that message — never "our expert will cover that." Reserve "our expert will get back to you" strictly for pricing, live availability, or booking/payment — never for information you already have. When flights or hotels come up, include one real outbound link so they can look themselves: Google Flights (https://www.google.com/flights) for flights, Booking.com or Agoda (search for the destination) for hotels — we guide and compare, we do not gatekeep, and we are not trying to be the booking engine ourselves.',
-    conversationLengthRule: '\n\nKEEP THIS SHORT — people come here for a human travel consultant, not an extended AI chat. Aim to reach handover within 4-5 customer messages total. Ask for ONLY: destination, travel month, headcount (a number — "2 people"), and budget. That is enough to qualify and hand off. Do NOT ask for: individual companion/traveller names, passport numbers, passport expiry dates, or any other document detail — that is collected later by the documentation team once the enquiry is confirmed, not during this first conversation. The moment you have destination + month + headcount + budget + the customer\'s own name and phone, move straight to handover — do not add extra confirmation questions or ask for anything more just to be thorough.'
+    conversationLengthRule: '\n\nKEEP THIS SHORT — people come here for a human travel consultant, not an extended AI chat. Aim to reach handover within 4-5 customer messages total. Ask for ONLY: destination, travel month, headcount (a number — "2 people"), and budget. That is enough to qualify and hand off. Do NOT ask for, and do NOT mention that the expert will later collect: individual companion/traveller names, passport numbers, or passport expiry dates — leave that out of this conversation entirely, do not even reference it as a future step. That is handled later by the documentation team once the enquiry is confirmed. The moment you have destination + month + headcount + budget + the customer\'s own name and phone, move straight to handover — do not add extra confirmation questions or ask for anything more just to be thorough.'
   }
 };
 
@@ -927,7 +950,7 @@ Stop asking more questions. Move explicitly toward conversion: offer to prepare 
 VISA DOCUMENT CHECKLISTS — still give these in full immediately when asked, since this is decision-relevant, not blog content:
 Example — Singapore tourist visa for Indian passport holders: passport with 6+ months validity and blank pages, recent passport-size photos (white background, 35x45mm), completed Form 14A, last 3 months bank statements, covering letter, confirmed return flight details and hotel booking, applied through an authorised agent like EscapeNFly (Indians cannot apply directly). Give equivalent genuine checklists for other countries you know.
 
-WHAT YOU MUST NEVER STATE: exact visa fees, current processing times (including invented ranges like "typically 15-20 days" — do not state a processing-time range under any phrasing, deferred or otherwise), approval chances or guarantees, live flight/hotel prices, package costs, or availability. Frame the handoff as progress, not a brush-off — e.g. "I'll get our expert to send you an exact quotation" rather than a flat "someone will call you." Never guarantee visa approval.
+WHAT YOU MUST NEVER STATE: exact visa fees, current processing times, approval chances or guarantees, live flight/hotel prices, package costs, or availability — UNLESS a specific figure is given to you verbatim in a "FOUNDER NOTES FOR THIS DESTINATION" block in this context, in which case use that exact figure (it is verified, not a guess). Without founder notes for that destination, do NOT invent a number or range from your own general knowledge (e.g. do not say "typically 15-20 days" or "4-6 weeks" unless founder notes literally say so) — instead say something honest and generic like "our expert will confirm the exact processing time for you," or, for the document checklist specifically, keep to only the universally-safe basics (passport, photo, application form) rather than a long invented list. Frame the handoff as progress, not a brush-off — e.g. "I'll get our expert to send you an exact quotation" rather than a flat "someone will call you." Never guarantee visa approval.
 
 INTENT — on EVERY turn, classify the customer's current need as exactly one of:
 holiday | visa | flights | hotel | cruise | corporate | mice | existing_booking | complaint | human_support | other_travel | off_topic
@@ -1001,9 +1024,12 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp') {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null) {
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
+    : '';
+  const founderLine = founderNotes
+    ? `\n\nFOUNDER NOTES FOR THIS DESTINATION (from Vineet directly — VERIFIED, TREAT AS GROUND TRUTH, overrides your own general knowledge including any specific numbers you might otherwise guess):${founderNotes.visa_info ? `\nVisa: ${founderNotes.visa_info}` : ''}${founderNotes.tips ? `\nTips: ${founderNotes.tips}` : ''}`
     : '';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -1017,7 +1043,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp') {
         body: JSON.stringify({
           model: CHAT_MODEL,
           max_tokens: 600,
-          system: buildChatSystem(channel) + knownLine,
+          system: buildChatSystem(channel) + knownLine + founderLine,
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }
@@ -1106,7 +1132,13 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     chat.msgs.push({ role: 'user', content: cap(message, 2000) });
     if (chat.msgs.length > HISTORY_MAX) chat.msgs = chat.msgs.slice(-HISTORY_MAX);
 
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel);
+    // Look up founder notes if we already know the destination from an
+    // earlier turn in this conversation (won't exist yet on the very first
+    // turn where the destination is first mentioned — available from the
+    // next reply onward, same as KNOWN LEAD INFO).
+    const founderNotes = chat.known?.destination ? await loadFounderNotes(chat.known.destination) : null;
+
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes);
     tAI = Date.now();
 
     if (!parsed) {

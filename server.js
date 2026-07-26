@@ -464,7 +464,11 @@ async function loadLiveWeather(city) {
 async function loadForexRate(currency) {
   if (!currency || currency === 'INR') return null;
   try {
-    const r = await fetchRetry(`https://api.frankfurter.app/latest?from=INR&to=${encodeURIComponent(currency)}`, {}, 'Frankfurter-forex');
+    // Switched from Frankfurter (ECB reference rates only — no AED, MVR, VND,
+    // EGP, MUR, SCR, NPR, KZT, which broke the single most-tested destination,
+    // Dubai) to open.er-api.com, verified via curl to cover every currency in
+    // DESTINATION_INFO. Single request for all rates against INR at once.
+    const r = await fetchRetry('https://open.er-api.com/v6/latest/INR', {}, 'open-er-api-forex');
     if (!r.ok) return null;
     const data = await r.json();
     const rate = data.rates?.[currency];

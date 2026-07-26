@@ -1358,7 +1358,12 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     // turn where the destination is first mentioned — available from the
     // next reply onward, same as KNOWN LEAD INFO).
     const founderNotes = chat.known?.destination ? await loadFounderNotes(chat.known.destination) : null;
-    const destInfo = chat.known?.destination ? lookupDestinationInfo(chat.known.destination) : null;
+    // Turn-1 gap (same class of bug as the intent pre-classifier): chat.known.destination
+    // is only populated AFTER Claude parses this turn, so on the very first message
+    // ("need to travel in dubai...") it's still empty at lookup-time here. Fall back to
+    // guessing directly from the raw message — lookupDestinationInfo() already does loose
+    // substring matching, so this works fine against free text, not just a clean field.
+    const destInfo = chat.known?.destination ? lookupDestinationInfo(chat.known.destination) : lookupDestinationInfo(message);
     const [liveWeather, forexRate] = destInfo
       ? await Promise.all([loadLiveWeather(destInfo.city), loadForexRate(destInfo.currency)])
       : [null, null];

@@ -983,10 +983,29 @@ function buildChatSystem(channel, intent) {
 function guessIntentFromMessage(message) {
   const m = String(message || '').toLowerCase();
   if (/\bbooking (reference|ref|number)\b|\bmy (existing )?booking\b|cancel(l)?ation|\brefund\b|already booked/.test(m)) return 'existing_booking';
-  if (/\bvisa\b/.test(m) && !/\btrip\b|\bholiday\b|\bpackage\b/.test(m)) return 'visa';
-  if (/\bflight(s)?\b|\bfly\b|\bairfare\b|\bairline\b/.test(m) && !/\bhotel\b|\bpackage\b|\btrip\b/.test(m)) return 'flights';
-  if (/\bhotel(s)?\b|\bcheck.?in\b|\baccommodation\b|\bstay\b/.test(m) && !/\bflight\b|\bpackage\b|\btrip\b/.test(m)) return 'hotel';
-  return null; // ambiguous / holiday / not enough signal — use the default flow
+
+  // A "broad" signal means the message is asking about the trip more
+  // generally, or asking multiple distinct things at once — in that case
+  // don't lock into a narrow specialist flow off one keyword (this is what
+  // caused cross_01's false positive: "visa process, best time to visit,
+  // and cost for 2 people" matched \bvisa\b but is not a narrow visa-only
+  // ask).
+  const broadSignal = /\btrip\b|\bholiday\b|\bpackage\b|\bcost\b|\bhow much\b|\bbest time\b|\bitinerary\b/.test(m);
+  const visaSignal   = /\bvisa\b/.test(m);
+  // Route-shaped messages ("passengers", "economy/business class",
+  // "one-way/round-trip") count as a flight signal even without the literal
+  // word "flight" — this is what flights_04 needed ("Delhi to Singapore, 2
+  // passengers, economy, mid-December" never says "flight").
+  const flightSignal = /\bflight(s)?\b|\bfly\b|\bairfare\b|\bairline\b|\bpassenger(s)?\b|\beconomy class\b|\bbusiness class\b|\bone.?way\b|\bround.?trip\b/.test(m);
+  const hotelSignal  = /\bhotel(s)?\b|\bcheck.?in\b|\baccommodation\b|\b\d+.?star\b/.test(m);
+
+  const hits = [visaSignal && 'visa', flightSignal && 'flights', hotelSignal && 'hotel'].filter(Boolean);
+  // Only trust ONE clear, unambiguous signal with nothing broader mixed in.
+  // Multiple category signals, or a category signal alongside a broad/
+  // multi-topic ask, isn't a narrow single-category enquiry — fall back to
+  // the default flow rather than guess wrong.
+  if (hits.length === 1 && !broadSignal) return hits[0];
+  return null; // ambiguous / holiday / mixed / not enough signal — use the default flow
 }
 
 const STAGE_LOGIC = {

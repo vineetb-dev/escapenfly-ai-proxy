@@ -3,46 +3,80 @@
     "id": "visa_01_basic_tourist",
     "category": "visa",
     "description": "Straightforward France tourist visa enquiry — the exact case that surfaced tonight's bugs",
-    "customerTurns": ["Hi need france tourist visa", "september and 2 people, my name is Vineet"],
+    "customerTurns": [
+      "Hi need france tourist visa",
+      "september and 2 people, my name is Vineet"
+    ],
     "expectedIntent": "visa",
-    "mustAsk": ["applicant", "travel", "month"],
-    "mustNotAsk": ["budget"],
-    "mustNotSay": ["cannot apply directly", "indians cannot apply direct"],
+    "mustAsk": [
+      "applicant",
+      "travel",
+      "month"
+    ],
+    "mustNotAsk": [
+      "budget"
+    ],
+    "mustNotSay": [
+      "cannot apply directly",
+      "indians cannot apply direct"
+    ],
     "notes": "Should not ask budget. Should not claim Indians can't apply directly for France (VFS Global handles this)."
   },
   {
     "id": "visa_02_dubai_uae",
     "category": "visa",
     "description": "Dubai visa — the founder_notes accuracy test case",
-    "customerTurns": ["Hi need dubai trip and visa for december", "2 people, 2 lac, name vineet bansal"],
-    "expectedIntent": "visa",
-    "mustNotSay": ["4-6 weeks", "15-20 days", "4 to 6 weeks"],
-    "notes": "Should use the founder_notes Dubai entry (~2 days) if present, or avoid stating any invented processing-time range at all."
+    "customerTurns": [
+      "Hi need dubai trip and visa for december",
+      "2 people, 2 lac, name vineet bansal"
+    ],
+    "mustNotSay": [
+      "4-6 weeks",
+      "15-20 days",
+      "4 to 6 weeks"
+    ],
+    "notes": "Accuracy check only (no invented processing-time number) — intent is defensibly holiday or visa for a message mentioning both trip and visa."
   },
   {
     "id": "visa_03_no_destination_yet",
     "category": "visa",
     "description": "Customer wants visa help but hasn't named a country yet",
-    "customerTurns": ["I need help with a visa"],
+    "customerTurns": [
+      "I need help with a visa"
+    ],
     "expectedIntent": "visa",
-    "mustAsk": ["country", "where"],
-    "mustNotAsk": ["budget"],
+    "mustAsk": [
+      "country",
+      "where"
+    ],
+    "mustNotAsk": [
+      "budget"
+    ],
     "notes": "First message — specialist flow won't be active yet (needs a turn to classify intent), verify the general flow still doesn't ask budget prematurely."
   },
   {
     "id": "visa_04_schengen_general",
     "category": "visa",
     "description": "Generic Schengen visa question, not a specific pre-named country",
-    "customerTurns": ["Do I need a visa for Europe as an Indian citizen"],
+    "customerTurns": [
+      "Do I need a visa for Europe as an Indian citizen"
+    ],
     "expectedIntent": "visa",
-    "mustNotSay": ["guaranteed", "100% approval", "always approved"],
+    "mustNotSay": [
+      "guaranteed",
+      "100% approval",
+      "always approved"
+    ],
     "notes": "Should never guarantee visa approval."
   },
   {
     "id": "visa_05_visa_plus_holiday",
     "category": "visa",
     "description": "Visa enquiry that later expands into wanting a full trip planned",
-    "customerTurns": ["Need a Thailand visa", "actually can you also help plan the whole trip, budget is around 1.5 lakh"],
+    "customerTurns": [
+      "Need a Thailand visa",
+      "actually can you also help plan the whole trip, budget is around 1.5 lakh"
+    ],
     "expectedIntent": "holiday",
     "notes": "Budget becomes relevant once they ask for the full trip — should not be refused or ignored once offered."
   },
@@ -50,53 +84,88 @@
     "id": "visa_06_refusal_history",
     "category": "visa",
     "description": "Customer mentions a previous visa refusal",
-    "customerTurns": ["I need a UK visa but I was refused once before, will that be a problem"],
+    "customerTurns": [
+      "I need a UK visa but I was refused once before, will that be a problem"
+    ],
     "expectedIntent": "visa",
-    "mustNotSay": ["guaranteed", "won't be an issue", "no problem at all"],
+    "mustNotSay": [
+      "guaranteed",
+      "won't be an issue",
+      "no problem at all"
+    ],
     "notes": "Should not falsely reassure about approval odds — this is exactly the 'never guarantee' rule."
   },
   {
     "id": "holiday_01_basic_qualify",
     "category": "holiday",
     "description": "Basic destination-named holiday enquiry",
-    "customerTurns": ["Looking for a Bali trip"],
+    "customerTurns": [
+      "Looking for a Bali trip"
+    ],
     "expectedIntent": "holiday",
-    "mustAsk": ["month", "travel"],
-    "mustNotSay": ["gem", "breathtaking", "stunning"],
+    "mustAsk": [
+      "month",
+      "travel"
+    ],
+    "mustNotSay": [
+      "gem",
+      "breathtaking",
+      "stunning"
+    ],
     "notes": "Stage 1 — should qualify, not describe the destination like a travel blog."
   },
   {
     "id": "holiday_02_itinerary_request",
     "category": "holiday",
     "description": "Customer explicitly asks what a trip covers",
-    "customerTurns": ["Looking for a Singapore trip", "what should we cover in 5 days"],
+    "customerTurns": [
+      "Looking for a Singapore trip",
+      "what should we cover in 5 days"
+    ],
     "expectedIntent": "holiday",
-    "mustAsk": ["hotel", "star"],
+    "mustAsk": [
+      "hotel",
+      "star"
+    ],
     "notes": "Stage 2 — compact recommendation with hotel tiers, not a day-by-day essay."
   },
   {
     "id": "holiday_03_full_qualify_to_handover",
     "category": "holiday",
     "description": "Full information given across two messages, should reach handover",
-    "customerTurns": ["Need a Dubai holiday", "december, 2 people, 2 lac budget, name Vineet"],
+    "customerTurns": [
+      "Need a Dubai holiday",
+      "december, 2 people, 2 lac budget, name Vineet"
+    ],
     "expectedIntent": "holiday",
-    "mustAsk": ["number", "phone", "whatsapp"],
+    "mustAsk": [
+      "number",
+      "phone",
+      "whatsapp"
+    ],
     "notes": "Should move to handover and ask for contact info once qualified (website channel)."
   },
   {
     "id": "holiday_04_honeymoon",
     "category": "holiday",
     "description": "Honeymoon-specific holiday enquiry",
-    "customerTurns": ["Honeymoon trip from Chandigarh, thinking Maldives"],
+    "customerTurns": [
+      "Honeymoon trip from Chandigarh, thinking Maldives"
+    ],
     "expectedIntent": "holiday",
-    "mustNotAsk": ["how many people", "number of travellers"],
+    "mustNotAsk": [
+      "how many people",
+      "number of travellers"
+    ],
     "notes": "Honeymoon implies 2 travellers — asking headcount here would feel tone-deaf."
   },
   {
     "id": "holiday_05_family_with_kids",
     "category": "holiday",
     "description": "Family holiday mentioning children",
-    "customerTurns": ["Family trip to Thailand, me my wife and 2 kids aged 5 and 8"],
+    "customerTurns": [
+      "Family trip to Thailand, me my wife and 2 kids aged 5 and 8"
+    ],
     "expectedIntent": "holiday",
     "notes": "Should acknowledge the family composition naturally, not re-ask headcount."
   },
@@ -104,7 +173,9 @@
     "id": "holiday_06_senior_citizens",
     "category": "holiday",
     "description": "Senior citizen travellers",
-    "customerTurns": ["My parents want to visit Europe, both in their 70s, first time travelling abroad"],
+    "customerTurns": [
+      "My parents want to visit Europe, both in their 70s, first time travelling abroad"
+    ],
     "expectedIntent": "holiday",
     "notes": "First-time-abroad + senior signals should trigger more reassurance/explanation, not a terse qualifying question."
   },
@@ -112,7 +183,9 @@
     "id": "holiday_07_group_booking",
     "category": "holiday",
     "description": "Larger group booking",
-    "customerTurns": ["Group of 15 friends want to do a Vietnam trip"],
+    "customerTurns": [
+      "Group of 15 friends want to do a Vietnam trip"
+    ],
     "expectedIntent": "holiday",
     "notes": "Should handle a non-couple, non-family group size naturally."
   },
@@ -120,16 +193,24 @@
     "id": "holiday_08_price_sensitive",
     "category": "holiday",
     "description": "Explicitly budget-conscious customer",
-    "customerTurns": ["Cheapest possible Goa package for 4 people, we don't have much budget"],
+    "customerTurns": [
+      "Cheapest possible Goa package for 4 people, we don't have much budget"
+    ],
     "expectedIntent": "holiday",
-    "mustNotSay": ["luxury", "premium", "5-star"],
+    "mustNotSay": [
+      "luxury",
+      "premium",
+      "5-star"
+    ],
     "notes": "Should not lead with upsell language for a stated budget-conscious customer."
   },
   {
     "id": "holiday_09_luxury",
     "category": "holiday",
     "description": "Explicitly luxury-seeking customer",
-    "customerTurns": ["Want a luxury Maldives honeymoon, money is not a constraint"],
+    "customerTurns": [
+      "Want a luxury Maldives honeymoon, money is not a constraint"
+    ],
     "expectedIntent": "holiday",
     "notes": "Tone should match — premium hotel tiers, not budget options."
   },
@@ -137,35 +218,55 @@
     "id": "holiday_10_destination_switch",
     "category": "holiday",
     "description": "Customer changes destination mid-conversation",
-    "customerTurns": ["Looking for a Bali trip", "actually let's do Vietnam instead"],
+    "customerTurns": [
+      "Looking for a Bali trip",
+      "actually let's do Vietnam instead"
+    ],
     "expectedIntent": "holiday",
-    "mustNotSay": ["bali"],
-    "notes": "Should follow the switch cleanly, not keep referencing the old destination."
+    "notes": "Should follow the switch cleanly. Checked against the FINAL reply only — Bali is legitimately mentioned in turn 1 before the switch.",
+    "mustNotSayInLastReply": [
+      "bali"
+    ]
   },
   {
     "id": "flights_01_basic",
     "category": "flights",
     "description": "Basic flight booking enquiry",
-    "customerTurns": ["Need a flight from Delhi to Dubai in November"],
+    "customerTurns": [
+      "Need a flight from Delhi to Dubai in November"
+    ],
     "expectedIntent": "flights",
-    "mustAsk": ["passenger", "how many"],
-    "mustNotAsk": ["hotel", "star category"],
+    "mustAsk": [
+      "passenger",
+      "how many"
+    ],
+    "mustNotAsk": [
+      "hotel",
+      "star category"
+    ],
     "notes": "Should not drift into hotel/holiday questions."
   },
   {
     "id": "flights_02_cabin_class",
     "category": "flights",
     "description": "Flight enquiry with class preference stated",
-    "customerTurns": ["Business class flight Mumbai to London for 2 people in March"],
+    "customerTurns": [
+      "Business class flight Mumbai to London for 2 people in March"
+    ],
     "expectedIntent": "flights",
-    "mustNotAsk": ["cabin class", "economy or business"],
+    "mustNotAsk": [
+      "cabin class",
+      "economy or business"
+    ],
     "notes": "Already given — should not re-ask cabin class."
   },
   {
     "id": "flights_03_flexible_dates",
     "category": "flights",
     "description": "Customer unsure of exact dates",
-    "customerTurns": ["Want to fly to Bangkok sometime in Feb, dates are flexible"],
+    "customerTurns": [
+      "Want to fly to Bangkok sometime in Feb, dates are flexible"
+    ],
     "expectedIntent": "flights",
     "notes": "Should accept approximate timing rather than demanding exact dates."
   },
@@ -173,54 +274,91 @@
     "id": "flights_04_link_included",
     "category": "flights",
     "description": "Enough info given to warrant a live comparison link",
-    "customerTurns": ["Delhi to Singapore, 2 passengers, economy, mid-December"],
+    "customerTurns": [
+      "Delhi to Singapore, 2 passengers, economy, mid-December"
+    ],
     "expectedIntent": "flights",
-    "mustAsk": ["google flights", "compare"],
+    "mustAsk": [
+      "google flights",
+      "compare"
+    ],
     "notes": "Website channel should offer the Google Flights outbound link once enough is known."
   },
   {
     "id": "hotel_01_basic",
     "category": "hotel",
     "description": "Basic hotel booking enquiry",
-    "customerTurns": ["Need a hotel in Goa for 3 nights"],
+    "customerTurns": [
+      "Need a hotel in Goa for 3 nights"
+    ],
     "expectedIntent": "hotel",
-    "mustAsk": ["check-in", "check in", "guests", "rooms"],
-    "mustNotAsk": ["visa", "flight"],
+    "mustAsk": [
+      "check-in",
+      "check in",
+      "guests",
+      "rooms"
+    ],
+    "mustNotAsk": [
+      "visa",
+      "flight"
+    ],
     "notes": "Should not drift into visa/flight territory."
   },
   {
     "id": "hotel_02_category_given",
     "category": "hotel",
     "description": "Hotel category preference already stated",
-    "customerTurns": ["4-star hotel in Dubai downtown, check in 10th Dec check out 15th Dec, 2 adults"],
+    "customerTurns": [
+      "4-star hotel in Dubai downtown, check in 10th Dec check out 15th Dec, 2 adults"
+    ],
     "expectedIntent": "hotel",
-    "mustNotAsk": ["what category", "budget category", "how many nights"],
+    "mustNotAsk": [
+      "what category",
+      "budget category",
+      "how many nights"
+    ],
     "notes": "All core fields given upfront — should not re-ask any of them."
   },
   {
     "id": "hotel_03_link_included",
     "category": "hotel",
     "description": "Enough info given to warrant a live comparison link",
-    "customerTurns": ["3-star hotel Bangkok, 12-16 Jan, 2 guests 1 room"],
+    "customerTurns": [
+      "3-star hotel Bangkok, 12-16 Jan, 2 guests 1 room"
+    ],
     "expectedIntent": "hotel",
-    "mustAsk": ["booking.com", "agoda"],
+    "mustAsk": [
+      "booking.com",
+      "agoda"
+    ],
     "notes": "Website channel should offer an outbound hotel comparison link."
   },
   {
     "id": "existing_01_reference_first",
     "category": "existing_booking",
     "description": "Customer with an existing booking issue",
-    "customerTurns": ["I have an issue with my existing booking"],
+    "customerTurns": [
+      "I have an issue with my existing booking"
+    ],
     "expectedIntent": "existing_booking",
-    "mustAsk": ["booking reference", "phone number"],
-    "mustNotAsk": ["destination", "budget", "where are you travelling"],
+    "mustAsk": [
+      "booking reference",
+      "phone number"
+    ],
+    "mustNotAsk": [
+      "destination",
+      "budget",
+      "where are you travelling"
+    ],
     "notes": "Should ask for reference/phone first, not run a new-sales qualification flow."
   },
   {
     "id": "existing_02_cancellation",
     "category": "existing_booking",
     "description": "Customer wants to cancel a booking",
-    "customerTurns": ["I need to cancel my trip, booking ref ENF-12345"],
+    "customerTurns": [
+      "I need to cancel my trip, booking ref ENF-12345"
+    ],
     "expectedIntent": "existing_booking",
     "notes": "Should not attempt to process the cancellation itself — hand over to a human."
   },
@@ -228,16 +366,22 @@
     "id": "existing_03_upset_customer",
     "category": "existing_booking",
     "description": "Frustrated customer with a booking problem",
-    "customerTurns": ["This is ridiculous, my hotel booking got cancelled and nobody told me!"],
-    "expectedIntent": "existing_booking",
-    "mustNotSay": ["calm down", "relax"],
-    "notes": "Tone should be reassuring and unhurried, not dismissive of the frustration."
+    "customerTurns": [
+      "This is ridiculous, my hotel booking got cancelled and nobody told me!"
+    ],
+    "mustNotSay": [
+      "calm down",
+      "relax"
+    ],
+    "notes": "Tone check only, not intent classification — both complaint and existing_booking are defensible for an angry customer with a cancelled booking."
   },
   {
     "id": "cross_01_multi_question",
     "category": "cross-cutting",
     "description": "Customer asks several things in one message",
-    "customerTurns": ["I want to go to Japan, what's the visa process, best time to visit, and roughly how much would it cost for 2 people"],
+    "customerTurns": [
+      "I want to go to Japan, what's the visa process, best time to visit, and roughly how much would it cost for 2 people"
+    ],
     "expectedIntent": "holiday",
     "notes": "Should address the question(s) without turning into an overwhelming multi-paragraph dump — check it stays organized and doesn't ignore parts of the ask."
   },
@@ -245,15 +389,19 @@
     "id": "cross_02_incomplete_info",
     "category": "cross-cutting",
     "description": "Customer gives very little information",
-    "customerTurns": ["hi", "want to travel somewhere"],
-    "expectedIntent": "holiday",
-    "notes": "Should ask a natural clarifying question, not stall or give a generic non-answer."
+    "customerTurns": [
+      "hi",
+      "want to travel somewhere"
+    ],
+    "notes": "Behavioral check only (asks a natural clarifying question) — intent classification is genuinely ambiguous for \"hi\" / \"want to travel somewhere\"."
   },
   {
     "id": "cross_03_advice_only_no_intent_to_buy",
     "category": "cross-cutting",
     "description": "Pure information-seeking, no buying signal",
-    "customerTurns": ["What's the best time of year to visit Japan"],
+    "customerTurns": [
+      "What's the best time of year to visit Japan"
+    ],
     "expectedIntent": "holiday",
     "notes": "Should answer the actual question helpfully without immediately pushing for a quotation."
   },
@@ -261,16 +409,25 @@
     "id": "cross_04_difficult_question",
     "category": "cross-cutting",
     "description": "A question Maya genuinely shouldn't guess on",
-    "customerTurns": ["What are my exact chances of getting a US visa approved"],
+    "customerTurns": [
+      "What are my exact chances of getting a US visa approved"
+    ],
     "expectedIntent": "visa",
-    "mustNotSay": ["guaranteed", "100%", "definitely approved", "high chance"],
+    "mustNotSay": [
+      "guaranteed",
+      "100%",
+      "definitely approved",
+      "high chance"
+    ],
     "notes": "Should decline to predict approval odds, not invent a confidence percentage."
   },
   {
     "id": "cross_05_off_topic",
     "category": "cross-cutting",
     "description": "Completely unrelated question",
-    "customerTurns": ["Can you help me write a python script"],
+    "customerTurns": [
+      "Can you help me write a python script"
+    ],
     "expectedIntent": "off_topic",
     "notes": "Should redirect to travel in one line, not attempt to help or go silent."
   },
@@ -278,7 +435,9 @@
     "id": "cross_06_solo_traveller",
     "category": "cross-cutting",
     "description": "Solo traveller, safety-conscious",
-    "customerTurns": ["Solo female traveller, is Vietnam safe to travel alone"],
+    "customerTurns": [
+      "Solo female traveller, is Vietnam safe to travel alone"
+    ],
     "expectedIntent": "holiday",
     "notes": "Should answer the safety question genuinely, not deflect it."
   },
@@ -286,18 +445,32 @@
     "id": "cross_07_first_time_vs_experienced",
     "category": "cross-cutting",
     "description": "Experienced traveller giving terse, complete information upfront",
-    "customerTurns": ["Bali, march, 2 pax, 1.5L, done this before no need for basics"],
+    "customerTurns": [
+      "Bali, march, 2 pax, 1.5L, done this before no need for basics"
+    ],
     "expectedIntent": "holiday",
-    "mustNotSay": ["let me explain", "first time"],
+    "mustNotSay": [
+      "let me explain",
+      "first time"
+    ],
     "notes": "Should stay concise and skip beginner-level explanation given the explicit signal."
   },
   {
     "id": "cross_08_conversation_length",
     "category": "cross-cutting",
     "description": "Full qualify-to-handover flow, checking message count discipline",
-    "customerTurns": ["Need a Dubai trip", "december, 2 people", "2 lac budget, name Vineet"],
+    "customerTurns": [
+      "Need a Dubai trip",
+      "december, 2 people",
+      "2 lac budget, name Vineet"
+    ],
     "expectedIntent": "holiday",
-    "mustNotAsk": ["passport number", "passport expiry", "second traveller's name", "companion's name"],
+    "mustNotAsk": [
+      "passport number",
+      "passport expiry",
+      "second traveller's name",
+      "companion's name"
+    ],
     "notes": "Should reach handover within a few messages and never ask for document-collection details this early."
   }
 ]

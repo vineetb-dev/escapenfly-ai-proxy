@@ -968,6 +968,27 @@ function buildChatSystem(channel, intent) {
 // etc.) fall back to the holiday flow's general shape — not broken, just not
 // specialized yet. Deliberately NOT all 17 categories at once — build fewer
 // flows well, verify, then expand.
+// ── TURN-1 INTENT PRE-CLASSIFIER ──
+// Real gap found via the test suite: the specialist STAGE_LOGIC flow can
+// only activate from turn 2 onward, because intent needs one turn to be
+// classified by Claude and persisted (chat.known.intent) before the system
+// prompt can be built with the right flow. A customer who gives everything
+// in one message ("Delhi to Dubai flight, 2 pax, business class, March")
+// was still getting the generic default flow on that very first reply.
+// This is a cheap, local, best-effort keyword guess used ONLY when we have
+// no persisted intent yet (turn 1) — from turn 2 onward, Claude's own
+// actual classification takes over via chat.known.intent, this never
+// overrides it. Doesn't need to be perfect, just good enough to activate
+// the right specialist flow on an unambiguous first message.
+function guessIntentFromMessage(message) {
+  const m = String(message || '').toLowerCase();
+  if (/\bbooking (reference|ref|number)\b|\bmy (existing )?booking\b|cancel(l)?ation|\brefund\b|already booked/.test(m)) return 'existing_booking';
+  if (/\bvisa\b/.test(m) && !/\btrip\b|\bholiday\b|\bpackage\b/.test(m)) return 'visa';
+  if (/\bflight(s)?\b|\bfly\b|\bairfare\b|\bairline\b/.test(m) && !/\bhotel\b|\bpackage\b|\btrip\b/.test(m)) return 'flights';
+  if (/\bhotel(s)?\b|\bcheck.?in\b|\baccommodation\b|\bstay\b/.test(m) && !/\bflight\b|\bpackage\b|\btrip\b/.test(m)) return 'hotel';
+  return null; // ambiguous / holiday / not enough signal — use the default flow
+}
+
 const STAGE_LOGIC = {
   holiday: `STAGE 1 — destination named, nothing else known (e.g. "Looking for Almaty trip", "Interested in Bali"):
 Do NOT describe the destination. Do NOT list attractions, history, or scenery. Give ONE short confidence-building line (optionally mentioning EscapeNFly's experience with that destination), then ask for the qualifying details needed to quote: travel month, number of travellers, departure city, and budget (if decided). That is the entire message.
@@ -985,7 +1006,9 @@ RIGHT:
 "For a 5-day trip we usually base you in Almaty city and cover Big Almaty Lake, Charyn Canyon, Kok Tobe and the main city sights. Depending on your budget we can do this with 3-star, 4-star or premium hotels, and private or group (SIC) tours. When are you looking to travel, and how many people?"
 
 STAGE 3 — enough is known (destination + month + pax, ideally budget/hotel preference too):
-Stop asking more questions. Move explicitly toward conversion: offer to prepare a customised itinerary/quotation, offer hotel options, offer visa assistance, or offer a callback. Never end a qualified conversation without proposing this next step.{{VISA_SNAPSHOT_RULE}}{{CONTACT_CAPTURE_RULE}}`,
+Stop asking more questions. Move explicitly toward conversion: offer to prepare a customised itinerary/quotation, offer hotel options, offer visa assistance, or offer a callback. Never end a qualified conversation without proposing this next step.{{VISA_SNAPSHOT_RULE}}{{CONTACT_CAPTURE_RULE}}
+
+PRIORITY WHEN BOTH APPLY: if this message reaches Stage 3 readiness (destination + month + pax now known, even if this is also the first time they've asked about the itinerary), Stage 3 wins — move to handover and ask for contact info. You may weave in one brief itinerary mention if it fits naturally, but do NOT let giving itinerary highlights replace or delay the handover/contact-capture step. A customer who gives you everything in one message should get taken to conversion that same reply, not parked at Stage 2.`,
 
   visa: `VISA SPECIALIST FLOW — this is a visa enquiry. Treat it as one, not a holiday enquiry in disguise.
 Ask ONLY: the destination country (if not already clear), visa type/purpose (tourist/business/student — most are tourist, don't over-ask if it's obvious from context), number of applicants, and intended travel month or dates. NEVER ask budget. NEVER ask hotel preference, departure city, or other holiday-shaped questions — those are irrelevant to a visa-only enquiry.
@@ -1238,8 +1261,9 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     // turn where the destination is first mentioned — available from the
     // next reply onward, same as KNOWN LEAD INFO).
     const founderNotes = chat.known?.destination ? await loadFounderNotes(chat.known.destination) : null;
+    const effectiveIntent = chat.known?.intent || guessIntentFromMessage(message);
 
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, chat.known?.intent);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent);
     tAI = Date.now();
 
     if (!parsed) {

@@ -56,14 +56,24 @@ async function runCase(testCase) {
     failures.push(`expected intent "${testCase.expectedIntent}", got "${lastResponse.intent}"`);
   }
 
-  for (const kw of (testCase.mustAsk || [])) {
-    if (!contains(fullText, kw)) failures.push(`expected to ask about "${kw}" — not found anywhere in replies`);
+  // mustAsk entries are alternate phrasings of the SAME expected question —
+  // any one match is a pass. (Fixed from AND to OR: "month" vs "travel" or
+  // "country" vs "where" were both valid phrasings, but the AND version
+  // required both literal words and false-failed on wording choice.)
+  if (testCase.mustAsk && testCase.mustAsk.length && !testCase.mustAsk.some(kw => contains(fullText, kw))) {
+    failures.push(`expected to ask about one of [${testCase.mustAsk.join(', ')}] — none found in replies`);
   }
   for (const kw of (testCase.mustNotAsk || [])) {
     if (contains(fullText, kw)) failures.push(`should NOT have asked about "${kw}" — found in replies`);
   }
   for (const kw of (testCase.mustNotSay || [])) {
     if (contains(fullText, kw)) failures.push(`should NOT have said "${kw}" — found in replies`);
+  }
+  // Checked against only the LAST reply, not the whole transcript — for
+  // things that are fine earlier (e.g. the pre-switch destination) but
+  // shouldn't linger after a stated change.
+  for (const kw of (testCase.mustNotSayInLastReply || [])) {
+    if (contains(allReplies[allReplies.length - 1] || '', kw)) failures.push(`should NOT have said "${kw}" in the final reply — found there`);
   }
 
   return {

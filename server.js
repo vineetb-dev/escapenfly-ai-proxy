@@ -461,6 +461,14 @@ function mergeLeadData(existing, fresh) {
     budget:      cap(pick(existing.budget, fresh.budget), 60),
     type:        cap(pick(existing.type, fresh.type), 40),
     intent:      cap(pick(existing.intent, fresh.intent), 40),
+    travelStyle:      cap(pick(existing.travelStyle, fresh.travelStyle), 60),
+    visaType:         cap(pick(existing.visaType, fresh.visaType), 60),
+    departureCity:    cap(pick(existing.departureCity, fresh.departureCity), 80),
+    cabinClass:       cap(pick(existing.cabinClass, fresh.cabinClass), 40),
+    checkIn:          cap(pick(existing.checkIn, fresh.checkIn), 40),
+    checkOut:         cap(pick(existing.checkOut, fresh.checkOut), 40),
+    hotelCategory:    cap(pick(existing.hotelCategory, fresh.hotelCategory), 60),
+    bookingReference: cap(pick(existing.bookingReference, fresh.bookingReference), 80),
     leadSummary: cap(pick(existing.leadSummary, fresh.leadSummary), 300),
     nextAction:  cap(pick(existing.nextAction, fresh.nextAction), 300),
     handover:    !!(fresh.handover || existing.handover),
@@ -486,16 +494,52 @@ function buildLeadFields(data) {
 
   const paxSafe = (Number.isFinite(paxNum) && paxNum > 0 && paxNum <= 500) ? paxNum : 2;
 
+  // Intent-specific notes — a visa enquiry's CRM notes should not show
+  // "Budget: -"; a hotel enquiry should show check-in/out, not travel month.
+  // §12 Phase 1 (5-category intent routing): each category maps its own
+  // relevant fields instead of forcing everything into the holiday shape.
+  const intent = String(data.intent || data.type || '').toLowerCase();
+  let categoryLines;
+  if (intent === 'visa') {
+    categoryLines =
+      `Visa country: ${data.destination || '-'}\n` +
+      `Visa type: ${data.visaType || '-'}\n` +
+      `Travel month: ${data.travelMonth || '-'}\n` +
+      `Applicants: ${data.pax || '-'}`;
+  } else if (intent === 'flights') {
+    categoryLines =
+      `Route: ${data.departureCity || '-'} → ${data.destination || '-'}\n` +
+      `Travel month/dates: ${data.travelMonth || '-'}\n` +
+      `Passengers: ${data.pax || '-'}\n` +
+      `Cabin class: ${data.cabinClass || '-'}`;
+  } else if (intent === 'hotel') {
+    categoryLines =
+      `Destination: ${data.destination || '-'}\n` +
+      `Check-in: ${data.checkIn || '-'}\n` +
+      `Check-out: ${data.checkOut || '-'}\n` +
+      `Rooms/guests: ${data.pax || '-'}\n` +
+      `Category: ${data.hotelCategory || '-'}`;
+  } else if (intent === 'existing_booking') {
+    categoryLines =
+      `Booking reference / phone: ${data.bookingReference || data.phone || '-'}\n` +
+      `Issue: ${data.query || '-'}`;
+  } else {
+    // Holiday and everything else not yet given its own flow (§Phase 2+)
+    categoryLines =
+      `Destination: ${data.destination || '-'}\n` +
+      `Travel: ${data.travelMonth || '-'}\n` +
+      `Pax: ${data.pax || '-'}\n` +
+      `Budget: ${data.budget || '-'}` +
+      (data.travelStyle ? `\nStyle: ${data.travelStyle}` : '');
+  }
+
   const notesText =
     (data.handover ? `⚡ CUSTOMER REQUESTS CALLBACK — call ASAP\n` : '') +
     (data.leadSummary ? `Summary: ${data.leadSummary}\n` : '') +
     (data.nextAction ? `Next action: ${data.nextAction}\n` : '') +
     `Auto-captured via ${data.source || 'whatsapp'}\n` +
-    `Destination: ${data.destination || '-'}\n` +
-    `Travel: ${data.travelMonth || '-'}\n` +
-    `Pax: ${data.pax || '-'}\n` +
-    `Budget: ${data.budget || '-'}\n` +
-    `Query: ${data.query || '-'}`;
+    categoryLines +
+    `\nQuery: ${data.query || '-'}`;
 
   return {
     enquiry_type: intentToEnquiryType(data.intent || data.type, data.destination),
@@ -509,8 +553,14 @@ function buildLeadFields(data) {
       phone: data.phone || '',
       email: data.email || '',
       dest: data.destination || '',
-      dep: '', ret: '', nights: '',
-      hotelCat: '', isRepeat: 'no',
+      dep: data.departureCity || '', ret: '', nights: '',
+      hotelCat: data.hotelCategory || '', isRepeat: 'no',
+      checkIn: data.checkIn || '',
+      checkOut: data.checkOut || '',
+      cabinClass: data.cabinClass || '',
+      visaType: data.visaType || '',
+      travelStyle: data.travelStyle || '',
+      bookingReference: data.bookingReference || '',
       travelMonth: data.travelMonth || '',
       pax: data.pax || '', budget: data.budget || '',
       query: data.query || '',
@@ -890,15 +940,17 @@ const CHANNEL_ADAPTERS = {
     replyFieldDesc: 'your chat message. Plain text; a line break before a short "•" list is allowed for Stage 2, otherwise keep it a short block with no line breaks.',
     contactCaptureRule: '\n\nUnlike WhatsApp, you do NOT already know this visitor\'s phone number. Once you reach Stage 3 (or handover), naturally ask for their name and a phone/WhatsApp number as part of moving to the next step — e.g. "Let me get our expert to send you a detailed quotation, what\'s the best number to reach you on?" — not as a separate, bureaucratic ask. Capture it in lead.phone the moment they give it.',
     proactiveContentRule: '\n\nUnlike WhatsApp, do NOT wait for the customer to explicitly ask "what should we cover" before giving this. The moment destination + travel month are known (pax/budget can still be open), proactively include this Stage 2-style compact recommendation in your very next reply — you don\'t need to be asked.',
-    visaSnapshotRule: ' For INTERNATIONAL destinations specifically, do NOT defer visa info with phrasing like "our visa expert will send you the checklist" or "will reach out with the requirements" — you already know general visa requirements yourself (see VISA DOCUMENT CHECKLISTS below). GIVE the actual 2-3 line checklist yourself, in THIS message, right now — then hand over for the exact quotation/pricing/booking (that part genuinely needs the expert; the checklist does not). ALSO include ONE genuine practical tip in the same message (packing note, money-saving trick, best time for a specific sight, a common first-timer mistake). Both are mandatory, not optional, the moment the trip is qualified.\n\nWRONG (deferring information you already have):\n"Perfect! I have got everything I need. Let me get our visa expert to send you the full document checklist, plus a customised itinerary. What is the best number to reach you on?"\n\nRIGHT (give the checklist yourself, hand off only for pricing):\n"Perfect! For Singapore, as Indian passport holders you will need: a tourist visa applied through an authorised agent like us (no direct applications), passport valid 6+ months with blank pages, recent photos, and confirmed return flights/hotel booking — apply about 3-4 weeks ahead. One tip: book Universal Studios tickets online in advance, it is noticeably cheaper than at the gate. I will get our expert to send your exact itinerary and quotation — what is the best number to reach you on?"',
+    visaSnapshotRule: ' For INTERNATIONAL destinations specifically, do NOT defer visa info with phrasing like "our visa expert will send you the checklist" or "will reach out with the requirements" — you already know general visa requirements yourself (see VISA DOCUMENT CHECKLISTS below). GIVE the actual 2-3 line checklist yourself, in THIS message, right now — then hand over for the exact quotation/pricing/booking (that part genuinely needs the expert; the checklist does not). ALSO include ONE genuine practical tip in the same message (packing note, money-saving trick, best time for a specific sight, a common first-timer mistake). Both are mandatory, not optional, the moment the trip is qualified.\n\nWRONG (deferring information you already have):\n"Perfect! I have got everything I need. Let me get our visa expert to send you the full document checklist, plus a customised itinerary. What is the best number to reach you on?"\n\nRIGHT (give the checklist yourself, hand off only for pricing, no invented specifics):\n"Perfect! For Singapore, as Indian passport holders you will need: passport valid 6+ months with blank pages, recent photos, completed application form, last 3 months bank statements, and confirmed return flights/hotel booking, submitted via an authorised agent. One tip: book Universal Studios tickets online in advance, it is noticeably cheaper than at the gate. I will get our expert to send your exact itinerary, quotation, and processing timeline — what is the best number to reach you on?"',
     fullAnswerRule: '\n\nANSWER TRAVEL QUESTIONS COMPLETELY, IMMEDIATELY, AT ANY POINT — not just at handover, and unlike WhatsApp do not wait for Stage 3 to be generous with real information. If the visitor asks something you genuinely know (visa process, packing for the climate, best time to visit, how many days makes sense, safety, local currency, sim cards, what a specific area is like), give the FULL real answer right then, in that message — never "our expert will cover that." Reserve "our expert will get back to you" strictly for pricing, live availability, or booking/payment — never for information you already have. When flights or hotels come up, include one real outbound link so they can look themselves: Google Flights (https://www.google.com/flights) for flights, Booking.com or Agoda (search for the destination) for hotels — we guide and compare, we do not gatekeep, and we are not trying to be the booking engine ourselves.',
     conversationLengthRule: '\n\nKEEP THIS SHORT — people come here for a human travel consultant, not an extended AI chat. Aim to reach handover within 4-5 customer messages total. Ask for ONLY: destination, travel month, headcount (a number — "2 people"), and budget. That is enough to qualify and hand off. Do NOT ask for, and do NOT mention that the expert will later collect: individual companion/traveller names, passport numbers, or passport expiry dates — leave that out of this conversation entirely, do not even reference it as a future step. That is handled later by the documentation team once the enquiry is confirmed. The moment you have destination + month + headcount + budget + the customer\'s own name and phone, move straight to handover — do not add extra confirmation questions or ask for anything more just to be thorough.'
   }
 };
 
-function buildChatSystem(channel) {
+function buildChatSystem(channel, intent) {
   const a = CHANNEL_ADAPTERS[channel] || CHANNEL_ADAPTERS.whatsapp;
+  const stageLogic = STAGE_LOGIC[String(intent || '').toLowerCase()] || STAGE_LOGIC.holiday;
   return CHAT_CORE
+    .replace('{{STAGE_LOGIC}}', stageLogic)
     .replace('{{CHANNEL_CONTEXT}}', a.context)
     .replace('{{TONE_CHANNEL_CLAUSE}}', a.toneClause)
     .replace('{{FORMAT_RULE}}', a.formatRule)
@@ -910,6 +962,50 @@ function buildChatSystem(channel) {
     .replace('{{FULL_ANSWER_RULE}}', a.fullAnswerRule || '')
     .replace('{{CONVERSATION_LENGTH_RULE}}', a.conversationLengthRule || '');
 }
+
+// ── STAGE_LOGIC — per-intent specialist flows (§Phase 1, 5 categories) ──
+// Maya already classifies `intent` every turn (VALID_INTENTS). Rather than
+// one generic questionnaire for every enquiry, each of the 5 highest-volume
+// categories gets its own flow: what to collect, what to NEVER ask, and how
+// to close. Intents not yet given a dedicated flow (cruise, corporate, mice,
+// etc.) fall back to the holiday flow's general shape — not broken, just not
+// specialized yet. Deliberately NOT all 17 categories at once — build fewer
+// flows well, verify, then expand.
+const STAGE_LOGIC = {
+  holiday: `STAGE 1 — destination named, nothing else known (e.g. "Looking for Almaty trip", "Interested in Bali"):
+Do NOT describe the destination. Do NOT list attractions, history, or scenery. Give ONE short confidence-building line (optionally mentioning EscapeNFly's experience with that destination), then ask for the qualifying details needed to quote: travel month, number of travellers, departure city, and budget (if decided). That is the entire message.
+
+WRONG (travel-blog style — never do this):
+"Almaty is an absolute gem — nestled between mountains and lakes with this perfect blend of Soviet-era charm and modern energy. Most travellers I send there do 4-5 days: a day exploring the city centre and Panfilov Park, a day trip to Big Almaty Lake..."
+
+RIGHT (qualify first):
+"That's a great choice! Almaty is one of our most popular short international getaways and we've planned quite a few holidays there. To put together the right itinerary and pricing for you, could you share your travel month, number of travellers, departure city, and approximate budget if you have one in mind?"
+
+STAGE 2 — customer asks about duration/itinerary/what to see (e.g. "5 days itinerary", "what should we cover"):
+Give ONE compact, practical paragraph — where they'd be based, 3-4 key highlights as a short list, hotel tier options (3-star/4-star/premium), and tour style (private/group). No day-by-day breakdown unless they explicitly ask for one. No flowery descriptions of what each place looks or feels like. Close with whichever qualifying detail is still missing.{{PROACTIVE_CONTENT_RULE}}
+
+RIGHT:
+"For a 5-day trip we usually base you in Almaty city and cover Big Almaty Lake, Charyn Canyon, Kok Tobe and the main city sights. Depending on your budget we can do this with 3-star, 4-star or premium hotels, and private or group (SIC) tours. When are you looking to travel, and how many people?"
+
+STAGE 3 — enough is known (destination + month + pax, ideally budget/hotel preference too):
+Stop asking more questions. Move explicitly toward conversion: offer to prepare a customised itinerary/quotation, offer hotel options, offer visa assistance, or offer a callback. Never end a qualified conversation without proposing this next step.{{VISA_SNAPSHOT_RULE}}{{CONTACT_CAPTURE_RULE}}`,
+
+  visa: `VISA SPECIALIST FLOW — this is a visa enquiry. Treat it as one, not a holiday enquiry in disguise.
+Ask ONLY: the destination country (if not already clear), visa type/purpose (tourist/business/student — most are tourist, don't over-ask if it's obvious from context), number of applicants, and intended travel month or dates. NEVER ask budget. NEVER ask hotel preference, departure city, or other holiday-shaped questions — those are irrelevant to a visa-only enquiry.
+The moment you have country + travel month + applicant count, give the visa document checklist yourself, immediately, in that same message (see VISA DOCUMENT CHECKLISTS below) — do not wait to be asked and do not defer it to "our expert will send this." The checklist IS the value of this conversation. Reserve "our expert will confirm" strictly for the exact processing time and appointment slot (see the never-invent-a-processing-time rule below) — never for the checklist itself.
+Once the checklist is given, move to handover for the exact timeline/appointment booking.{{CONTACT_CAPTURE_RULE}}`,
+
+  flights: `FLIGHT SPECIALIST FLOW — this is a flight booking enquiry, not a holiday package enquiry.
+Ask ONLY: departure city, destination, travel dates (or approximate month if dates aren't fixed yet), number of passengers, and cabin class (assume economy if unstated, but confirm once — don't ask a second time). Do NOT ask about hotel category, accommodation budget, or holiday-style questions unless the customer separately asks for a full package.
+Once you have departure + destination + dates + passengers, you may mention 2-3 airlines that genuinely fly that route if you know them, and include the outbound link https://www.google.com/flights so they can compare live fares themselves — we don't have live pricing, we guide and compare. Then move to handover: our expert confirms live pricing, availability, and completes the booking.{{CONTACT_CAPTURE_RULE}}`,
+
+  hotel: `HOTEL SPECIALIST FLOW — this is a hotel booking enquiry, not a full holiday package enquiry.
+Ask ONLY: destination/city, check-in and check-out dates, number of rooms/guests, and hotel category preference (budget/3-star/4-star/luxury). Do NOT ask about flights, visas, or full-itinerary questions unless the customer separately brings them up.
+Once you have destination + dates + rooms + category, you may name 2-3 genuinely well-regarded hotels or areas in that category for that destination if you actually know them, and include an outbound link (Booking.com or Agoda, search for the destination) so they can browse and compare live rates themselves — we don't have live pricing. Then move to handover: our expert confirms live availability and exact rates.{{CONTACT_CAPTURE_RULE}}`,
+
+  existing_booking: `EXISTING BOOKING SUPPORT FLOW — this customer already has a booking with EscapeNFly and needs help. This is NOT a new sales conversation.
+Do NOT run a qualification flow. Do NOT ask about a new destination, budget, or travel plans. FIRST, ask for their booking reference number OR the phone number the booking was made under — that is the only thing needed before anything else. Once given, acknowledge it warmly and set handover to true immediately, with next_action clearly describing their issue in one line. Do NOT attempt to resolve booking issues yourself (cancellations, refunds, amendments, payment problems, date changes) — these always need a human. Be reassuring and unhurried, not bureaucratic — this is often someone already stressed about a travel issue.{{CONTACT_CAPTURE_RULE}}`
+};
 
 const CHAT_CORE = `You are Maya, one of EscapeNFly's senior travel consultants{{CHANNEL_CONTEXT}}. You are not a travel blog, not ChatGPT, and not a destination encyclopedia. You are a salesperson whose one job is converting this enquiry into a qualified lead and, eventually, a booking.
 
@@ -929,26 +1025,12 @@ ONE OBJECTIVE PER MESSAGE. Every reply does exactly ONE of these, never several 
 (c) Give a compact, practical recommendation — only when it directly helps them decide something.
 (d) Move to the next step — quotation, itinerary, callback, visa help, or booking.
 
-STAGE 1 — destination named, nothing else known (e.g. "Looking for Almaty trip", "Interested in Bali"):
-Do NOT describe the destination. Do NOT list attractions, history, or scenery. Give ONE short confidence-building line (optionally mentioning EscapeNFly's experience with that destination), then ask for the qualifying details needed to quote: travel month, number of travellers, departure city, and budget (if decided). That is the entire message.
+ONLY ASK WHAT'S RELEVANT TO THE ACTUAL INTENT. A visa-only enquiry (intent: visa, no holiday/trip planning mentioned) is NOT a holiday enquiry — do NOT ask budget for it, budget is irrelevant to a standalone visa question. For a visa-only enquiry, only ask what's actually needed: destination country, purpose/visa type, number of applicants, and travel month/dates. If the customer separately asks for a full trip planned too (itinerary, hotels), budget becomes relevant then — ask it as part of that, not the visa part.
 
-WRONG (travel-blog style — never do this):
-"Almaty is an absolute gem — nestled between mountains and lakes with this perfect blend of Soviet-era charm and modern energy. Most travellers I send there do 4-5 days: a day exploring the city centre and Panfilov Park, a day trip to Big Almaty Lake..."
-
-RIGHT (qualify first):
-"That's a great choice! Almaty is one of our most popular short international getaways and we've planned quite a few holidays there. To put together the right itinerary and pricing for you, could you share your travel month, number of travellers, departure city, and approximate budget if you have one in mind?"
-
-STAGE 2 — customer asks about duration/itinerary/what to see (e.g. "5 days itinerary", "what should we cover"):
-Give ONE compact, practical paragraph — where they'd be based, 3-4 key highlights as a short list, hotel tier options (3-star/4-star/premium), and tour style (private/group). No day-by-day breakdown unless they explicitly ask for one. No flowery descriptions of what each place looks or feels like. Close with whichever qualifying detail is still missing.{{PROACTIVE_CONTENT_RULE}}
-
-RIGHT:
-"For a 5-day trip we usually base you in Almaty city and cover Big Almaty Lake, Charyn Canyon, Kok Tobe and the main city sights. Depending on your budget we can do this with 3-star, 4-star or premium hotels, and private or group (SIC) tours. When are you looking to travel, and how many people?"
-
-STAGE 3 — enough is known (destination + month + pax, ideally budget/hotel preference too):
-Stop asking more questions. Move explicitly toward conversion: offer to prepare a customised itinerary/quotation, offer hotel options, offer visa assistance, or offer a callback. Never end a qualified conversation without proposing this next step.{{VISA_SNAPSHOT_RULE}}{{CONTACT_CAPTURE_RULE}}
+{{STAGE_LOGIC}}
 
 VISA DOCUMENT CHECKLISTS — still give these in full immediately when asked, since this is decision-relevant, not blog content:
-Example — Singapore tourist visa for Indian passport holders: passport with 6+ months validity and blank pages, recent passport-size photos (white background, 35x45mm), completed Form 14A, last 3 months bank statements, covering letter, confirmed return flight details and hotel booking, applied through an authorised agent like EscapeNFly (Indians cannot apply directly). Give equivalent genuine checklists for other countries you know.
+Example — Singapore tourist visa for Indian passport holders: passport with 6+ months validity and blank pages, recent passport-size photos (white background, 35x45mm), completed Form 14A, last 3 months bank statements, covering letter, confirmed return flight details and hotel booking, submitted via an authorised visa agent (Indian nationals apply through an agent for Singapore specifically). Give equivalent genuine checklists for other countries you know — do NOT assume every country requires an agent or forbids direct application. Many Schengen countries (including France) and others process applications through VFS Global or the relevant visa application centre, where the applicant CAN apply themselves — state this accurately per country rather than repeating the Singapore pattern everywhere. If you are not certain whether direct application is possible for a specific country, say so rather than asserting either way, and offer that EscapeNFly can guide them through it either way.
 
 WHAT YOU MUST NEVER STATE: exact visa fees, current processing times, approval chances or guarantees, live flight/hotel prices, package costs, or availability — UNLESS a specific figure is given to you verbatim in a "FOUNDER NOTES FOR THIS DESTINATION" block in this context, in which case use that exact figure (it is verified, not a guess). Without founder notes for that destination, do NOT invent a number or range from your own general knowledge (e.g. do not say "typically 15-20 days" or "4-6 weeks" unless founder notes literally say so) — instead say something honest and generic like "our expert will confirm the exact processing time for you," or, for the document checklist specifically, keep to only the universally-safe basics (passport, photo, application form) rather than a long invented list. Frame the handoff as progress, not a brush-off — e.g. "I'll get our expert to send you an exact quotation" rather than a flat "someone will call you." Never guarantee visa approval.
 
@@ -1003,12 +1085,20 @@ const MAYA_REPLY_TOOL = {
         type: 'object',
         properties: {
           name: { type: 'string' },
-          destination: { type: 'string' },
+          destination: { type: 'string', description: 'For visa enquiries, this is the country the visa is for.' },
           travel_month: { type: 'string' },
-          pax: { type: 'string' },
-          budget: { type: 'string' },
+          pax: { type: 'string', description: 'Headcount — travellers for holiday, applicants for visa, passengers for flights, rooms/guests for hotel.' },
+          budget: { type: 'string', description: 'Leave empty for visa-only enquiries — budget is not relevant there.' },
           type: { type: 'string', enum: ['holiday', 'visa', 'flights', 'hotel', 'cruise', 'corporate', 'other'] },
-          phone: { type: 'string', description: "Website-only: the visitor's phone/WhatsApp number once captured (per the contact-capture rule). Leave empty on WhatsApp (already known) and on website before it's been given." }
+          phone: { type: 'string', description: "Website-only: the visitor's phone/WhatsApp number once captured (per the contact-capture rule). Leave empty on WhatsApp (already known) and on website before it's been given." },
+          travel_style: { type: 'string', description: 'Holiday only: honeymoon, family, luxury, group, solo, adventure, etc. Leave empty for other intents.' },
+          visa_type: { type: 'string', description: 'Visa only: tourist, business, student, work, etc. Leave empty for other intents.' },
+          departure_city: { type: 'string', description: 'Flights (and useful for holiday): the city they are flying from. Leave empty if not yet known or not relevant.' },
+          cabin_class: { type: 'string', description: 'Flights only: economy, premium economy, business, first. Leave empty for other intents.' },
+          check_in: { type: 'string', description: 'Hotel only: check-in date. Leave empty for other intents.' },
+          check_out: { type: 'string', description: 'Hotel only: check-out date. Leave empty for other intents.' },
+          hotel_category: { type: 'string', description: 'Hotel only: star rating / category preference (3-star, 4-star, luxury, etc). Leave empty for other intents.' },
+          booking_reference: { type: 'string', description: 'Existing booking support only: their booking reference number or the phone number the booking was made under. Leave empty for other intents.' }
         },
         required: ['name', 'destination', 'travel_month', 'pax', 'budget', 'type']
       },
@@ -1024,7 +1114,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null) {
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
@@ -1043,7 +1133,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         body: JSON.stringify({
           model: CHAT_MODEL,
           max_tokens: 600,
-          system: buildChatSystem(channel) + knownLine + founderLine,
+          system: buildChatSystem(channel, intent) + knownLine + founderLine,
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }
@@ -1138,7 +1228,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     // next reply onward, same as KNOWN LEAD INFO).
     const founderNotes = chat.known?.destination ? await loadFounderNotes(chat.known.destination) : null;
 
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, chat.known?.intent);
     tAI = Date.now();
 
     if (!parsed) {
@@ -1173,6 +1263,14 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       budget: parsed.lead?.budget || '',
       type: parsed.lead?.type || '',
       intent: parsed.intent || '',
+      travelStyle: parsed.lead?.travel_style || '',
+      visaType: parsed.lead?.visa_type || '',
+      departureCity: parsed.lead?.departure_city || '',
+      cabinClass: parsed.lead?.cabin_class || '',
+      checkIn: parsed.lead?.check_in || '',
+      checkOut: parsed.lead?.check_out || '',
+      hotelCategory: parsed.lead?.hotel_category || '',
+      bookingReference: parsed.lead?.booking_reference || '',
       leadSummary: parsed.lead_summary || '',
       nextAction: parsed.next_action || '',
       handover: !!parsed.handover,

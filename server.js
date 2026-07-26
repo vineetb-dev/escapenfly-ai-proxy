@@ -447,6 +447,17 @@ function lookupDestinationInfo(destination) {
   return null;
 }
 
+// Same substring match as lookupDestinationInfo, but returns the matched KEY
+// itself (e.g. 'dubai') rather than its weather/currency info — needed for
+// founder_notes lookups, which are keyed by destination name directly.
+function guessDestinationKeyFromMessage(message) {
+  const m = String(message || '').toLowerCase();
+  for (const k of Object.keys(DESTINATION_INFO)) {
+    if (m.includes(k)) return k;
+  }
+  return null;
+}
+
 async function loadLiveWeather(city) {
   if (!process.env.OPENWEATHER_API_KEY || !city) return null;
   try {
@@ -1256,7 +1267,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
       (founderNotes.visa_info ? `\nVisa: ${founderNotes.visa_info}` : '') +
       (founderNotes.visa_complexity ? `\nVisa complexity: ${founderNotes.visa_complexity}` : '') +
       (founderNotes.rejection_patterns ? `\nCommon rejection patterns we've seen: ${founderNotes.rejection_patterns}` : '') +
-      (founderNotes.min_budget_inr ? `\nRealistic minimum budget: ₹${Number(founderNotes.min_budget_inr).toLocaleString('en-IN')}${founderNotes.min_budget_note ? ` (${founderNotes.min_budget_note})` : ''} — use this as the real reference for budget-fit judgment instead of estimating.` : '') +
+      (founderNotes.min_budget_inr ? `\nRealistic minimum budget: ₹${Number(founderNotes.min_budget_inr).toLocaleString('en-IN')}${founderNotes.min_budget_note ? ` (${founderNotes.min_budget_note})` : ''}. MANDATORY: the moment you know the customer's stated budget AND pax count, actually do this arithmetic (this number is usually per-person — check min_budget_note to confirm) and compare it against what they gave you. If their total budget divided by pax is meaningfully below this minimum, say so plainly and specifically (e.g. "that works out to about ₹50k/person, and this trip realistically needs closer to ₹85k/person — let's either adjust the budget or look at what we'd need to trim") — do not just acknowledge the number exists without applying it.` : '') +
       (founderNotes.ideal_duration ? `\nIdeal trip duration: ${founderNotes.ideal_duration}` : '') +
       (founderNotes.best_airlines ? `\nBest airlines for this route: ${founderNotes.best_airlines}` : '') +
       (founderNotes.best_hotel_areas ? `\nBest hotel areas: ${founderNotes.best_hotel_areas}` : '') +
@@ -1374,7 +1385,9 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     // earlier turn in this conversation (won't exist yet on the very first
     // turn where the destination is first mentioned — available from the
     // next reply onward, same as KNOWN LEAD INFO).
-    const founderNotes = chat.known?.destination ? await loadFounderNotes(chat.known.destination) : null;
+    const founderDestKey = chat.known?.destination || guessDestinationKeyFromMessage(message);
+    const founderNotes = founderDestKey ? await loadFounderNotes(founderDestKey) : null;
+    console.log(`🔎 founderNotes lookup for "${founderDestKey || '(none)'}":`, founderNotes ? JSON.stringify(founderNotes) : 'NOT FOUND');
     // Turn-1 gap (same class of bug as the intent pre-classifier): chat.known.destination
     // is only populated AFTER Claude parses this turn, so on the very first message
     // ("need to travel in dubai...") it's still empty at lookup-time here. Fall back to

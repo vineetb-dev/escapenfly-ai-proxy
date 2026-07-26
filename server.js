@@ -377,6 +377,36 @@ async function upsertCustomerProfile(phone, known) {
   }
 }
 
+// ── RECOMMENDATIONS LOG — the compounding judgment asset (§Learning Engine) ──
+// Every time enough is known to create or meaningfully update a lead, log
+// the situation and the recommendation reasoning given. Starts nearly
+// empty; that's the point — this is genuinely proprietary, compounding data
+// that only accumulates by actually running the business, not something
+// mineable retroactively. Reuses lead_summary/next_action (already produced
+// every turn) rather than requiring a new field from Maya.
+async function logRecommendation(known, phone, channel) {
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/recommendations`, {
+      method: 'POST',
+      headers: { ...SB_HEADERS, 'Prefer': 'return=minimal' },
+      body: JSON.stringify({
+        phone: phone || '',
+        destination: known.destination || '',
+        situation: {
+          destination: known.destination || '', travelMonth: known.travelMonth || '',
+          pax: known.pax || '', budget: known.budget || '', type: known.type || '',
+          intent: known.intent || '', travelStyle: known.travelStyle || ''
+        },
+        recommendation_reason: known.leadSummary || known.nextAction || '',
+        channel: channel || 'whatsapp'
+      })
+    }, 'SB-logRecommendation');
+    if (!r.ok) console.error('logRecommendation failed:', r.status, await r.text());
+  } catch (e) {
+    console.error('logRecommendation error:', e.message);
+  }
+}
+
 // ── FOUNDER NOTES — Vineet's verified per-destination facts (§Phase 3) ──
 // Direct response to a real accuracy failure: Maya was generating plausible-
 // sounding but WRONG visa processing times and document lists from her own
@@ -1474,6 +1504,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
           chat.sig = sig;
           const ok = await updateLead(recent.id, merged);
           log.crm = ok ? `enriched:${recent.id.slice(0, 8)}` : 'enrich-FAILED';
+          await logRecommendation(merged, effectivePhone, channel);
           if (merged.handover && !recent.existing.handover) {
             const assigned = await assignTeamWithClaude(merged);
             log.notify = (await notifyTeam(assigned, merged)) ? 'ok' : 'FAILED';
@@ -1489,6 +1520,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
         log.crm = leadId ? `created:${leadId.slice(0, 8)}→${assigned.name}` : 'create-FAILED';
         log.notify = (await notifyTeam(assigned, merged)) ? 'ok' : 'FAILED';
         chat.sig = JSON.stringify(merged);
+        await logRecommendation(merged, effectivePhone, channel);
       }
     }
 

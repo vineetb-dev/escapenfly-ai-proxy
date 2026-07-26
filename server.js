@@ -1468,7 +1468,16 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       ? await Promise.all([loadLiveWeather(destInfo.city), loadForexRate(destInfo.currency)])
       : [null, null];
     const effectiveIntent = chat.known?.intent || guessIntentFromMessage(message);
-    const enquiryStatus = await loadEnquiryStatus(phone);
+    // Same turn-1 gap as the destination/intent fixes earlier tonight: on
+    // website, if the customer states their phone IN the same message as a
+    // status question ("what about my trip, 9878638400"), the session key
+    // here is still the anonymous key — Claude hasn't extracted the number
+    // into parsed.lead.phone yet at this point in the turn. WhatsApp never
+    // has this gap (phone is known from message one there). Fall back to a
+    // direct regex match against the raw message for a real Indian mobile
+    // number pattern.
+    const statusLookupPhone = validPhone(phone) ? phone : (message.match(/\b[6-9]\d{9}\b/) || [])[0];
+    const enquiryStatus = await loadEnquiryStatus(statusLookupPhone);
 
     const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus);
     tAI = Date.now();

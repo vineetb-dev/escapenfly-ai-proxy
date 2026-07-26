@@ -1344,7 +1344,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
     ? `\n\nLIVE DATA FOR THIS DESTINATION (fetched just now — use only if genuinely relevant to what the customer is asking, don't force it into every reply):${liveWeather ? `\nCurrent weather in ${liveWeather.city} right now: ${liveWeather.tempC}°C, ${liveWeather.condition}. This is CURRENT conditions only, not a seasonal forecast — do not use it to answer "what's the best time to visit" or predict weather for a future travel month, only for "what's it like there right now" or a trip happening imminently.` : ''}${forexRate ? `\nCurrent exchange rate: 1 INR = ${forexRate.rate.toFixed(4)} ${forexRate.currency}. You may mention this if the customer asks about currency/forex, but note rates fluctuate daily so frame it as "around" or "currently", not a locked-in number.` : ''}`
     : '';
   const statusLine = enquiryStatus
-    ? `\n\nEXISTING ENQUIRY STATUS (real CRM data — use ONLY if the customer is asking for an update on their existing enquiry/trip, e.g. "any update", "what's the status", "did you get my enquiry" — never volunteer this unprompted in an unrelated new conversation):\n` +
+    ? `\n\nEXISTING ENQUIRY STATUS (real CRM data — this block only appears because a real enquiry already exists for this phone number, which is itself the signal to treat this as a status check, not a new enquiry. Recognize a wide range of phrasing as asking for an update: "any update", "what's the status", "did you get my enquiry", "what about my trip to X", "what happened with my Malaysia trip" — any of these, given a real record exists, should be read as checking on the EXISTING enquiry below, not starting a fresh one. Never volunteer this unprompted in a conversation that's clearly about something new):\n` +
       `Destination: ${enquiryStatus.destination || 'not specified'}\n` +
       `Status: ${enquiryStatus.status}${enquiryStatus.assignedTo ? ` — being handled by ${enquiryStatus.assignedTo}` : ''}\n` +
       (enquiryStatus.lastNote ? `Most recent note: ${enquiryStatus.lastNote}\n` : '') +
@@ -1478,6 +1478,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     // number pattern.
     const statusLookupPhone = validPhone(phone) ? phone : (message.match(/\b[6-9]\d{9}\b/) || [])[0];
     const enquiryStatus = await loadEnquiryStatus(statusLookupPhone);
+    console.log(`🔎 enquiryStatus lookup for "${statusLookupPhone || '(none)'}":`, enquiryStatus ? JSON.stringify(enquiryStatus) : 'NOT FOUND');
 
     const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus);
     tAI = Date.now();

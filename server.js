@@ -1525,7 +1525,15 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     }
 
     await saveChat(chat);
-    const hasRealFounderData = !!founderNotes && Object.entries(founderNotes).some(([k, v]) => k !== 'destination' && v !== null && v !== '');
+    // Gated to ready/handover — the only point in the conversation where
+    // founder-verified facts (visa specifics, budget floor) are actually
+    // instructed to surface. Without this gate, the badge fired on ANY
+    // turn where a destination with founder data was still being tracked,
+    // even plain qualifying questions with no verified fact stated at all —
+    // a real bug caught by testing, not a hypothetical one.
+    const hasRealFounderData = !!founderNotes
+      && Object.entries(founderNotes).some(([k, v]) => k !== 'destination' && v !== null && v !== '')
+      && !!(parsed.ready || parsed.handover);
     if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = effectivePhone; resultRef.founderVerified = hasRealFounderData; }
     console.log(`▶ [${phone}${effectivePhone !== phone ? '→' + effectivePhone : ''}] IN:"${short(message)}" | intent:${log.intent} | ready:${!!parsed.ready} handover:${!!parsed.handover} | reply:"${short(reply, 60)}" | CRM:${log.crm} | notify:${log.notify} | founderVerified:${hasRealFounderData} | load:${tLoad - t0}ms ai:${tAI - tLoad}ms send:${tSent - tAI}ms post:${Date.now() - tSent}ms total:${Date.now() - t0}ms`);
     return reply;

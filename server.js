@@ -400,6 +400,81 @@ async function loadFounderNotes(destination) {
   }
 }
 
+// ── LIVE TRAVEL INTELLIGENCE — weather + forex (§Phase 4) ──
+// Same pre-fetch-and-inject pattern as founder_notes: look up once before
+// calling Claude, inject as labelled context, let Maya use it only where
+// it's actually relevant rather than forcing it into every reply.
+// HONEST LIMITATION: OpenWeatherMap's free tier is CURRENT conditions only,
+// not historical seasonal averages — useful for "what's it like there right
+// now" or a near-term trip, not "what's the best month to visit" (Maya
+// already handles that from general knowledge, no live data needed there).
+const DESTINATION_INFO = {
+  // destination keyword → { city: OpenWeatherMap query, currency: ISO code }
+  // Deliberately a starting set of common outbound destinations, not
+  // exhaustive — extend as needed, same spirit as founder_notes.
+  dubai: { city: 'Dubai,AE', currency: 'AED' }, uae: { city: 'Dubai,AE', currency: 'AED' },
+  singapore: { city: 'Singapore,SG', currency: 'SGD' },
+  thailand: { city: 'Bangkok,TH', currency: 'THB' }, bangkok: { city: 'Bangkok,TH', currency: 'THB' }, phuket: { city: 'Phuket,TH', currency: 'THB' },
+  bali: { city: 'Denpasar,ID', currency: 'IDR' }, indonesia: { city: 'Denpasar,ID', currency: 'IDR' },
+  malaysia: { city: 'Kuala Lumpur,MY', currency: 'MYR' },
+  maldives: { city: 'Male,MV', currency: 'MVR' },
+  france: { city: 'Paris,FR', currency: 'EUR' }, paris: { city: 'Paris,FR', currency: 'EUR' },
+  italy: { city: 'Rome,IT', currency: 'EUR' },
+  spain: { city: 'Madrid,ES', currency: 'EUR' },
+  switzerland: { city: 'Zurich,CH', currency: 'CHF' },
+  uk: { city: 'London,GB', currency: 'GBP' }, london: { city: 'London,GB', currency: 'GBP' }, england: { city: 'London,GB', currency: 'GBP' },
+  usa: { city: 'New York,US', currency: 'USD' }, us: { city: 'New York,US', currency: 'USD' }, america: { city: 'New York,US', currency: 'USD' },
+  japan: { city: 'Tokyo,JP', currency: 'JPY' }, tokyo: { city: 'Tokyo,JP', currency: 'JPY' },
+  vietnam: { city: 'Hanoi,VN', currency: 'VND' },
+  australia: { city: 'Sydney,AU', currency: 'AUD' },
+  turkey: { city: 'Istanbul,TR', currency: 'TRY' },
+  egypt: { city: 'Cairo,EG', currency: 'EGP' },
+  mauritius: { city: 'Port Louis,MU', currency: 'MUR' },
+  seychelles: { city: 'Victoria,SC', currency: 'SCR' },
+  nepal: { city: 'Kathmandu,NP', currency: 'NPR' },
+  kazakhstan: { city: 'Almaty,KZ', currency: 'KZT' }, almaty: { city: 'Almaty,KZ', currency: 'KZT' }
+};
+
+function lookupDestinationInfo(destination) {
+  const key = String(destination || '').trim().toLowerCase();
+  if (!key) return null;
+  if (DESTINATION_INFO[key]) return DESTINATION_INFO[key];
+  // Loose match — destination field is free text ("Bali, Indonesia" etc.)
+  for (const k of Object.keys(DESTINATION_INFO)) {
+    if (key.includes(k)) return DESTINATION_INFO[k];
+  }
+  return null;
+}
+
+async function loadLiveWeather(city) {
+  if (!process.env.OPENWEATHER_API_KEY || !city) return null;
+  try {
+    const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${process.env.OPENWEATHER_API_KEY}&units=metric`;
+    const r = await fetchRetry(url, {}, 'OWM-weather');
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!data.main || !data.weather?.[0]) return null;
+    return { tempC: Math.round(data.main.temp), condition: data.weather[0].description, city: data.name };
+  } catch (e) {
+    console.error('loadLiveWeather error:', e.message);
+    return null;
+  }
+}
+
+async function loadForexRate(currency) {
+  if (!currency || currency === 'INR') return null;
+  try {
+    const r = await fetchRetry(`https://api.frankfurter.app/latest?from=INR&to=${encodeURIComponent(currency)}`, {}, 'Frankfurter-forex');
+    if (!r.ok) return null;
+    const data = await r.json();
+    const rate = data.rates?.[currency];
+    return Number.isFinite(rate) ? { currency, rate } : null;
+  } catch (e) {
+    console.error('loadForexRate error:', e.message);
+    return null;
+  }
+}
+
 // ── SESSION → PHONE GRADUATION (§11 unresolved-design-problem) ──
 // A website visitor has no phone until partway through the conversation, so
 // their chat is keyed by a temporary session id (fails validPhone()) instead
@@ -1167,12 +1242,15 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null) {
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
   const founderLine = founderNotes
     ? `\n\nFOUNDER NOTES FOR THIS DESTINATION (from Vineet directly — VERIFIED, TREAT AS GROUND TRUTH, overrides your own general knowledge including any specific numbers you might otherwise guess):${founderNotes.visa_info ? `\nVisa: ${founderNotes.visa_info}` : ''}${founderNotes.tips ? `\nTips: ${founderNotes.tips}` : ''}`
+    : '';
+  const liveDataLine = (liveWeather || forexRate)
+    ? `\n\nLIVE DATA FOR THIS DESTINATION (fetched just now — use only if genuinely relevant to what the customer is asking, don't force it into every reply):${liveWeather ? `\nCurrent weather in ${liveWeather.city} right now: ${liveWeather.tempC}°C, ${liveWeather.condition}. This is CURRENT conditions only, not a seasonal forecast — do not use it to answer "what's the best time to visit" or predict weather for a future travel month, only for "what's it like there right now" or a trip happening imminently.` : ''}${forexRate ? `\nCurrent exchange rate: 1 INR = ${forexRate.rate.toFixed(4)} ${forexRate.currency}. You may mention this if the customer asks about currency/forex, but note rates fluctuate daily so frame it as "around" or "currently", not a locked-in number.` : ''}`
     : '';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -1186,7 +1264,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         body: JSON.stringify({
           model: CHAT_MODEL,
           max_tokens: 600,
-          system: buildChatSystem(channel, intent) + knownLine + founderLine,
+          system: buildChatSystem(channel, intent) + knownLine + founderLine + liveDataLine,
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }
@@ -1280,9 +1358,13 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     // turn where the destination is first mentioned — available from the
     // next reply onward, same as KNOWN LEAD INFO).
     const founderNotes = chat.known?.destination ? await loadFounderNotes(chat.known.destination) : null;
+    const destInfo = chat.known?.destination ? lookupDestinationInfo(chat.known.destination) : null;
+    const [liveWeather, forexRate] = destInfo
+      ? await Promise.all([loadLiveWeather(destInfo.city), loadForexRate(destInfo.currency)])
+      : [null, null];
     const effectiveIntent = chat.known?.intent || guessIntentFromMessage(message);
 
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate);
     tAI = Date.now();
 
     if (!parsed) {

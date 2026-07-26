@@ -1525,8 +1525,9 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     }
 
     await saveChat(chat);
-    if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = effectivePhone; }
-    console.log(`▶ [${phone}${effectivePhone !== phone ? '→' + effectivePhone : ''}] IN:"${short(message)}" | intent:${log.intent} | ready:${!!parsed.ready} handover:${!!parsed.handover} | reply:"${short(reply, 60)}" | CRM:${log.crm} | notify:${log.notify} | load:${tLoad - t0}ms ai:${tAI - tLoad}ms send:${tSent - tAI}ms post:${Date.now() - tSent}ms total:${Date.now() - t0}ms`);
+    const hasRealFounderData = !!founderNotes && Object.entries(founderNotes).some(([k, v]) => k !== 'destination' && v !== null && v !== '');
+    if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = effectivePhone; resultRef.founderVerified = hasRealFounderData; }
+    console.log(`▶ [${phone}${effectivePhone !== phone ? '→' + effectivePhone : ''}] IN:"${short(message)}" | intent:${log.intent} | ready:${!!parsed.ready} handover:${!!parsed.handover} | reply:"${short(reply, 60)}" | CRM:${log.crm} | notify:${log.notify} | founderVerified:${hasRealFounderData} | load:${tLoad - t0}ms ai:${tAI - tLoad}ms send:${tSent - tAI}ms post:${Date.now() - tSent}ms total:${Date.now() - t0}ms`);
     return reply;
   } catch (e) {
     console.error(`AI chat error [${phone}]:`, e.message);
@@ -1616,6 +1617,7 @@ app.post('/webhook/website-chat', async (req, res) => {
   res.json({
     reply: reply || FALLBACK_REPLY,
     intent: out.known?.intent || '',
+    founderVerified: !!out.founderVerified,
     lead: {
       destination: out.known?.destination || '',
       travelMonth: out.known?.travelMonth || '',

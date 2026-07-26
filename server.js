@@ -416,6 +416,39 @@ async function logRecommendation(known, phone, channel) {
 // Vineet's own verified answers, looked up per destination and injected as
 // authoritative context that overrides general knowledge. Keyed by a
 // lowercased, trimmed destination name for simple exact-match lookup.
+// ── ENQUIRY STATUS — "Track Your Trip" (§Interaction: silence after handover) ──
+// Directly answers frustration #16 from the discovery document: the silence
+// after handover, with no way to check in without re-messaging and hoping.
+// Deliberately NO time window (unlike findRecentLeadDB's 24h dedupe window)
+// — a status check should work whenever someone asks, days or weeks later,
+// not just within the first 24 hours.
+async function loadEnquiryStatus(phone) {
+  if (!validPhone(phone)) return null;
+  try {
+    const url = `${SB_URL}/rest/v1/enquiries?phone=eq.${phone}` +
+      `&is_deleted=eq.false&select=status,assigned_to_name,history,original_message_text,created_at,updated_at` +
+      `&order=created_at.desc&limit=1`;
+    const r = await fetchRetry(url, { headers: SB_HEADERS }, 'SB-enquiryStatus');
+    if (!r.ok) return null;
+    const rows = await r.json();
+    if (!rows[0]) return null;
+    let destination = '';
+    try { destination = JSON.parse(rows[0].original_message_text || '{}').dest || ''; } catch (e) {}
+    const lastNote = Array.isArray(rows[0].history) && rows[0].history.length
+      ? rows[0].history[rows[0].history.length - 1] : null;
+    return {
+      status: rows[0].status || 'new',
+      assignedTo: rows[0].assigned_to_name || '',
+      destination,
+      lastNote: lastNote?.note || '',
+      lastUpdated: rows[0].updated_at || rows[0].created_at
+    };
+  } catch (e) {
+    console.error('loadEnquiryStatus error:', e.message);
+    return null;
+  }
+}
+
 async function loadFounderNotes(destination) {
   const key = String(destination || '').trim().toLowerCase();
   if (!key) return null;
@@ -1288,7 +1321,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null, enquiryStatus = null) {
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
@@ -1310,6 +1343,13 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
   const liveDataLine = (liveWeather || forexRate)
     ? `\n\nLIVE DATA FOR THIS DESTINATION (fetched just now — use only if genuinely relevant to what the customer is asking, don't force it into every reply):${liveWeather ? `\nCurrent weather in ${liveWeather.city} right now: ${liveWeather.tempC}°C, ${liveWeather.condition}. This is CURRENT conditions only, not a seasonal forecast — do not use it to answer "what's the best time to visit" or predict weather for a future travel month, only for "what's it like there right now" or a trip happening imminently.` : ''}${forexRate ? `\nCurrent exchange rate: 1 INR = ${forexRate.rate.toFixed(4)} ${forexRate.currency}. You may mention this if the customer asks about currency/forex, but note rates fluctuate daily so frame it as "around" or "currently", not a locked-in number.` : ''}`
     : '';
+  const statusLine = enquiryStatus
+    ? `\n\nEXISTING ENQUIRY STATUS (real CRM data — use ONLY if the customer is asking for an update on their existing enquiry/trip, e.g. "any update", "what's the status", "did you get my enquiry" — never volunteer this unprompted in an unrelated new conversation):\n` +
+      `Destination: ${enquiryStatus.destination || 'not specified'}\n` +
+      `Status: ${enquiryStatus.status}${enquiryStatus.assignedTo ? ` — being handled by ${enquiryStatus.assignedTo}` : ''}\n` +
+      (enquiryStatus.lastNote ? `Most recent note: ${enquiryStatus.lastNote}\n` : '') +
+      `IMPORTANT: if status is "lost", do NOT say "lost" or anything sounding dismissive to the customer — instead warmly re-engage, e.g. "Looks like this one's still open on our side — want me to get our expert to take another look, or has anything changed with your plans?" For any other status, translate it warmly and honestly: "new" → just come in, being reviewed; "called"/"follow-up" → our team's been in touch, following up; "quoted" → your quotation should already be with you, offer to resend if needed; "booked" → celebrate it, your trip is booked. Never invent a status or a name if this block is empty.`
+    : '';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
@@ -1322,7 +1362,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         body: JSON.stringify({
           model: CHAT_MODEL,
           max_tokens: 600,
-          system: buildChatSystem(channel, intent) + knownLine + founderLine + liveDataLine,
+          system: buildChatSystem(channel, intent) + knownLine + founderLine + liveDataLine + statusLine,
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }
@@ -1428,8 +1468,9 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       ? await Promise.all([loadLiveWeather(destInfo.city), loadForexRate(destInfo.currency)])
       : [null, null];
     const effectiveIntent = chat.known?.intent || guessIntentFromMessage(message);
+    const enquiryStatus = await loadEnquiryStatus(phone);
 
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus);
     tAI = Date.now();
 
     if (!parsed) {

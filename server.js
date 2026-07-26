@@ -390,7 +390,8 @@ async function loadFounderNotes(destination) {
   const key = String(destination || '').trim().toLowerCase();
   if (!key) return null;
   try {
-    const r = await fetchRetry(`${SB_URL}/rest/v1/founder_notes?destination=eq.${encodeURIComponent(key)}&select=visa_info,tips`, { headers: SB_HEADERS }, 'SB-founderNotes');
+    const fields = 'visa_info,tips,min_budget_inr,min_budget_note,ideal_duration,visa_complexity,rejection_patterns,best_airlines,best_hotel_areas,common_mistakes,seasonal_advice,consultant_notes,post_trip_feedback';
+    const r = await fetchRetry(`${SB_URL}/rest/v1/founder_notes?destination=eq.${encodeURIComponent(key)}&select=${fields}`, { headers: SB_HEADERS }, 'SB-founderNotes');
     if (!r.ok) return null;
     const rows = await r.json();
     return rows[0] || null;
@@ -1251,7 +1252,19 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
   const founderLine = founderNotes
-    ? `\n\nFOUNDER NOTES FOR THIS DESTINATION (from Vineet directly — VERIFIED, TREAT AS GROUND TRUTH, overrides your own general knowledge including any specific numbers you might otherwise guess):${founderNotes.visa_info ? `\nVisa: ${founderNotes.visa_info}` : ''}${founderNotes.tips ? `\nTips: ${founderNotes.tips}` : ''}`
+    ? `\n\nFOUNDER NOTES FOR THIS DESTINATION (from Vineet or the EscapeNFly team directly — VERIFIED, TREAT AS GROUND TRUTH, overrides your own general knowledge including any specific numbers you might otherwise guess):` +
+      (founderNotes.visa_info ? `\nVisa: ${founderNotes.visa_info}` : '') +
+      (founderNotes.visa_complexity ? `\nVisa complexity: ${founderNotes.visa_complexity}` : '') +
+      (founderNotes.rejection_patterns ? `\nCommon rejection patterns we've seen: ${founderNotes.rejection_patterns}` : '') +
+      (founderNotes.min_budget_inr ? `\nRealistic minimum budget: ₹${Number(founderNotes.min_budget_inr).toLocaleString('en-IN')}${founderNotes.min_budget_note ? ` (${founderNotes.min_budget_note})` : ''} — use this as the real reference for budget-fit judgment instead of estimating.` : '') +
+      (founderNotes.ideal_duration ? `\nIdeal trip duration: ${founderNotes.ideal_duration}` : '') +
+      (founderNotes.best_airlines ? `\nBest airlines for this route: ${founderNotes.best_airlines}` : '') +
+      (founderNotes.best_hotel_areas ? `\nBest hotel areas: ${founderNotes.best_hotel_areas}` : '') +
+      (founderNotes.seasonal_advice ? `\nSeasonal advice: ${founderNotes.seasonal_advice}` : '') +
+      (founderNotes.common_mistakes ? `\nCommon mistakes travellers make here: ${founderNotes.common_mistakes}` : '') +
+      (founderNotes.consultant_notes ? `\nConsultant notes: ${founderNotes.consultant_notes}` : '') +
+      (founderNotes.post_trip_feedback ? `\nReal customer feedback from past trips: ${founderNotes.post_trip_feedback}` : '') +
+      (founderNotes.tips ? `\nTips: ${founderNotes.tips}` : '')
     : '';
   const liveDataLine = (liveWeather || forexRate)
     ? `\n\nLIVE DATA FOR THIS DESTINATION (fetched just now — use only if genuinely relevant to what the customer is asking, don't force it into every reply):${liveWeather ? `\nCurrent weather in ${liveWeather.city} right now: ${liveWeather.tempC}°C, ${liveWeather.condition}. This is CURRENT conditions only, not a seasonal forecast — do not use it to answer "what's the best time to visit" or predict weather for a future travel month, only for "what's it like there right now" or a trip happening imminently.` : ''}${forexRate ? `\nCurrent exchange rate: 1 INR = ${forexRate.rate.toFixed(4)} ${forexRate.currency}. You may mention this if the customer asks about currency/forex, but note rates fluctuate daily so frame it as "around" or "currently", not a locked-in number.` : ''}`

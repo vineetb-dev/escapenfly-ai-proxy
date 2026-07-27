@@ -535,7 +535,12 @@ const DESTINATION_INFO = {
   mauritius: { city: 'Port Louis,MU', currency: 'MUR' },
   seychelles: { city: 'Victoria,SC', currency: 'SCR' },
   nepal: { city: 'Kathmandu,NP', currency: 'NPR' },
-  kazakhstan: { city: 'Almaty,KZ', currency: 'KZT' }, almaty: { city: 'Almaty,KZ', currency: 'KZT' }
+  kazakhstan: { city: 'Almaty,KZ', currency: 'KZT' }, almaty: { city: 'Almaty,KZ', currency: 'KZT' },
+  'south korea': { city: 'Seoul,KR', currency: 'KRW' }, korea: { city: 'Seoul,KR', currency: 'KRW' },
+  'sri lanka': { city: 'Colombo,LK', currency: 'LKR' },
+  azerbaijan: { city: 'Baku,AZ', currency: 'AZN' },
+  georgia: { city: 'Tbilisi,GE', currency: 'GEL' },
+  'new zealand': { city: 'Auckland,NZ', currency: 'NZD' }
 };
 
 function lookupDestinationInfo(destination) {

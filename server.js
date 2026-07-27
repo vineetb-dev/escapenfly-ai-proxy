@@ -1659,7 +1659,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     const hasRealFounderData = !!founderNotes
       && Object.entries(founderNotes).some(([k, v]) => k !== 'destination' && v !== null && v !== '')
       && !!(parsed.ready || parsed.handover);
-    if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = effectivePhone; resultRef.founderVerified = hasRealFounderData; }
+    if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = effectivePhone; resultRef.founderVerified = hasRealFounderData; resultRef.founderNotes = founderNotes; }
     console.log(`▶ [${phone}${effectivePhone !== phone ? '→' + effectivePhone : ''}] IN:"${short(message)}" | intent:${log.intent} | ready:${!!parsed.ready} handover:${!!parsed.handover} | reply:"${short(reply, 60)}" | CRM:${log.crm} | notify:${log.notify} | founderVerified:${hasRealFounderData} | load:${tLoad - t0}ms ai:${tAI - tLoad}ms send:${tSent - tAI}ms post:${Date.now() - tSent}ms total:${Date.now() - t0}ms`);
     return reply;
   } catch (e) {
@@ -1747,6 +1747,7 @@ app.post('/webhook/website-chat', async (req, res) => {
   const message = cleanAttr(req.body.message || req.body.text || '') || 'Hi';
   const out = {};
   const reply = await withPhoneLock(sessionKey, () => mayaTurn(sessionKey, message, null, 'website', out));
+  const fn = out.founderNotes || null;
   res.json({
     reply: reply || FALLBACK_REPLY,
     intent: out.known?.intent || '',
@@ -1757,6 +1758,31 @@ app.post('/webhook/website-chat', async (req, res) => {
       pax: out.known?.pax || '',
       budget: out.known?.budget || '',
       name: out.known?.name || ''
+    },
+    workspace: {
+      visa: fn && (fn.visa_info || fn.visa_complexity) ? {
+        summary: fn.visa_info || '',
+        complexity: fn.visa_complexity || ''
+      } : null,
+      flights: fn && fn.best_airlines ? { airlines: fn.best_airlines } : null,
+      hotels: fn && (fn.best_hotel_areas || fn.luxury_upgrade) ? {
+        areas: fn.best_hotel_areas || '',
+        luxuryUpgrade: fn.luxury_upgrade || ''
+      } : null,
+      budget: fn && fn.min_budget_inr ? {
+        minBudgetInr: fn.min_budget_inr,
+        note: fn.min_budget_note || '',
+        idealDuration: fn.ideal_duration || ''
+      } : null,
+      tips: fn && (fn.hidden_gem || fn.money_saving_tip || fn.must_not_miss || fn.common_mistakes || fn.first_time_traveller_advice || fn.ideal_for || fn.avoid_if) ? {
+        hiddenGem: fn.hidden_gem || '',
+        moneySavingTip: fn.money_saving_tip || '',
+        mustNotMiss: fn.must_not_miss || '',
+        commonMistakes: fn.common_mistakes || '',
+        firstTimeAdvice: fn.first_time_traveller_advice || '',
+        idealFor: fn.ideal_for || '',
+        avoidIf: fn.avoid_if || ''
+      } : null
     },
     sessionKey: out.effectivePhone || sessionKey
   });

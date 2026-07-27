@@ -540,7 +540,9 @@ const DESTINATION_INFO = {
   'sri lanka': { city: 'Colombo,LK', currency: 'LKR' },
   azerbaijan: { city: 'Baku,AZ', currency: 'AZN' },
   georgia: { city: 'Tbilisi,GE', currency: 'GEL' },
-  'new zealand': { city: 'Auckland,NZ', currency: 'NZD' }
+  'new zealand': { city: 'Auckland,NZ', currency: 'NZD' },
+  kashmir: { city: 'Srinagar,IN' }, srinagar: { city: 'Srinagar,IN' },
+  ladakh: { city: 'Leh,IN' }, leh: { city: 'Leh,IN' }
 };
 
 function lookupDestinationInfo(destination) {

@@ -422,6 +422,39 @@ async function logRecommendation(known, phone, channel) {
 // Deliberately NO time window (unlike findRecentLeadDB's 24h dedupe window)
 // — a status check should work whenever someone asks, days or weeks later,
 // not just within the first 24 hours.
+// ── PAST DESTINATIONS — "you're not a stranger" (§the person-shaped hole) ──
+// Direct fix for a real, named gap: a repeat customer, recognized by phone,
+// was being treated exactly like a first-time visitor. Pulls real past
+// enquiry destinations so Maya can acknowledge genuine history naturally —
+// never invented, never forced into every reply, just available when it's
+// actually relevant (a returning customer, or "where haven't we been").
+async function loadPastDestinations(phone) {
+  if (!validPhone(phone)) return [];
+  try {
+    const url = `${SB_URL}/rest/v1/enquiries?phone=eq.${phone}` +
+      `&or=(is_deleted.is.null,is_deleted.eq.false)&select=original_message_text,created_at` +
+      `&order=created_at.desc&limit=10`;
+    const r = await fetchRetry(url, { headers: SB_HEADERS }, 'SB-pastDestinations');
+    if (!r.ok) { console.error('loadPastDestinations query failed:', r.status, await r.text()); return []; }
+    const rows = await r.json();
+    const seen = new Set();
+    const destinations = [];
+    for (const row of rows) {
+      try {
+        const dest = JSON.parse(row.original_message_text || '{}').dest;
+        if (dest && !seen.has(dest.toLowerCase())) {
+          seen.add(dest.toLowerCase());
+          destinations.push(dest);
+        }
+      } catch (e) {}
+    }
+    return destinations.slice(0, 5);
+  } catch (e) {
+    console.error('loadPastDestinations error:', e.message);
+    return [];
+  }
+}
+
 async function loadEnquiryStatus(phone) {
   if (!validPhone(phone)) return null;
   try {
@@ -1327,7 +1360,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null, enquiryStatus = null) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = []) {
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
@@ -1356,6 +1389,9 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
       (enquiryStatus.lastNote ? `Most recent note: ${enquiryStatus.lastNote}\n` : '') +
       `IMPORTANT: if status is "lost", do NOT say "lost" or anything sounding dismissive to the customer — instead warmly re-engage, e.g. "Looks like this one's still open on our side — want me to get our expert to take another look, or has anything changed with your plans?" For any other status, translate it warmly and honestly: "new" → just come in, being reviewed; "called"/"follow-up" → our team's been in touch, following up; "quoted" → your quotation should already be with you, offer to resend if needed; "booked" → celebrate it, your trip is booked. Never invent a status or a name if this block is empty.`
     : '';
+  const pastDestinationsLine = (pastDestinations && pastDestinations.length)
+    ? `\n\nTHIS CUSTOMER'S PAST ENQUIRIES WITH US (real CRM data, most recent first): ${pastDestinations.join(', ')}. This is a returning customer, not a stranger — acknowledge this naturally where it fits (e.g. "I see you've asked us about ${pastDestinations[0]} before" or, if they're asking for something new/different, you can note "since you've already done ${pastDestinations.slice(0,2).join(' and ')} with us"). Do NOT force this into every reply or open with it awkwardly — use it only where it genuinely makes the conversation feel more personal, not as a checklist item to recite.`
+    : '';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
@@ -1368,7 +1404,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         body: JSON.stringify({
           model: CHAT_MODEL,
           max_tokens: 600,
-          system: buildChatSystem(channel, intent) + knownLine + founderLine + liveDataLine + statusLine,
+          system: buildChatSystem(channel, intent) + knownLine + founderLine + liveDataLine + statusLine + pastDestinationsLine,
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }
@@ -1485,8 +1521,9 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     const statusLookupPhone = validPhone(phone) ? phone : (message.match(/\b[6-9]\d{9}\b/) || [])[0];
     const enquiryStatus = await loadEnquiryStatus(statusLookupPhone);
     console.log(`🔎 enquiryStatus lookup for "${statusLookupPhone || '(none)'}":`, enquiryStatus ? JSON.stringify(enquiryStatus) : 'NOT FOUND');
+    const pastDestinations = await loadPastDestinations(statusLookupPhone);
 
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations);
     tAI = Date.now();
 
     if (!parsed) {

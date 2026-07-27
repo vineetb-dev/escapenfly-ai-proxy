@@ -425,11 +425,17 @@ async function logRecommendation(known, phone, channel) {
 async function loadEnquiryStatus(phone) {
   if (!validPhone(phone)) return null;
   try {
+    // is_deleted.eq.false alone would silently EXCLUDE any row where the
+    // column is NULL rather than explicitly false (NULL != false in
+    // Postgres) — a real risk on an established table where older rows may
+    // predate this column being set. Match NULL-or-false explicitly instead
+    // of assuming every row has it populated.
     const url = `${SB_URL}/rest/v1/enquiries?phone=eq.${phone}` +
-      `&is_deleted=eq.false&select=status,assigned_to_name,history,original_message_text,created_at,updated_at` +
+      `&or=(is_deleted.is.null,is_deleted.eq.false)` +
+      `&select=status,assigned_to_name,history,original_message_text,created_at,updated_at` +
       `&order=created_at.desc&limit=1`;
     const r = await fetchRetry(url, { headers: SB_HEADERS }, 'SB-enquiryStatus');
-    if (!r.ok) return null;
+    if (!r.ok) { console.error('loadEnquiryStatus query failed:', r.status, await r.text()); return null; }
     const rows = await r.json();
     if (!rows[0]) return null;
     let destination = '';

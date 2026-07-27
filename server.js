@@ -491,12 +491,27 @@ async function loadEnquiryStatus(phone) {
 async function loadFounderNotes(destination) {
   const key = String(destination || '').trim().toLowerCase();
   if (!key) return null;
+  const fields = 'destination,visa_info,tips,min_budget_inr,min_budget_note,ideal_duration,visa_complexity,rejection_patterns,best_airlines,best_hotel_areas,common_mistakes,seasonal_advice,consultant_notes,post_trip_feedback,ideal_for,avoid_if,hidden_gem,money_saving_tip,luxury_upgrade,must_not_miss,first_time_traveller_advice';
   try {
-    const fields = 'visa_info,tips,min_budget_inr,min_budget_note,ideal_duration,visa_complexity,rejection_patterns,best_airlines,best_hotel_areas,common_mistakes,seasonal_advice,consultant_notes,post_trip_feedback';
     const r = await fetchRetry(`${SB_URL}/rest/v1/founder_notes?destination=eq.${encodeURIComponent(key)}&select=${fields}`, { headers: SB_HEADERS }, 'SB-founderNotes');
     if (!r.ok) return null;
     const rows = await r.json();
-    return rows[0] || null;
+    if (rows[0]) return rows[0];
+
+    // No exact match — try a loose match against every known destination
+    // key (e.g. "phuket" falls back to a "thailand" row with real data,
+    // rather than finding nothing). Designed earlier, only now actually
+    // wired in — cheap, only runs on a miss.
+    const listR = await fetchRetry(`${SB_URL}/rest/v1/founder_notes?select=destination`, { headers: SB_HEADERS }, 'SB-founderNotes-list');
+    if (!listR.ok) return null;
+    const allKeys = (await listR.json()).map(r => r.destination);
+    const matchedKey = allKeys.find(k => key.includes(k) || k.includes(key));
+    if (!matchedKey) return null;
+
+    const r2 = await fetchRetry(`${SB_URL}/rest/v1/founder_notes?destination=eq.${encodeURIComponent(matchedKey)}&select=${fields}`, { headers: SB_HEADERS }, 'SB-founderNotes-fallback');
+    if (!r2.ok) return null;
+    const rows2 = await r2.json();
+    return rows2[0] || null;
   } catch (e) {
     console.error('loadFounderNotes error:', e.message);
     return null;
@@ -1385,6 +1400,13 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
       (founderNotes.seasonal_advice ? `\nSeasonal advice: ${founderNotes.seasonal_advice}` : '') +
       (founderNotes.common_mistakes ? `\nCommon mistakes travellers make here: ${founderNotes.common_mistakes}` : '') +
       (founderNotes.consultant_notes ? `\nConsultant notes: ${founderNotes.consultant_notes}` : '') +
+      (founderNotes.ideal_for ? `\nGenuinely ideal for: ${founderNotes.ideal_for}` : '') +
+      (founderNotes.avoid_if ? `\nWorth steering away from if: ${founderNotes.avoid_if} — mention this gently if it applies, don't volunteer it if it doesn't apply to this customer.` : '') +
+      (founderNotes.hidden_gem ? `\nA genuine hidden gem here: ${founderNotes.hidden_gem}` : '') +
+      (founderNotes.money_saving_tip ? `\nReal money-saving tip: ${founderNotes.money_saving_tip}` : '') +
+      (founderNotes.luxury_upgrade ? `\nFor a customer wanting to spend more: ${founderNotes.luxury_upgrade}` : '') +
+      (founderNotes.must_not_miss ? `\nThe one thing not to miss: ${founderNotes.must_not_miss}` : '') +
+      (founderNotes.first_time_traveller_advice ? `\nAdvice specifically for first-time visitors: ${founderNotes.first_time_traveller_advice}` : '') +
       (founderNotes.post_trip_feedback ? `\nReal customer feedback from past trips: ${founderNotes.post_trip_feedback}` : '') +
       (founderNotes.tips ? `\nTips: ${founderNotes.tips}` : '')
     : '';

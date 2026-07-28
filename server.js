@@ -1387,6 +1387,8 @@ const MAYA_REPLY_TOOL = {
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
 async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}) {
+  const todayStr = new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
+  const currentDateLine = `\n\nTODAY'S ACTUAL DATE: ${todayStr}. Use this to reason correctly about relative time — if a customer says a month without a year (e.g. "December"), assume the NEXT upcoming occurrence of that month from today's real date, not a past or arbitrary year. NEVER offer already-past years as options when asking a customer to confirm their travel year.`;
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
@@ -1440,7 +1442,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         body: JSON.stringify({
           model: CHAT_MODEL,
           max_tokens: 600,
-          system: buildChatSystem(channel, intent) + knownLine + founderLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine,
+          system: buildChatSystem(channel, intent) + currentDateLine + knownLine + founderLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine,
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }

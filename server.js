@@ -1386,7 +1386,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = []) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}) {
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
@@ -1425,6 +1425,9 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
   const pastDestinationsLine = (pastDestinations && pastDestinations.length)
     ? `\n\nTHIS CUSTOMER'S PAST ENQUIRIES WITH US (real CRM data, most recent first): ${pastDestinations.join(', ')}. This is a returning customer, not a stranger — acknowledge this naturally where it fits (e.g. "I see you've asked us about ${pastDestinations[0]} before" or, if they're asking for something new/different, you can note "since you've already done ${pastDestinations.slice(0,2).join(' and ')} with us"). Do NOT force this into every reply or open with it awkwardly — use it only where it genuinely makes the conversation feel more personal, not as a checklist item to recite.`
     : '';
+  const returningProfileLine = (returningProfile && returningProfile.name)
+    ? `\n\nRETURNING CUSTOMER (real profile from a previous visit — this is the START of a new conversation, so use this to avoid re-asking what you already know): name is ${returningProfile.name}${returningProfile.destination ? `, last discussed ${returningProfile.destination}` : ''}${returningProfile.travelMonth ? ` for ${returningProfile.travelMonth}` : ''}. You may greet them by name naturally (e.g. "Hi ${returningProfile.name}!") but do not assume they want the SAME trip again — confirm what they're looking for this time rather than assuming continuity.`
+    : '';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
@@ -1437,7 +1440,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         body: JSON.stringify({
           model: CHAT_MODEL,
           max_tokens: 600,
-          system: buildChatSystem(channel, intent) + knownLine + founderLine + liveDataLine + statusLine + pastDestinationsLine,
+          system: buildChatSystem(channel, intent) + knownLine + founderLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine,
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }
@@ -1555,8 +1558,16 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     const enquiryStatus = await loadEnquiryStatus(statusLookupPhone);
     console.log(`🔎 enquiryStatus lookup for "${statusLookupPhone || '(none)'}":`, enquiryStatus ? JSON.stringify(enquiryStatus) : 'NOT FOUND');
     const pastDestinations = await loadPastDestinations(statusLookupPhone);
+    // Phase 3 completion: customer_profile existed but was write-only until
+    // now — nothing ever read it back into a conversation. Only surface it
+    // when THIS session's own chat.known is still thin (name/destination not
+    // yet given here) — a genuinely new conversation, not mid-conversation
+    // where fresher in-session info should already take priority.
+    const isNewSession = !chat.known?.name && !chat.known?.destination;
+    const returningProfile = (isNewSession && validPhone(statusLookupPhone))
+      ? await loadCustomerProfile(statusLookupPhone) : {};
 
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations, returningProfile);
     tAI = Date.now();
 
     if (!parsed) {

@@ -271,18 +271,19 @@
     "notes": "Should accept approximate timing rather than demanding exact dates."
   },
   {
-    "id": "flights_04_link_included",
+    "id": "flights_04_no_outbound_link",
     "category": "flights",
-    "description": "Enough info given to warrant a live comparison link",
+    "description": "Enough info given — should stay in-conversation, not send the customer elsewhere",
     "customerTurns": [
       "Delhi to Singapore, 2 passengers, economy, mid-December"
     ],
     "expectedIntent": "flights",
-    "mustAsk": [
+    "mustNotSay": [
       "google flights",
-      "compare"
+      "booking.com",
+      "agoda"
     ],
-    "notes": "Website channel should offer the Google Flights outbound link once enough is known."
+    "notes": "Should NOT suggest Google Flights or any outbound comparison link — keep the customer in this conversation, move to handover instead."
   },
   {
     "id": "hotel_01_basic",
@@ -320,18 +321,19 @@
     "notes": "All core fields given upfront — should not re-ask any of them."
   },
   {
-    "id": "hotel_03_link_included",
+    "id": "hotel_03_no_outbound_link",
     "category": "hotel",
-    "description": "Enough info given to warrant a live comparison link",
+    "description": "Enough info given — should stay in-conversation, not send the customer elsewhere",
     "customerTurns": [
       "3-star hotel Bangkok, 12-16 Jan, 2 guests 1 room"
     ],
     "expectedIntent": "hotel",
-    "mustAsk": [
+    "mustNotSay": [
       "booking.com",
-      "agoda"
+      "agoda",
+      "google flights"
     ],
-    "notes": "Website channel should offer an outbound hotel comparison link."
+    "notes": "Should NOT suggest Booking.com/Agoda or any outbound comparison link — keep the customer in this conversation, move to handover instead."
   },
   {
     "id": "existing_01_reference_first",

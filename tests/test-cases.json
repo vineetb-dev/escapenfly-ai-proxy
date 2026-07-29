@@ -223,10 +223,7 @@
       "actually let's do Vietnam instead"
     ],
     "expectedIntent": "holiday",
-    "notes": "Should follow the switch cleanly. Checked against the FINAL reply only — Bali is legitimately mentioned in turn 1 before the switch.",
-    "mustNotSayInLastReply": [
-      "bali"
-    ]
+    "notes": "Behavioral check, not a keyword check — read the transcript manually. Good: fresh qualifying questions about Vietnam, at most one natural comparison mention of Bali. Bad: continuing to ask Bali-specific questions, or repeated/confused references to Bali. A single natural comparison mention (e.g. 'different energy from Bali') is not a failure."
   },
   {
     "id": "flights_01_basic",

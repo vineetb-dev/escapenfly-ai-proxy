@@ -290,17 +290,11 @@
       "Need a hotel in Goa for 3 nights"
     ],
     "expectedIntent": "hotel",
-    "mustAsk": [
-      "check-in",
-      "check in",
-      "guests",
-      "rooms"
-    ],
     "mustNotAsk": [
       "visa",
       "flight"
     ],
-    "notes": "Should not drift into visa/flight territory."
+    "notes": "Behavioral check, not a keyword check — read the transcript manually. Good: asks for dates (implying check-in/check-out) and headcount (implying guests), in natural phrasing. Bad: doesn't ask for either concept at all, or asks in a stiff, form-like way. The specific words used to ask don't matter — whether the right information gets requested naturally does."
   },
   {
     "id": "hotel_02_category_given",

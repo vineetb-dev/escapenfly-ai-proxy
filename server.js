@@ -1420,7 +1420,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, debugRef = null) {
   const todayStr = new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
   const currentDateLine = `\n\nTODAY'S ACTUAL DATE: ${todayStr}. Use this to reason correctly about relative time — if a customer says a month without a year (e.g. "December"), assume the NEXT upcoming occurrence of that month from today's real date, not a past or arbitrary year. NEVER offer already-past years as options when asking a customer to confirm their travel year.`;
   const knownLine = (known && Object.values(known).some(v => v))
@@ -1483,6 +1483,16 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         })
       }, 'Claude-chat');
       const d = await r.json();
+      if (!r.ok) {
+        // Previously silently fell through to "no tool_use block found" —
+        // discarding the actual status/reason (rate limit, overload, bad
+        // request, etc). Surface it for real diagnosis instead of guessing.
+        const errType = d?.error?.type || 'unknown';
+        const errMsg = d?.error?.message || JSON.stringify(d).slice(0, 300);
+        console.error(`Claude API error [${phone}] attempt ${attempt + 1}: HTTP ${r.status} (${errType}) — ${errMsg}`);
+        if (debugRef) { debugRef.status = r.status; debugRef.errorType = errType; debugRef.errorMessage = errMsg; }
+        throw new Error(`Claude API HTTP ${r.status} (${errType})`);
+      }
       const toolBlock = (d.content || []).find(b => b.type === 'tool_use' && b.name === 'maya_reply');
       if (toolBlock && toolBlock.input && typeof toolBlock.input.reply === 'string') {
         const parsed = toolBlock.input;
@@ -1491,6 +1501,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         if (!VALID_INTENTS.includes(parsed.intent)) parsed.intent = 'other_travel';
         return parsed;
       }
+      if (debugRef) { debugRef.status = r.status; debugRef.errorType = 'no_tool_use_block'; debugRef.errorMessage = JSON.stringify(d).slice(0, 300); }
       throw new Error('No valid maya_reply tool_use block in response');
     } catch (e) {
       console.error(`Maya tool-call attempt ${attempt + 1} failed [${phone}]:`, e.message);
@@ -1603,7 +1614,8 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     const returningProfile = (isNewSession && validPhone(statusLookupPhone))
       ? await loadCustomerProfile(statusLookupPhone) : {};
 
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations, returningProfile);
+    const debugRef = {};
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations, returningProfile, debugRef);
     tAI = Date.now();
 
     if (!parsed) {
@@ -1611,8 +1623,8 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       chat.lastReply = FALLBACK_REPLY;
       if (onReply) await onReply(FALLBACK_REPLY);
       await saveChat(chat);
-      if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = phone; }
-      console.log(`▶ [${phone}] IN:"${short(message)}" | intent:ERR | reply:FALLBACK | ai:${tAI - tLoad}ms total:${Date.now() - t0}ms`);
+      if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = phone; resultRef.debugError = debugRef; }
+      console.log(`▶ [${phone}] IN:"${short(message)}" | intent:ERR | reply:FALLBACK | debug:${JSON.stringify(debugRef)} | ai:${tAI - tLoad}ms total:${Date.now() - t0}ms`);
       return FALLBACK_REPLY;
     }
 
@@ -1833,7 +1845,11 @@ app.post('/webhook/website-chat', async (req, res) => {
         avoidIf: fn.avoid_if || ''
       } : null
     },
-    sessionKey: out.effectivePhone || sessionKey
+    sessionKey: out.effectivePhone || sessionKey,
+    // Temporary diagnostic — only present when the Claude call actually
+    // failed (see callMayaJSON), so this stays invisible on healthy turns.
+    // Non-sensitive: status code + error type/message only, no request body.
+    debugError: out.debugError && Object.keys(out.debugError).length ? out.debugError : undefined
   });
 });
 

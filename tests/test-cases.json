@@ -470,5 +470,51 @@
       "companion's name"
     ],
     "notes": "Should reach handover within a few messages and never ask for document-collection details this early."
+  },
+  {
+    "id": "consultative_01_budget_question",
+    "category": "consultative-questioning",
+    "description": "Customer asks about cost without stating a budget — Maya must ask for it, but not as a bare form field",
+    "customerTurns": [
+      "Looking at a Thailand trip in December for 2 people, how much would it cost roughly"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "what's your budget",
+      "what is your budget",
+      "what is your budget range"
+    ],
+    "notes": "Behavioral check, not just the keyword list — read the transcript. Good: a natural, scenario-framed budget question giving the customer something to answer against (e.g. \"comfortable mid-range or more premium?\"). Bad: a bare form-field ask like \"What's your budget?\" with nothing to anchor against."
+  },
+  {
+    "id": "consultative_02_travel_style_question",
+    "category": "consultative-questioning",
+    "description": "Customer is undecided on trip style — Maya must ask, but not as a bare form field",
+    "customerTurns": [
+      "Thinking about a Vietnam trip, not sure what kind of trip to plan though"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "what's your travel style",
+      "what is your travel style",
+      "what type of trip"
+    ],
+    "notes": "Behavioral check, not just the keyword list — read the transcript. Good: a natural, scenario-framed style question (e.g. \"relaxed sightseeing, or more adventure and activities?\"). Bad: a bare form-field ask like \"What's your travel style?\" with nothing to anchor against."
+  },
+  {
+    "id": "consultative_03_no_stacked_form_ask",
+    "category": "consultative-questioning",
+    "description": "Family trip with budget and style both open — should still be ONE natural question, not a stacked form",
+    "customerTurns": [
+      "Family trip to Bali, 4 of us, budget and style both open at this point"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "what's your budget",
+      "what is your budget",
+      "what's your travel style",
+      "what is your travel style"
+    ],
+    "notes": "Behavioral check, not just the keyword list — read the transcript. Should ask exactly ONE natural, scenario-framed question (budget OR style, not both), never a bare form-field ask or multiple questions stacked in one message."
   }
 ]

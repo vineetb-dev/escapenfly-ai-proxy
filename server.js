@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const { z } = require('zod');
 const app = express();
 
 app.use(cors({ origin: '*' }));
@@ -860,10 +861,36 @@ function sanitizeTemplateParam(text) {
     .slice(0, 1000);
 }
 
+// ── ZOD VALIDATION — WhatsApp template params + lead_summary ──
+// sanitizeTemplateParam() already cleans/truncates, but that was ad hoc —
+// nothing declared the contract or guaranteed it degraded gracefully if the
+// cleaning logic above it ever changed. These schemas make the guarantee
+// explicit: ANY input (wrong type, null, oversized, malformed) is coerced
+// into a safe, truncated string via .catch() rather than throwing and
+// failing the send outright.
+const waTemplateParamSchema = z.preprocess(
+  (v) => sanitizeTemplateParam(v),
+  z.string().max(1000)
+).catch('');
+
+function validateTemplateParams(params) {
+  return (params || []).map((p) => waTemplateParamSchema.parse(p));
+}
+
+const leadSummarySchema = z.preprocess(
+  (v) => sanitizeTemplateParam(v).slice(0, 300),
+  z.string().max(300)
+).catch('');
+
+function validateLeadSummary(summary) {
+  return leadSummarySchema.parse(summary);
+}
+
 // ── SEND WHATSAPP via AiSensy ──
 async function sendWA(phone, templateName, params) {
   if (!AISENSY_KEY) { console.error('sendWA skipped: AISENSY_KEY not set'); return false; }
   try {
+    const validatedParams = validateTemplateParams(params);
     const r = await fetchRetry('https://backend.aisensy.com/campaign/t1/api/v2', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -871,8 +898,8 @@ async function sendWA(phone, templateName, params) {
         apiKey: AISENSY_KEY,
         campaignName: templateName,
         destination: phone,
-        userName: params[0] || 'Traveller',
-        templateParams: params.map(sanitizeTemplateParam)
+        userName: validatedParams[0] || 'Traveller',
+        templateParams: validatedParams
       })
     }, `AiSensy-${templateName}`);
     const body = await r.text();
@@ -1619,7 +1646,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       checkOut: parsed.lead?.check_out || '',
       hotelCategory: parsed.lead?.hotel_category || '',
       bookingReference: parsed.lead?.booking_reference || '',
-      leadSummary: parsed.lead_summary || '',
+      leadSummary: validateLeadSummary(parsed.lead_summary),
       nextAction: parsed.next_action || '',
       handover: !!parsed.handover,
       query: message,

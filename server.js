@@ -915,9 +915,16 @@ async function sendWA(phone, templateName, params) {
 // ── NOTIFY TEAM (instant new-lead alert) ──
 async function notifyTeam(assigned, leadData) {
   let ok = true;
+  // Slot 4 in the approved team_lead_notification template is fixed as
+  // "...assigned to {{4}} in the CRM" — it can only ever grammatically hold
+  // a NAME, since the template itself can't be edited post-approval. The
+  // rep's own copy was previously sending CRM_URL into this slot, which
+  // rendered as a raw link where a name belongs — a real bug, not a
+  // stylistic choice. The CRM link itself belongs on the template's
+  // separate "EscapeNFly CRM" button, not the body text.
   if (assigned.wa && assigned.wa !== '919XXXXXXXXX') {
     ok = await sendWA(assigned.wa, 'team_lead_notification',
-      [assigned.name, leadData.name || 'Unknown', leadData.destination || 'TBD', CRM_URL]) && ok;
+      [assigned.name, leadData.name || 'Unknown', leadData.destination || 'TBD', assigned.name]) && ok;
   }
   ok = await sendWA(WA_NUM, 'team_lead_notification',
     ['Vineet', leadData.name || 'Unknown', leadData.destination || 'TBD', assigned.name]) && ok;

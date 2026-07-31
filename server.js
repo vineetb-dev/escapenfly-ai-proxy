@@ -559,26 +559,40 @@ const DESTINATION_INFO = {
   ladakh: { city: 'Leh,IN' }, leh: { city: 'Leh,IN' }
 };
 
+function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Same class of bug as the founder_notes P0: plain .includes() substring
+// matching is unsafe — "us" is a real DESTINATION_INFO key and a real
+// substring of "australia" AND "mauritius", so a naive scan checking "us"
+// before "australia" (insertion order) would silently misresolve an
+// Australia enquiry to the US. Word-boundary matching plus picking the
+// LONGEST match among all matches (not just the first in object-key order)
+// fixes both the substring-collision bug and specificity ties (e.g.
+// "south korea" over "korea", "thailand" over an unrelated short key).
+function bestDestinationKeyMatch(text) {
+  const m = String(text || '').toLowerCase();
+  let best = null;
+  for (const k of Object.keys(DESTINATION_INFO)) {
+    const re = new RegExp(`\\b${escapeRegex(k)}\\b`);
+    if (re.test(m) && (!best || k.length > best.length)) best = k;
+  }
+  return best;
+}
+
 function lookupDestinationInfo(destination) {
   const key = String(destination || '').trim().toLowerCase();
   if (!key) return null;
   if (DESTINATION_INFO[key]) return DESTINATION_INFO[key];
   // Loose match — destination field is free text ("Bali, Indonesia" etc.)
-  for (const k of Object.keys(DESTINATION_INFO)) {
-    if (key.includes(k)) return DESTINATION_INFO[k];
-  }
-  return null;
+  const matched = bestDestinationKeyMatch(key);
+  return matched ? DESTINATION_INFO[matched] : null;
 }
 
-// Same substring match as lookupDestinationInfo, but returns the matched KEY
-// itself (e.g. 'dubai') rather than its weather/currency info — needed for
+// Same matching as lookupDestinationInfo, but returns the matched KEY itself
+// (e.g. 'dubai') rather than its weather/currency info — needed for
 // founder_notes lookups, which are keyed by destination name directly.
 function guessDestinationKeyFromMessage(message) {
-  const m = String(message || '').toLowerCase();
-  for (const k of Object.keys(DESTINATION_INFO)) {
-    if (m.includes(k)) return k;
-  }
-  return null;
+  return bestDestinationKeyMatch(message);
 }
 
 async function loadLiveWeather(city) {
@@ -1587,15 +1601,19 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     // earlier turn in this conversation (won't exist yet on the very first
     // turn where the destination is first mentioned — available from the
     // next reply onward, same as KNOWN LEAD INFO).
-    const founderDestKey = chat.known?.destination || guessDestinationKeyFromMessage(message);
+    // P0 fix (31 Jul 2026): chat.known.destination persists per phone for
+    // 24h (CHAT_TTL_MS) and previously took priority over whatever the
+    // customer just typed — a stale destination from an earlier, unrelated
+    // conversation on the same phone silently overrode a brand new
+    // destination named in THIS message. The message's own destination now
+    // always wins; session memory is only a fallback when this message
+    // names no destination at all (a genuine same-topic follow-up like
+    // "6 nights please").
+    const messageDestKey = guessDestinationKeyFromMessage(message);
+    const founderDestKey = messageDestKey || chat.known?.destination;
     const founderNotes = founderDestKey ? await loadFounderNotes(founderDestKey) : null;
     console.log(`🔎 founderNotes lookup for "${founderDestKey || '(none)'}":`, founderNotes ? JSON.stringify(founderNotes) : 'NOT FOUND');
-    // Turn-1 gap (same class of bug as the intent pre-classifier): chat.known.destination
-    // is only populated AFTER Claude parses this turn, so on the very first message
-    // ("need to travel in dubai...") it's still empty at lookup-time here. Fall back to
-    // guessing directly from the raw message — lookupDestinationInfo() already does loose
-    // substring matching, so this works fine against free text, not just a clean field.
-    const destInfo = chat.known?.destination ? lookupDestinationInfo(chat.known.destination) : lookupDestinationInfo(message);
+    const destInfo = messageDestKey ? lookupDestinationInfo(messageDestKey) : (chat.known?.destination ? lookupDestinationInfo(chat.known.destination) : lookupDestinationInfo(message));
     const [liveWeather, forexRate] = destInfo
       ? await Promise.all([loadLiveWeather(destInfo.city), loadForexRate(destInfo.currency)])
       : [null, null];

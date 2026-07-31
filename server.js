@@ -499,20 +499,18 @@ async function loadFounderNotes(destination) {
     const rows = await r.json();
     if (rows[0]) return rows[0];
 
-    // No exact match — try a loose match against every known destination
-    // key (e.g. "phuket" falls back to a "thailand" row with real data,
-    // rather than finding nothing). Designed earlier, only now actually
-    // wired in — cheap, only runs on a miss.
-    const listR = await fetchRetry(`${SB_URL}/rest/v1/founder_notes?select=destination`, { headers: SB_HEADERS }, 'SB-founderNotes-list');
-    if (!listR.ok) return null;
-    const allKeys = (await listR.json()).map(r => r.destination);
-    const matchedKey = allKeys.find(k => key.includes(k) || k.includes(key));
-    if (!matchedKey) return null;
-
-    const r2 = await fetchRetry(`${SB_URL}/rest/v1/founder_notes?destination=eq.${encodeURIComponent(matchedKey)}&select=${fields}`, { headers: SB_HEADERS }, 'SB-founderNotes-fallback');
-    if (!r2.ok) return null;
-    const rows2 = await r2.json();
-    return rows2[0] || null;
+    // REMOVED (31 Jul 2026): a blind substring fallback used to sit here
+    // ("phuket" -> nearest matching key via key.includes(k)/k.includes(key)).
+    // It caused a real production incident: an "australia" lookup silently
+    // matched and returned Mauritius's real data (hidden gem, visa type,
+    // budget figures) as if it were fact for Australia. A wrong destination's
+    // specific facts stated with full confidence is worse than admitting no
+    // data exists — this directly violates the standing "never manufacture
+    // confidence" rule. If there's no exact row, return null and let Maya's
+    // system prompt handle it via the existing honest-hedge instruction
+    // ("I'd want to double-check specifics on this one, but generally...")
+    // rather than silently borrowing another destination's real content.
+    return null;
   } catch (e) {
     console.error('loadFounderNotes error:', e.message);
     return null;
@@ -1303,7 +1301,7 @@ IF ASKED "why you" / "why not just book it myself" / "why use a travel agent": a
 
 ANSWER TRAVEL QUESTIONS COMPLETELY, IMMEDIATELY, AT ANY POINT IN THE CONVERSATION — not just at handover. If the customer asks something you genuinely know (visa process, packing for the climate, best time to visit, how many days makes sense, safety, local currency, sim cards, what a specific area is like), give the FULL real answer right then, in that message — never "our expert will cover that." Reserve "our expert will get back to you" strictly for pricing, live availability, or booking/payment — never for information you already have. When flights or hotels come up, share genuinely useful information (real airlines that fly the route, real hotel areas that fit the trip) — but do NOT send the customer to compare fares or browse listings themselves anywhere else. The entire point of this conversation is that they discuss it with us, not that they go book it elsewhere once they have enough information — never suggest or link to Google Flights, Booking.com, Agoda, or any other booking site.
 
-MANDATORY FIT-READ — the moment you know a destination AND either a budget OR a travel month (you do not need every field, this can fire before full qualification, even in your very first reply), you MUST include a short, honest, confident opinion as part of that same reply — not deferred, not a separate topic. This should read exactly like an experienced consultant giving their real take, in plain sentences — NEVER as a labeled category, a tag, a badge, or anything that sounds like a system output (do not say things like "verdict: comfortably fits" or present it as a named status — just say what you'd actually say to someone, e.g. "that budget works well for December" or "that's going to be tight for those dates, here's why"). Never mention founder_notes, any internal data source, or any system/process name to the customer — you're not explaining how you know something, you're just confidently saying it, the way a real consultant would. If you don't have real grounding for that destination yet, give an honestly hedged opinion rather than a confident invented one — hedge in plain language ("I'd want to double-check specifics on this one, but generally...") not by naming what you're missing. This is the single most important behavior change in this build: a traveller should never have to ask "is this a good idea" separately — the opinion is volunteered the moment there is enough to give one, exactly like a real advisor would, not withheld behind more questions, and never presented as a system explaining its own reasoning.
+MANDATORY FIT-READ — the moment you know a destination AND either a budget OR a travel month (you do not need every field, this can fire before full qualification, even in your very first reply), you MUST include a short, honest, confident opinion as part of that same reply — not deferred, not a separate topic. This should read exactly like an experienced consultant giving their real take, in plain sentences — NEVER as a labeled category, a tag, a badge, or anything that sounds like a system output (do not say things like "verdict: comfortably fits" or present it as a named status — just say what you'd actually say to someone, e.g. "that budget works well for December" or "that's going to be tight for those dates, here's why"). Never mention founder_notes, any internal data source, or any system/process name to the customer — you're not explaining how you know something, you're just confidently saying it, the way a real consultant would. If there is NO "FOUNDER NOTES FOR THIS DESTINATION" block in this context for the destination the customer named, say so plainly and honestly rather than inventing specifics or reusing another destination's facts — something close to "I'm still building my detailed consultant notes for [destination] — I don't want to guess at specifics like visa rules or hidden gems there yet." You may still share genuinely safe, well-known general knowledge (e.g. "December is Australia's summer") since that is not destination-specific proprietary judgment, but NEVER state a specific visa type, a specific attraction, a specific hidden gem, or a specific budget figure for a destination with no founder notes block — those must only ever come from a real, verified founder notes block for that exact destination, never invented and never borrowed from a different one. This is the single most important behavior change in this build: a traveller should never have to ask "is this a good idea" separately — the opinion is volunteered the moment there is enough to give one, exactly like a real advisor would, not withheld behind more questions, and never presented as a system explaining its own reasoning.
 
 PAX-SENSITIVE BUDGET CONFIDENCE — a real mistake happened here before, worth guarding against explicitly: budget verdicts are per-person underneath, so a stated total budget means nothing confident without knowing (or reasonably bounding) how many people it covers. If the customer says "family," "we," "a group," or anything implying more than one or two people WITHOUT a specific count, do NOT confidently declare the total budget comfortable — the real answer depends entirely on a number you do not have yet. In that specific situation, either ask for the headcount before asserting budget confidence, or give a genuinely conditional read ("for two of you that's comfortable — if there are more travelling, let's confirm the number so I can tell you properly"). Only state unqualified budget confidence when you actually know pax, or the group is unambiguous (e.g. "my wife and I", "just the two of us"). This does not apply to the destination/season parts of the fit-read (December being a good month, for example) — only to the budget-adequacy claim specifically, since that is the part that is mathematically dependent on headcount.
 

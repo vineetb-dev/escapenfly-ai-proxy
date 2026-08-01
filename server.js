@@ -588,11 +588,68 @@ function lookupDestinationInfo(destination) {
   return matched ? DESTINATION_INFO[matched] : null;
 }
 
-// Same matching as lookupDestinationInfo, but returns the matched KEY itself
-// (e.g. 'dubai') rather than its weather/currency info — needed for
-// founder_notes lookups, which are keyed by destination name directly.
+// Same matching as lookupDestinationInfo, but returns the matched KEY
+// itself (e.g. 'dubai') rather than its weather/currency info. Drives
+// destInfo/weather/forex only — founder_notes resolution below uses its
+// own matcher against founder_notes' own destination list instead (see
+// allFounderDestinationKeyMatches).
 function guessDestinationKeyFromMessage(message) {
   return bestDestinationKeyMatch(message);
+}
+
+// ── MULTI-COUNTRY FOUNDER_NOTES RESOLUTION ──
+// Deliberately separate from DESTINATION_INFO/bestDestinationKeyMatch above,
+// which stays untouched (weather/forex remains single-destination, out of
+// scope here). founder_notes' own destination list has no city-level
+// aliases the way DESTINATION_INFO does (no separate "bangkok" row next to
+// "thailand", no "uae" next to "dubai") — matching against it directly is
+// what makes a compound trip like "Australia and New Zealand" resolve as
+// TWO real countries instead of one exact-match lookup against the literal
+// compound string (which can never match a single-country row).
+let founderKeyListCache = { keys: null, fetchedAt: 0 };
+const FOUNDER_KEY_LIST_TTL_MS = 15 * 60 * 1000; // founder_notes changes rarely; avoid a DB round-trip every turn
+
+async function getFounderNotesDestinationKeys() {
+  const now = Date.now();
+  if (founderKeyListCache.keys && (now - founderKeyListCache.fetchedAt) < FOUNDER_KEY_LIST_TTL_MS) {
+    return founderKeyListCache.keys;
+  }
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/founder_notes?select=destination`, { headers: SB_HEADERS }, 'SB-founderNotes-keys');
+    if (!r.ok) return founderKeyListCache.keys || [];
+    const keys = (await r.json()).map(row => String(row.destination || '').trim().toLowerCase()).filter(Boolean);
+    founderKeyListCache = { keys, fetchedAt: now };
+    return keys;
+  } catch (e) {
+    console.error('getFounderNotesDestinationKeys error:', e.message);
+    return founderKeyListCache.keys || [];
+  }
+}
+
+// Sanity cap — an unusual multi-leg mention shouldn't blow up the prompt or
+// the workspace payload.
+const MAX_MULTI_DESTINATIONS = 3;
+
+// Returns ALL distinct founder_notes destination keys mentioned in text, in
+// the order first mentioned. Plain word-boundary matching only, no
+// longest-match tie-break needed (unlike bestDestinationKeyMatch above) —
+// founder_notes' own key list has no nested-substring pairs like
+// DESTINATION_INFO's "korea"/"south korea", verified against the real table.
+async function allFounderDestinationKeyMatches(text) {
+  const m = String(text || '').toLowerCase();
+  if (!m) return [];
+  const keys = await getFounderNotesDestinationKeys();
+  const found = [];
+  for (const k of keys) {
+    const re = new RegExp(`\\b${escapeRegex(k)}\\b`);
+    const idx = m.search(re);
+    if (idx !== -1) found.push({ key: k, idx });
+  }
+  found.sort((a, b) => a.idx - b.idx);
+  const seen = new Set();
+  const ordered = [];
+  for (const f of found) { if (!seen.has(f.key)) { seen.add(f.key); ordered.push(f.key); } }
+  return ordered.slice(0, MAX_MULTI_DESTINATIONS);
 }
 
 async function loadLiveWeather(city) {
@@ -1442,34 +1499,41 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotes = null, intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, debugRef = null) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotesList = [], intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, debugRef = null) {
   const todayStr = new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
   const currentDateLine = `\n\nTODAY'S ACTUAL DATE: ${todayStr}. Use this to reason correctly about relative time — if a customer says a month without a year (e.g. "December"), assume the NEXT upcoming occurrence of that month from today's real date, not a past or arbitrary year. NEVER offer already-past years as options when asking a customer to confirm their travel year.`;
   const knownLine = (known && Object.values(known).some(v => v))
     ? `\n\nKNOWN LEAD INFO (already learned earlier in this conversation — do not re-ask): ${JSON.stringify(known)}`
     : '';
-  const founderLine = founderNotes
-    ? `\n\nFOUNDER NOTES FOR THIS DESTINATION (from Vineet or the EscapeNFly team directly — VERIFIED, TREAT AS GROUND TRUTH, overrides your own general knowledge including any specific numbers you might otherwise guess):` +
-      (founderNotes.visa_info ? `\nVisa: ${founderNotes.visa_info}` : '') +
-      (founderNotes.visa_complexity ? `\nVisa complexity: ${founderNotes.visa_complexity}` : '') +
-      (founderNotes.rejection_patterns ? `\nCommon rejection patterns we've seen: ${founderNotes.rejection_patterns}` : '') +
-      (founderNotes.min_budget_inr ? `\nRealistic minimum budget: ₹${Number(founderNotes.min_budget_inr).toLocaleString('en-IN')}${founderNotes.min_budget_note ? ` (${founderNotes.min_budget_note})` : ''} — this is real, verified data, use it to silently inform your own confidence, not something to recite as a calculation to the customer. If their stated budget is comfortably at or above this, acknowledge it warmly and move on ("that works well for..."). If it's genuinely far below — not a borderline case, a real mismatch — mention gently in one soft sentence that it's a little tight for a comfortable trip there, without a breakdown, a per-person division shown, or a lecture, then move straight to handover either way. The expert will sort out exact numbers; your job here is confidence and warmth, not an audit.` : '') +
-      (founderNotes.ideal_duration ? `\nIdeal trip duration: ${founderNotes.ideal_duration}` : '') +
-      (founderNotes.best_airlines ? `\nBest airlines for this route: ${founderNotes.best_airlines}` : '') +
-      (founderNotes.best_hotel_areas ? `\nBest hotel areas: ${founderNotes.best_hotel_areas}` : '') +
-      (founderNotes.seasonal_advice ? `\nSeasonal advice: ${founderNotes.seasonal_advice}` : '') +
-      (founderNotes.common_mistakes ? `\nCommon mistakes travellers make here: ${founderNotes.common_mistakes}` : '') +
-      (founderNotes.consultant_notes ? `\nConsultant notes: ${founderNotes.consultant_notes}` : '') +
-      (founderNotes.ideal_for ? `\nGenuinely ideal for: ${founderNotes.ideal_for}` : '') +
-      (founderNotes.avoid_if ? `\nWorth steering away from if: ${founderNotes.avoid_if} — mention this gently if it applies, don't volunteer it if it doesn't apply to this customer.` : '') +
-      (founderNotes.hidden_gem ? `\nA genuine hidden gem here: ${founderNotes.hidden_gem}` : '') +
-      (founderNotes.money_saving_tip ? `\nReal money-saving tip: ${founderNotes.money_saving_tip}` : '') +
-      (founderNotes.luxury_upgrade ? `\nFor a customer wanting to spend more: ${founderNotes.luxury_upgrade}` : '') +
-      (founderNotes.must_not_miss ? `\nThe one thing not to miss: ${founderNotes.must_not_miss}` : '') +
-      (founderNotes.first_time_traveller_advice ? `\nAdvice specifically for first-time visitors: ${founderNotes.first_time_traveller_advice}` : '') +
-      (founderNotes.post_trip_feedback ? `\nReal customer feedback from past trips: ${founderNotes.post_trip_feedback}` : '') +
-      (founderNotes.tips ? `\nTips: ${founderNotes.tips}` : '')
-    : '';
+  // Field list is identical regardless of single- vs multi-country — kept
+  // as one formatter so the single-country case (the overwhelming majority
+  // of conversations) renders byte-identical to before this fix.
+  const formatFounderNotesFields = (fn) =>
+    (fn.visa_info ? `\nVisa: ${fn.visa_info}` : '') +
+    (fn.visa_complexity ? `\nVisa complexity: ${fn.visa_complexity}` : '') +
+    (fn.rejection_patterns ? `\nCommon rejection patterns we've seen: ${fn.rejection_patterns}` : '') +
+    (fn.min_budget_inr ? `\nRealistic minimum budget: ₹${Number(fn.min_budget_inr).toLocaleString('en-IN')}${fn.min_budget_note ? ` (${fn.min_budget_note})` : ''} — this is real, verified data, use it to silently inform your own confidence, not something to recite as a calculation to the customer. If their stated budget is comfortably at or above this, acknowledge it warmly and move on ("that works well for..."). If it's genuinely far below — not a borderline case, a real mismatch — mention gently in one soft sentence that it's a little tight for a comfortable trip there, without a breakdown, a per-person division shown, or a lecture, then move straight to handover either way. The expert will sort out exact numbers; your job here is confidence and warmth, not an audit.` : '') +
+    (fn.ideal_duration ? `\nIdeal trip duration: ${fn.ideal_duration}` : '') +
+    (fn.best_airlines ? `\nBest airlines for this route: ${fn.best_airlines}` : '') +
+    (fn.best_hotel_areas ? `\nBest hotel areas: ${fn.best_hotel_areas}` : '') +
+    (fn.seasonal_advice ? `\nSeasonal advice: ${fn.seasonal_advice}` : '') +
+    (fn.common_mistakes ? `\nCommon mistakes travellers make here: ${fn.common_mistakes}` : '') +
+    (fn.consultant_notes ? `\nConsultant notes: ${fn.consultant_notes}` : '') +
+    (fn.ideal_for ? `\nGenuinely ideal for: ${fn.ideal_for}` : '') +
+    (fn.avoid_if ? `\nWorth steering away from if: ${fn.avoid_if} — mention this gently if it applies, don't volunteer it if it doesn't apply to this customer.` : '') +
+    (fn.hidden_gem ? `\nA genuine hidden gem here: ${fn.hidden_gem}` : '') +
+    (fn.money_saving_tip ? `\nReal money-saving tip: ${fn.money_saving_tip}` : '') +
+    (fn.luxury_upgrade ? `\nFor a customer wanting to spend more: ${fn.luxury_upgrade}` : '') +
+    (fn.must_not_miss ? `\nThe one thing not to miss: ${fn.must_not_miss}` : '') +
+    (fn.first_time_traveller_advice ? `\nAdvice specifically for first-time visitors: ${fn.first_time_traveller_advice}` : '') +
+    (fn.post_trip_feedback ? `\nReal customer feedback from past trips: ${fn.post_trip_feedback}` : '') +
+    (fn.tips ? `\nTips: ${fn.tips}` : '');
+  const founderLine = founderNotesList.length === 1
+    ? `\n\nFOUNDER NOTES FOR THIS DESTINATION (from Vineet or the EscapeNFly team directly — VERIFIED, TREAT AS GROUND TRUTH, overrides your own general knowledge including any specific numbers you might otherwise guess):` + formatFounderNotesFields(founderNotesList[0])
+    : founderNotesList.length > 1
+      ? `\n\nFOUNDER NOTES FOR THIS TRIP (from Vineet or the EscapeNFly team directly — VERIFIED, TREAT AS GROUND TRUTH per country, overrides your own general knowledge including any specific numbers you might otherwise guess). This is a MULTI-COUNTRY trip — treat each country's facts as completely separate. Do NOT blend, average, or combine numbers across countries (never average two countries' budget minimums into one figure), and do NOT attribute one country's hidden gem, visa detail, or tip to a different country in the same trip:` +
+        founderNotesList.map(fn => `\n\n— ${String(fn.destination || '').toUpperCase()} —` + formatFounderNotesFields(fn)).join('')
+      : '';
   const liveDataLine = (liveWeather || forexRate)
     ? `\n\nLIVE DATA FOR THIS DESTINATION (fetched just now — use only if genuinely relevant to what the customer is asking, don't force it into every reply):${liveWeather ? `\nCurrent weather in ${liveWeather.city} right now: ${liveWeather.tempC}°C, ${liveWeather.condition}. This is CURRENT conditions only, not a seasonal forecast — do not use it to answer "what's the best time to visit" or predict weather for a future travel month, only for "what's it like there right now" or a trip happening imminently.` : ''}${forexRate ? `\nCurrent exchange rate: 1 INR = ${forexRate.rate.toFixed(4)} ${forexRate.currency}. You may mention this if the customer asks about currency/forex, but note rates fluctuate daily so frame it as "around" or "currently", not a locked-in number.` : ''}`
     : '';
@@ -1598,22 +1662,30 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     chat.msgs.push({ role: 'user', content: cap(message, 2000) });
     if (chat.msgs.length > HISTORY_MAX) chat.msgs = chat.msgs.slice(-HISTORY_MAX);
 
-    // Look up founder notes if we already know the destination from an
-    // earlier turn in this conversation (won't exist yet on the very first
-    // turn where the destination is first mentioned — available from the
-    // next reply onward, same as KNOWN LEAD INFO).
-    // P0 fix (31 Jul 2026): chat.known.destination persists per phone for
-    // 24h (CHAT_TTL_MS) and previously took priority over whatever the
-    // customer just typed — a stale destination from an earlier, unrelated
-    // conversation on the same phone silently overrode a brand new
-    // destination named in THIS message. The message's own destination now
-    // always wins; session memory is only a fallback when this message
-    // names no destination at all (a genuine same-topic follow-up like
-    // "6 nights please").
+    // Weather/forex resolution — unchanged, stays single-destination (out
+    // of scope for the multi-country fix below).
     const messageDestKey = guessDestinationKeyFromMessage(message);
-    const founderDestKey = messageDestKey || chat.known?.destination;
-    const founderNotes = founderDestKey ? await loadFounderNotes(founderDestKey) : null;
-    console.log(`🔎 founderNotes lookup for "${founderDestKey || '(none)'}":`, founderNotes ? JSON.stringify(founderNotes) : 'NOT FOUND');
+
+    // Look up founder notes for EVERY country actually named this trip.
+    // P0 fix (31 Jul 2026) made this exact-match only, which fixed the
+    // Australia/Mauritius data-leak but exposed a second bug: a compound
+    // destination like "Australia and New Zealand" got stored as ONE
+    // literal string in chat.known.destination, which can never exact-match
+    // a founder_notes row (the table only has single-country rows) — so the
+    // moment a later message didn't itself re-mention a country by name,
+    // founder_notes silently went from fully-populated to entirely null.
+    // Now resolves the full list of countries mentioned — current message
+    // first, falling back to session memory only when this message names
+    // none at all — same override semantics as the original session-bleed
+    // fix, generalized from one destination to a list.
+    const messageFounderKeys = await allFounderDestinationKeyMatches(message);
+    const knownFounderKeys = await allFounderDestinationKeyMatches(chat.known?.destination || '');
+    const founderDestKeys = messageFounderKeys.length ? messageFounderKeys : knownFounderKeys;
+    const founderNotesList = founderDestKeys.length
+      ? (await Promise.all(founderDestKeys.map(k => loadFounderNotes(k)))).filter(Boolean)
+      : [];
+    console.log(`🔎 founderNotes lookup for [${founderDestKeys.join(', ') || '(none)'}]:`, founderNotesList.length ? JSON.stringify(founderNotesList) : 'NOT FOUND');
+
     const destInfo = messageDestKey ? lookupDestinationInfo(messageDestKey) : (chat.known?.destination ? lookupDestinationInfo(chat.known.destination) : lookupDestinationInfo(message));
     const [liveWeather, forexRate] = destInfo
       ? await Promise.all([loadLiveWeather(destInfo.city), loadForexRate(destInfo.currency)])
@@ -1641,7 +1713,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       ? await loadCustomerProfile(statusLookupPhone) : {};
 
     const debugRef = {};
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotes, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations, returningProfile, debugRef);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotesList, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations, returningProfile, debugRef);
     tAI = Date.now();
 
     if (!parsed) {
@@ -1743,10 +1815,10 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     // turn where a destination with founder data was still being tracked,
     // even plain qualifying questions with no verified fact stated at all —
     // a real bug caught by testing, not a hypothetical one.
-    const hasRealFounderData = !!founderNotes
-      && Object.entries(founderNotes).some(([k, v]) => k !== 'destination' && v !== null && v !== '')
+    const hasRealFounderData = founderNotesList.length > 0
+      && founderNotesList.some(fn => Object.entries(fn).some(([k, v]) => k !== 'destination' && v !== null && v !== ''))
       && !!(parsed.ready || parsed.handover);
-    if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = effectivePhone; resultRef.founderVerified = hasRealFounderData; resultRef.founderNotes = founderNotes; }
+    if (resultRef) { resultRef.known = chat.known || {}; resultRef.effectivePhone = effectivePhone; resultRef.founderVerified = hasRealFounderData; resultRef.founderNotesList = founderNotesList; }
     console.log(`▶ [${phone}${effectivePhone !== phone ? '→' + effectivePhone : ''}] IN:"${short(message)}" | intent:${log.intent} | ready:${!!parsed.ready} handover:${!!parsed.handover} | reply:"${short(reply, 60)}" | CRM:${log.crm} | notify:${log.notify} | founderVerified:${hasRealFounderData} | load:${tLoad - t0}ms ai:${tAI - tLoad}ms send:${tSent - tAI}ms post:${Date.now() - tSent}ms total:${Date.now() - t0}ms`);
     return reply;
   } catch (e) {
@@ -1823,6 +1895,40 @@ app.post('/webhook/chat', async (req, res) => {
   res.json({ reply: reply || FALLBACK_REPLY });
 });
 
+// Shapes ONE founder_notes row into the workspace category fields the
+// frontend renders. Hotels collapses best_hotel_areas + luxury_upgrade into
+// a single `summary` string — every founder_notes row currently has
+// best_hotel_areas NULL (flagged separately for real content), so without
+// this collapse "filled" and "has visible content" could diverge: a stamp
+// marked filled purely because luxury_upgrade existed, while a caller
+// reading `areas` alone would render nothing.
+function buildWorkspaceCategories(fn) {
+  if (!fn) return { visa: null, flights: null, hotels: null, budget: null, tips: null };
+  const hotelsSummary = [fn.best_hotel_areas, fn.luxury_upgrade].filter(Boolean).join(' ');
+  return {
+    visa: (fn.visa_info || fn.visa_complexity) ? {
+      summary: fn.visa_info || '',
+      complexity: fn.visa_complexity || ''
+    } : null,
+    flights: fn.best_airlines ? { airlines: fn.best_airlines } : null,
+    hotels: hotelsSummary ? { summary: hotelsSummary } : null,
+    budget: fn.min_budget_inr ? {
+      minBudgetInr: fn.min_budget_inr,
+      note: fn.min_budget_note || '',
+      idealDuration: fn.ideal_duration || ''
+    } : null,
+    tips: (fn.hidden_gem || fn.money_saving_tip || fn.must_not_miss || fn.common_mistakes || fn.first_time_traveller_advice || fn.ideal_for || fn.avoid_if) ? {
+      hiddenGem: fn.hidden_gem || '',
+      moneySavingTip: fn.money_saving_tip || '',
+      mustNotMiss: fn.must_not_miss || '',
+      commonMistakes: fn.common_mistakes || '',
+      firstTimeAdvice: fn.first_time_traveller_advice || '',
+      idealFor: fn.ideal_for || '',
+      avoidIf: fn.avoid_if || ''
+    } : null
+  };
+}
+
 // ── WEBSITE CHAT (§11 Phase 1 — real endpoint, not just a test harness now) ──
 // Client sends a session id in `phone` until a real phone is captured (see
 // graduateSessionToPhone). Response now also returns the structured trip
@@ -1834,7 +1940,16 @@ app.post('/webhook/website-chat', async (req, res) => {
   const message = cleanAttr(req.body.message || req.body.text || '') || 'Hi';
   const out = {};
   const reply = await withPhoneLock(sessionKey, () => mayaTurn(sessionKey, message, null, 'website', out));
-  const fn = out.founderNotes || null;
+  const founderNotesList = out.founderNotesList || [];
+  // Option C (additive hybrid): visa/flights/hotels/budget/tips below stay
+  // exactly as they've always behaved for the single-destination case (the
+  // overwhelming majority of conversations) — populated only when exactly
+  // one country's real founder_notes resolved, null otherwise. A compound
+  // multi-country destination never blends into these fields (a blended
+  // budget figure is a worse kind of wrong than admitting nothing) —
+  // instead it populates the new multiDestination array below, purely
+  // additive, absent entirely for single-destination trips.
+  const singleFn = founderNotesList.length === 1 ? founderNotesList[0] : null;
   res.json({
     reply: reply || FALLBACK_REPLY,
     intent: out.known?.intent || '',
@@ -1847,29 +1962,10 @@ app.post('/webhook/website-chat', async (req, res) => {
       name: out.known?.name || ''
     },
     workspace: {
-      visa: fn && (fn.visa_info || fn.visa_complexity) ? {
-        summary: fn.visa_info || '',
-        complexity: fn.visa_complexity || ''
-      } : null,
-      flights: fn && fn.best_airlines ? { airlines: fn.best_airlines } : null,
-      hotels: fn && (fn.best_hotel_areas || fn.luxury_upgrade) ? {
-        areas: fn.best_hotel_areas || '',
-        luxuryUpgrade: fn.luxury_upgrade || ''
-      } : null,
-      budget: fn && fn.min_budget_inr ? {
-        minBudgetInr: fn.min_budget_inr,
-        note: fn.min_budget_note || '',
-        idealDuration: fn.ideal_duration || ''
-      } : null,
-      tips: fn && (fn.hidden_gem || fn.money_saving_tip || fn.must_not_miss || fn.common_mistakes || fn.first_time_traveller_advice || fn.ideal_for || fn.avoid_if) ? {
-        hiddenGem: fn.hidden_gem || '',
-        moneySavingTip: fn.money_saving_tip || '',
-        mustNotMiss: fn.must_not_miss || '',
-        commonMistakes: fn.common_mistakes || '',
-        firstTimeAdvice: fn.first_time_traveller_advice || '',
-        idealFor: fn.ideal_for || '',
-        avoidIf: fn.avoid_if || ''
-      } : null
+      ...buildWorkspaceCategories(singleFn),
+      multiDestination: founderNotesList.length > 1
+        ? founderNotesList.map(fn => ({ name: fn.destination || '', ...buildWorkspaceCategories(fn) }))
+        : null
     },
     sessionKey: out.effectivePhone || sessionKey,
     // Temporary diagnostic — only present when the Claude call actually

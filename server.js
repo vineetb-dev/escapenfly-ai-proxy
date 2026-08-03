@@ -140,7 +140,7 @@ const TEAM = {
   shubham:  { name: 'Shubham',         email: 'sales7@escapenfly.com',   wa: '919875921281', dept: 'Short Haul & Long Haul' },
   prabhjot: { name: 'Prabhjot Singh',  email: 'support2@escapenfly.com', wa: '919569933206', dept: 'Air Tickets, Corporate & Catch-All' },
   damini:   { name: 'Damini',          email: 'support3@escapenfly.com', wa: '919888002635', dept: 'Visa' },
-  admin:    { name: 'Vineet Bansal',   email: 'vineet.b@escapenfly.com', wa: '919851739851', dept: 'Admin' },
+  admin:    { name: 'Vineet Bansal',   email: 'vineet.b@escapenfly.com', wa: '919216320050', dept: 'Admin' },
   vivek:    { name: 'Vivek Bansal',    email: 'vivek.b@escapenfly.com',  wa: '918427694918', dept: 'Founder' },
   abhishek: { name: 'Abhishek Sharma', email: '',                       wa: '918146888811', dept: 'Founder' }
 };

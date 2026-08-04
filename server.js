@@ -152,14 +152,21 @@ const VISA_REP_KEYS = ['damini', 'prabhjot'];                        // visa-spe
 const FOUNDER_KEYS = ['admin', 'vivek', 'abhishek', 'prabhjot'];      // team digest, booking alert, EOD summary
 const STALE_CC_KEY = 'admin';                                        // stale alert CC
 
+// Departed staff — kept in TEAM (name/wa still needed to resolve any
+// remaining historical records) but excluded from routing new leads,
+// Claude's routing prompt, and their own individual WA sends. Their
+// count still flows into team_lead_digest's results.<key> below since
+// that AiSensy template has a fixed, pre-approved slot for them.
+const DEPARTED_KEYS = ['shubham']; // left the company; leads reassigned to Divya
+
 const ISLAND     = ['maldives','mauritius','seychelles','bali','lakshadweep'];
 const SHORT_HAUL = ['dubai','uae','thailand','bangkok','phuket','singapore','malaysia','sri lanka','nepal','bhutan','myanmar','middle east'];
 const LONG_HAUL  = ['usa','america','canada','australia','new zealand','japan','south korea','china','kenya','tanzania','africa','brazil','peru','argentina','europe','france','paris','italy','rome','switzerland','spain','greece','germany','uk','london','amsterdam','portugal','croatia','turkey'];
 const DOMESTIC   = ['india','kashmir','goa','rajasthan','himachal','kerala','ladakh','uttarakhand','northeast','andaman','manali','shimla','jaipur','udaipur','varanasi','rishikesh','sikkim','darjeeling','coorg','ooty','munnar'];
 
 let rrShortHaul = 0, rrLongHaul = 0;
-const shortHaulPool = ['lalit', 'divya', 'shubham'];
-const longHaulPool  = ['anjan', 'shubham'];
+const shortHaulPool = ['lalit', 'divya'];
+const longHaulPool  = ['anjan'];
 
 const VALID_INTENTS = ['holiday','visa','flights','hotel','cruise','corporate','mice','existing_booking','complaint','human_support','other_travel','off_topic'];
 
@@ -187,8 +194,8 @@ function looksLikeSpam(text) {
 
 // ── CLAUDE-BASED ASSIGNMENT (primary) ──
 async function assignTeamWithClaude(data) {
-  const teamList = Object.values(TEAM).filter(t => t.dept !== 'Admin' && t.dept !== 'Founder')
-    .map(t => `- ${t.name}: ${t.dept}`).join('\n');
+  const teamList = Object.entries(TEAM).filter(([k, t]) => t.dept !== 'Admin' && t.dept !== 'Founder' && !DEPARTED_KEYS.includes(k))
+    .map(([k, t]) => `- ${t.name}: ${t.dept}`).join('\n');
 
   const prompt = `You are a routing assistant for a travel agency. Decide which team member should handle this enquiry.
 
@@ -200,8 +207,8 @@ ROUTING RULES:
 - Flight/air-ticket-only, or Corporate/business travel → Prabhjot Singh
 - Domestic India → Lalit Mehta
 - Island (Maldives, Mauritius, Seychelles, Bali, Lakshadweep) → Divya Nigam
-- Short-haul international (Dubai, Thailand, Singapore, Sri Lanka, Nepal, Bhutan, Middle East) → split between Lalit Mehta, Divya Nigam, and Shubham
-- Long-haul international (Europe, UK, USA, Canada, Australia, Japan) → Anjan Pramanick or Shubham
+- Short-haul international (Dubai, Thailand, Singapore, Sri Lanka, Nepal, Bhutan, Middle East) → split between Lalit Mehta and Divya Nigam
+- Long-haul international (Europe, UK, USA, Canada, Australia, Japan) → Anjan Pramanick
 - Existing booking issue or complaint → Prabhjot Singh
 - If genuinely unclear or doesn't fit anywhere → Prabhjot Singh
 
@@ -215,7 +222,7 @@ Intent: ${data.intent || 'Not specified'}
 Summary: ${data.leadSummary || data.query || data.type || 'Not specified'}
 
 Respond with ONLY a JSON object, no other text:
-{"key": "lalit|divya|anjan|shubham|prabhjot|damini", "reasoning": "one short sentence"}`;
+{"key": "lalit|divya|anjan|prabhjot|damini", "reasoning": "one short sentence"}`;
 
   try {
     const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
@@ -234,11 +241,11 @@ Respond with ONLY a JSON object, no other text:
     const d = await r.json();
     const text = d.content[0].text.trim().replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(text);
-    if (parsed.key && TEAM[parsed.key]) {
+    if (parsed.key && TEAM[parsed.key] && !DEPARTED_KEYS.includes(parsed.key)) {
       console.log(`Claude assigned → ${TEAM[parsed.key].name} (${parsed.reasoning})`);
       return TEAM[parsed.key];
     }
-    throw new Error('Claude returned unrecognized key: ' + parsed.key);
+    throw new Error('Claude returned unrecognized or departed key: ' + parsed.key);
   } catch (e) {
     console.error('Claude assignment failed, using keyword fallback:', e.message);
     return assignTeamFallback(data);
@@ -1050,7 +1057,11 @@ app.post('/cron/daily-digest', async (req, res) => {
       const t = TEAM[key];
       const c = await countLeadsFor(t.name);
       results[key] = c;
-      await sendWA(t.wa, 'individual_lead_digest', [t.name, String(c.new), String(c.followup), String(c.urgent)]);
+      // Still counted (team_lead_digest below needs a value for every
+      // REP_KEYS slot), but departed staff get no personal WA send.
+      if (!DEPARTED_KEYS.includes(key)) {
+        await sendWA(t.wa, 'individual_lead_digest', [t.name, String(c.new), String(c.followup), String(c.urgent)]);
+      }
       console.log(`📊 [digest] ${t.name}: new=${c.new} followup=${c.followup} urgent=${c.urgent}`);
     }
 

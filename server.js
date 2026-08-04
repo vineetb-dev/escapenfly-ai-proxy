@@ -95,6 +95,7 @@ const DEDUPE_MS   = 24 * 60 * 60 * 1000; // one lead per phone per 24h
 const CHAT_TTL_MS = 24 * 60 * 60 * 1000; // Maya memory window
 const HISTORY_MAX = 16;                  // messages kept in Maya's context
 const STALE_HOURS = 30;                  // "no follow-up" threshold (24-48h window, mid-point)
+const STALE_REALERT_HOURS = 48;          // don't re-nag about the same ongoing staleness more than once per this window
 
 const SB_HEADERS = {
   'apikey': SB_KEY,
@@ -1082,17 +1083,29 @@ app.post('/cron/stale-check', async (req, res) => {
 
   try {
     const cutoff = new Date(Date.now() - STALE_HOURS * 60 * 60 * 1000).toISOString();
-    const url = `${SB_URL}/rest/v1/enquiries?is_deleted=eq.false&status=neq.booked&status=neq.lost` +
+    const url = `${SB_URL}/rest/v1/enquiries?is_deleted=eq.false&status=neq.booked&status=neq.lost&status=neq.cancelled` +
       `&last_activity_at=lt.${encodeURIComponent(cutoff)}` +
-      `&select=id,assigned_to_name,original_message_text,last_activity_at&limit=200`;
+      `&select=id,assigned_to_name,original_message_text,last_activity_at,last_stale_alert_at&limit=200`;
     const r = await fetchRetry(url, { headers: SB_HEADERS }, 'SB-staleQuery');
     if (!r.ok) { console.error('stale-check query failed:', r.status, await r.text()); return; }
     const rows = await r.json();
 
+    let alertedCount = 0;
     for (const row of rows) {
+      // Dedup: skip unless this is a first-time alert, last_activity_at
+      // has moved forward since the last alert (someone worked the lead,
+      // so this is a genuinely new staleness episode), or the last alert
+      // is old enough that a reminder is due. Prevents re-nagging every
+      // run about the same untouched lead forever.
+      const lastAlertMs = row.last_stale_alert_at ? new Date(row.last_stale_alert_at).getTime() : null;
+      const lastActivityMs = new Date(row.last_activity_at).getTime();
+      const reAlertDue = lastAlertMs !== null && (Date.now() - lastAlertMs) > STALE_REALERT_HOURS * 60 * 60 * 1000;
+      const shouldAlert = lastAlertMs === null || lastActivityMs > lastAlertMs || reAlertDue;
+      if (!shouldAlert) continue;
+
       let lead = {};
       try { lead = JSON.parse(row.original_message_text || '{}'); } catch (e) {}
-      const hoursStale = Math.round((Date.now() - new Date(row.last_activity_at).getTime()) / (60 * 60 * 1000));
+      const hoursStale = Math.round((Date.now() - lastActivityMs) / (60 * 60 * 1000));
       const repEntry = Object.values(TEAM).find(t => t.name === row.assigned_to_name);
       const repName = repEntry ? repEntry.name : (row.assigned_to_name || 'Unassigned');
       const destination = lead.dest || 'their enquiry';
@@ -1103,8 +1116,15 @@ app.post('/cron/stale-check', async (req, res) => {
       }
       await sendWA(TEAM.admin.wa, 'stale_lead_alert', ['Vineet (CC)', customerName, destination, String(hoursStale)]);
       console.log(`⏰ [stale] ${customerName} (${destination}) — ${hoursStale}h stale, rep: ${repName}`);
+
+      await fetchRetry(`${SB_URL}/rest/v1/enquiries?id=eq.${row.id}`, {
+        method: 'PATCH',
+        headers: { ...SB_HEADERS, Prefer: 'return=minimal' },
+        body: JSON.stringify({ last_stale_alert_at: new Date().toISOString() })
+      }, 'SB-markStaleAlerted');
+      alertedCount++;
     }
-    console.log(`⏰ [stale-check] ${rows.length} stale lead(s) flagged.`);
+    console.log(`⏰ [stale-check] ${rows.length} currently stale, ${alertedCount} alerted (rest deduped).`);
   } catch (e) {
     console.error('stale-check error:', e);
   }

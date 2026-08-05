@@ -1128,11 +1128,21 @@ app.post('/cron/stale-check', async (req, res) => {
       await sendWA(TEAM.admin.wa, 'stale_lead_alert', ['Vineet (CC)', customerName, destination, String(hoursStale)]);
       console.log(`⏰ [stale] ${customerName} (${destination}) — ${hoursStale}h stale, rep: ${repName}`);
 
-      await fetchRetry(`${SB_URL}/rest/v1/enquiries?id=eq.${row.id}`, {
+      // Previously unchecked — a silent failure here would send the alert
+      // but never persist the cooldown, making every future run re-alert
+      // on this lead forever (a real incident risk flagged during the
+      // Aug 5 "duplicate alerts" investigation, even though that specific
+      // report turned out to be a timezone misread of the same batch, not
+      // an actual cooldown failure). Now logs loudly if the write fails so
+      // a real occurrence is visible instead of silent.
+      const patchR = await fetchRetry(`${SB_URL}/rest/v1/enquiries?id=eq.${row.id}`, {
         method: 'PATCH',
         headers: { ...SB_HEADERS, Prefer: 'return=minimal' },
         body: JSON.stringify({ last_stale_alert_at: new Date().toISOString() })
       }, 'SB-markStaleAlerted');
+      if (!patchR.ok) {
+        console.error(`⚠️ [stale-check] last_stale_alert_at write FAILED for ${row.id} (${customerName}, ${destination}) — this lead WILL re-alert next run: ${patchR.status} ${await patchR.text()}`);
+      }
       alertedCount++;
     }
     console.log(`⏰ [stale-check] ${rows.length} currently stale, ${alertedCount} alerted (rest deduped).`);

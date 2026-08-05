@@ -1055,6 +1055,20 @@ function checkAiSensySignature(req) {
   }
 }
 
+// In-memory ring buffer of the last 20 signature checks, so Phase 1 can be
+// confirmed by curling this endpoint directly instead of needing Render log
+// access. No secret values are ever stored here — only HMAC digests
+// (already logged to console) and match/no-match outcomes.
+const webhookSigLog = [];
+function recordSigCheck(result) {
+  webhookSigLog.unshift({ at: new Date().toISOString(), ...result });
+  if (webhookSigLog.length > 20) webhookSigLog.length = 20;
+}
+app.get('/debug/webhook-sig-log', (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json(webhookSigLog);
+});
+
 const OPEN_STATUSES = "(new,called,quoted,follow-up,followup)"; // adjust if your CRM uses different status strings
 
 // Count leads for one assignee by status bucket.
@@ -2098,6 +2112,7 @@ app.post('/webhook/incoming', async (req, res) => {
   // why this isn't enforced yet. Remove this comment and add the 401 gate
   // only after explicit go-ahead once real traffic confirms MATCH below.
   const sigCheck = checkAiSensySignature(req);
+  recordSigCheck(sigCheck);
   if (sigCheck.checked) {
     console.log(`🔏 [webhook-sig] ${sigCheck.matched ? 'MATCH' : 'MISMATCH'} — expected:${sigCheck.expected} received:${sigCheck.received}`);
   } else {

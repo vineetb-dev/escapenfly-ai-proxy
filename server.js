@@ -5,7 +5,15 @@ const { z } = require('zod');
 const app = express();
 
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+// verify captures the raw request bytes into req.rawBody alongside the
+// normal parsed req.body — needed for HMAC signature verification, which
+// must hash the exact bytes AiSensy signed, not a re-serialized JSON.parse
+// of them (re-serialization can reorder keys/whitespace and silently break
+// the hash match). Every other route is unaffected — req.body still works
+// exactly as before.
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 
 // ═══════════════════════════════════════════════════════════════
 // ESCAPENFLY AI ENGINE v3.8  (forced tool-use — structured output, no more JSON parse errors)
@@ -84,6 +92,7 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const SB_URL        = process.env.SUPABASE_URL || 'https://zkhbaisggymbmurqxejk.supabase.co';
 const SB_KEY        = process.env.SUPABASE_KEY || 'sb_publishable_cXjJKnSOprBxp4CO0wQTsg_azzuBFTi';
 const AISENSY_KEY   = process.env.AISENSY_KEY;
+const AISENSY_WEBHOOK_SECRET = process.env.AISENSY_WEBHOOK_SECRET || '';
 const WA_NUM        = (process.env.WA_NUM || '919851739851').replace(/\D/g, '');
 const MAYA_CAMPAIGN = process.env.MAYA_CAMPAIGN || 'maya_session';
 const CRM_URL       = process.env.CRM_URL || 'https://escapenfly-crm.netlify.app';
@@ -1016,6 +1025,34 @@ async function notifyTeam(assigned, leadData) {
 function cronAuthOk(req) {
   const supplied = req.query.secret || req.headers['x-cron-secret'] || '';
   return CRON_SECRET && supplied === CRON_SECRET;
+}
+
+// ── AISENSY WEBHOOK SIGNATURE — PHASE 1: OBSERVE ONLY ──
+// Computes AiSensy's documented scheme (HMAC-SHA256 of the raw request
+// body, hex-encoded, header X-AiSensy-Signature) and reports whether it
+// matches — but /webhook/incoming does NOT reject on a mismatch yet. This
+// phase exists to confirm the scheme against real traffic first: the
+// header name/algorithm/encoding here come from secondhand documentation
+// (AiSensy's own docs page is a JS-rendered SPA that couldn't be read
+// directly), not a primary source, and given the Aug 4-5 silent-outage
+// incident, shipping enforcement on an unverified guess risks the exact
+// same failure mode again — silently rejecting all real traffic. DO NOT
+// add a 401/early-return using this result until explicitly told to
+// enforce, and only after a real test message confirms MATCH in the logs.
+function checkAiSensySignature(req) {
+  if (!AISENSY_WEBHOOK_SECRET) return { checked: false, reason: 'AISENSY_WEBHOOK_SECRET not configured' };
+  const header = req.headers['x-aisensy-signature'];
+  if (!header) return { checked: false, reason: 'no X-AiSensy-Signature header on this request' };
+  if (!req.rawBody) return { checked: false, reason: 'no raw body captured' };
+  try {
+    const expected = crypto.createHmac('sha256', AISENSY_WEBHOOK_SECRET).update(req.rawBody).digest('hex');
+    const expectedBuf = Buffer.from(expected, 'utf8');
+    const receivedBuf = Buffer.from(String(header), 'utf8');
+    const matched = expectedBuf.length === receivedBuf.length && crypto.timingSafeEqual(expectedBuf, receivedBuf);
+    return { checked: true, matched, expected, received: String(header) };
+  } catch (e) {
+    return { checked: false, reason: `error computing signature: ${e.message}` };
+  }
 }
 
 const OPEN_STATUSES = "(new,called,quoted,follow-up,followup)"; // adjust if your CRM uses different status strings
@@ -2056,6 +2093,16 @@ function deepExtract(obj) {
 //           status, userName, countryCode, ... } } }
 app.post('/webhook/incoming', async (req, res) => {
   res.json({ status: 'ok' }); // ack immediately
+
+  // PHASE 1 — OBSERVE ONLY, does not block. See checkAiSensySignature for
+  // why this isn't enforced yet. Remove this comment and add the 401 gate
+  // only after explicit go-ahead once real traffic confirms MATCH below.
+  const sigCheck = checkAiSensySignature(req);
+  if (sigCheck.checked) {
+    console.log(`🔏 [webhook-sig] ${sigCheck.matched ? 'MATCH' : 'MISMATCH'} — expected:${sigCheck.expected} received:${sigCheck.received}`);
+  } else {
+    console.log(`🔏 [webhook-sig] not checked — ${sigCheck.reason}`);
+  }
 
   try {
     const b = req.body || {};

@@ -98,6 +98,11 @@ const MAYA_CAMPAIGN = process.env.MAYA_CAMPAIGN || 'maya_session';
 const CRM_URL       = process.env.CRM_URL || 'https://escapenfly-crm.netlify.app';
 const CHAT_MODEL    = process.env.CHAT_MODEL || 'claude-haiku-4-5-20251001';
 const ROUTING_MODEL = process.env.ROUTING_MODEL || 'claude-sonnet-4-6';
+// Separate from CHAT_MODEL/ROUTING_MODEL — this is the only model in this
+// file that needs the web_search server tool, which Haiku 4.5 (CHAT_MODEL)
+// does not support. Only used by the visa_intelligence refresh/on-demand
+// lookup, never on the customer-facing reply path.
+const VISA_SEARCH_MODEL = process.env.VISA_SEARCH_MODEL || 'claude-sonnet-5';
 const CRON_SECRET   = process.env.CRON_SECRET || 'change-me-please';
 
 const DEDUPE_MS   = 24 * 60 * 60 * 1000; // one lead per phone per 24h
@@ -531,6 +536,123 @@ async function loadFounderNotes(destination) {
   } catch (e) {
     console.error('loadFounderNotes error:', e.message);
     return null;
+  }
+}
+
+// ── VISA INTELLIGENCE — EscapeNFly's own verified visa-fact database ──
+// Direct, permanent fix for the ESTA incident: category/fee/processing-time
+// facts now come from this table (own data, official-primary-source-only
+// refresh job — see synthesizeVisaIntelligence below), never from Maya's
+// own general knowledge. Separate from founder_notes on purpose — founder
+// notes stays Vineet's broader per-destination consulting judgment (budget
+// floor, hidden gems, hotel areas); this table is narrowly visa facts,
+// checkable against an official source and periodically re-verified.
+async function loadVisaIntelligence(destination) {
+  const key = String(destination || '').trim().toLowerCase();
+  if (!key) return null;
+  const fields = 'destination_country,visa_requirement,processing_time,documents_required,validity,entry_type,estimated_fee,consultant_tips,data_confidence,last_updated';
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/visa_intelligence?destination_country=eq.${encodeURIComponent(key)}&select=${fields}`, { headers: SB_HEADERS }, 'SB-visaIntel');
+    if (!r.ok) return null;
+    const rows = await r.json();
+    return rows[0] || null; // exact match only — same discipline as loadFounderNotes, no fuzzy substring fallback
+  } catch (e) {
+    console.error('loadVisaIntelligence error:', e.message);
+    return null;
+  }
+}
+
+// Small supplement so common synonyms resolve to the same canonical row
+// without needing duplicate DB rows — same spirit as DESTINATION_INFO's
+// city-level aliases below. Only covers cases the plain word-boundary match
+// against visa_intelligence's own destination_country list would otherwise
+// miss (e.g. a customer says "London", not "UK").
+const VISA_INTEL_ALIASES = {
+  'united kingdom': 'uk', 'london': 'uk', 'england': 'uk', 'britain': 'uk',
+  'united states': 'usa', 'america': 'usa',
+  'uae': 'dubai', 'emirates': 'dubai',
+  'indonesia': 'bali',
+  'korea': 'south korea',
+  'almaty': 'kazakhstan'
+};
+
+let visaIntelKeyListCache = { keys: null, fetchedAt: 0 };
+const VISA_INTEL_KEY_LIST_TTL_MS = 15 * 60 * 1000; // mirrors founderKeyListCache — table changes rarely
+
+async function getVisaIntelligenceDestinationKeys() {
+  const now = Date.now();
+  if (visaIntelKeyListCache.keys && (now - visaIntelKeyListCache.fetchedAt) < VISA_INTEL_KEY_LIST_TTL_MS) {
+    return visaIntelKeyListCache.keys;
+  }
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/visa_intelligence?select=destination_country`, { headers: SB_HEADERS }, 'SB-visaIntel-keys');
+    if (!r.ok) return visaIntelKeyListCache.keys || [];
+    const keys = (await r.json()).map(row => String(row.destination_country || '').trim().toLowerCase()).filter(Boolean);
+    visaIntelKeyListCache = { keys, fetchedAt: now };
+    return keys;
+  } catch (e) {
+    console.error('getVisaIntelligenceDestinationKeys error:', e.message);
+    return visaIntelKeyListCache.keys || [];
+  }
+}
+
+// Same multi-destination resolution as allFounderDestinationKeyMatches, plus
+// the small alias layer above. Returns canonical destination_country keys.
+async function allVisaIntelDestinationKeyMatches(text) {
+  const m = String(text || '').toLowerCase();
+  if (!m) return [];
+  const canonicalKeys = await getVisaIntelligenceDestinationKeys();
+  const found = [];
+  for (const k of canonicalKeys) {
+    const re = new RegExp(`\\b${escapeRegex(k)}\\b`);
+    const idx = m.search(re);
+    if (idx !== -1) found.push({ key: k, idx });
+  }
+  for (const [alias, canonical] of Object.entries(VISA_INTEL_ALIASES)) {
+    if (!canonicalKeys.includes(canonical)) continue; // only resolve to a row that actually exists
+    const re = new RegExp(`\\b${escapeRegex(alias)}\\b`);
+    const idx = m.search(re);
+    if (idx !== -1) found.push({ key: canonical, idx });
+  }
+  found.sort((a, b) => a.idx - b.idx);
+  const seen = new Set();
+  const ordered = [];
+  for (const f of found) { if (!seen.has(f.key)) { seen.add(f.key); ordered.push(f.key); } }
+  return ordered.slice(0, MAX_MULTI_DESTINATIONS);
+}
+
+// Explicit column allowlist on every write — consultant_tips is FOUNDER-
+// AUTHORED ONLY and must never appear here, on any code path that reaches
+// this function (monthly refresh or on-demand lookup alike).
+async function upsertVisaIntelligence(destinationKey, fields) {
+  const VALID_REQ = ['visa-free', 'evisa', 'visa-on-arrival', 'embassy-visa-required', 'unclear'];
+  const VALID_ENTRY = ['single', 'multiple'];
+  const nowIso = new Date().toISOString();
+  const payload = {
+    destination_country: destinationKey,
+    visa_requirement: VALID_REQ.includes(fields.visa_requirement) ? fields.visa_requirement : 'unclear',
+    processing_time: fields.processing_time || null,
+    documents_required: Array.isArray(fields.documents_required) && fields.documents_required.length ? fields.documents_required : null,
+    validity: fields.validity || null,
+    entry_type: VALID_ENTRY.includes(fields.entry_type) ? fields.entry_type : null,
+    estimated_fee: fields.estimated_fee || null,
+    data_confidence: fields.data_confidence === 'verified' ? 'verified' : 'needs_refresh',
+    last_updated: nowIso,
+    source_notes: fields.source_notes ? cap(fields.source_notes, 500) : null,
+    updated_at: nowIso
+  };
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/visa_intelligence?on_conflict=destination_country`, {
+      method: 'POST',
+      headers: { ...SB_HEADERS, 'Prefer': 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify(payload)
+    }, 'SB-upsertVisaIntel');
+    if (!r.ok) { console.error('upsertVisaIntelligence failed:', r.status, await r.text()); return false; }
+    visaIntelKeyListCache = { keys: null, fetchedAt: 0 }; // invalidate — a new destination may have just been added
+    return true;
+  } catch (e) {
+    console.error('upsertVisaIntelligence error:', e.message);
+    return false;
   }
 }
 
@@ -1169,6 +1291,175 @@ app.get('/debug/stacked-question-log', (req, res) => {
   res.json(stackedQuestionLog);
 });
 
+// ── VISA INTELLIGENCE — SYNTHESIS (web-search-grounded, official sources only) ──
+// Shared by both the monthly refresh cron and the on-demand mid-conversation
+// trigger — one function, one set of sourcing rules, so the two paths can
+// never drift apart. Forced tool_choice is deliberately NOT used here (unlike
+// MAYA_REPLY_TOOL) — the model needs to be free to call web_search first,
+// possibly across several rounds, before concluding with the structured tool;
+// forcing the structured tool from turn one would prevent it from searching
+// at all.
+const VISA_INTEL_TOOL = {
+  name: 'visa_intelligence_result',
+  description: "Structured, source-grounded current TOURIST visa facts for Indian passport holders specifically (EscapeNFly's customer base), for one destination. Base every field ONLY on what you found via web_search on an official primary source — a government immigration/foreign-affairs site, an embassy/consulate site, or an official e-visa portal. Never base a field on a travel-agency, visa-consultancy, or aggregator site (this explicitly excludes VisaHQ, iVisa, Sherpa, and any similar service), even if one appeared in search results.",
+  input_schema: {
+    type: 'object',
+    properties: {
+      visa_requirement: { type: 'string', enum: ['visa-free', 'evisa', 'visa-on-arrival', 'embassy-visa-required', 'unclear'], description: "The tourist-visa category for Indian passport holders. Use 'unclear' rather than guessing if official sources are ambiguous or you couldn't confirm it." },
+      processing_time: { type: 'string', description: 'Typical processing/appointment-wait range per the official source, e.g. "5-10 business days" or "60-300+ days for an interview slot". Empty string if not confidently found.' },
+      documents_required: { type: 'array', items: { type: 'string' }, description: 'The core document checklist per the official source. Empty array if not confidently found.' },
+      validity: { type: 'string', description: 'Visa validity period once granted, e.g. "90 days from issue". Empty string if not confidently found.' },
+      entry_type: { type: 'string', enum: ['single', 'multiple', ''], description: 'Single or multiple entry, if stated by the source; empty string if unclear.' },
+      estimated_fee: { type: 'string', description: 'Approximate fee as stated by the official source, with currency, e.g. "approx $185 USD". Empty string if not confidently found.' },
+      data_confidence: { type: 'string', enum: ['verified', 'needs_refresh'], description: "'verified' only if you found and are genuinely confident in current official-source information for the category at minimum. 'needs_refresh' if search failed, official sources conflicted, or you are not genuinely confident — never guess just to force 'verified'." },
+      source_notes: { type: 'string', description: 'Brief internal note on which official source(s) you checked and any caveats — for a human to audit later. Never shown to a customer.' }
+    },
+    required: ['visa_requirement', 'processing_time', 'documents_required', 'validity', 'entry_type', 'estimated_fee', 'data_confidence', 'source_notes']
+  }
+};
+
+async function synthesizeVisaIntelligence(destinationKey) {
+  const system = `You are a meticulous research assistant producing CURRENT, VERIFIED tourist-visa facts for Indian passport holders travelling to ${destinationKey}. Use the web_search tool to check OFFICIAL PRIMARY SOURCES ONLY: the destination's government immigration/foreign-affairs website, its embassy or consulate site, or its official e-visa portal. Do NOT use, cite, or rely on any travel agency, visa consultancy, or third-party aggregator site — this specifically excludes VisaHQ, iVisa, Sherpa, and any similar service, even if one appears prominently in search results. If you cannot find or confidently confirm a field from an official source, leave it empty (or use 'unclear' for the category) and set data_confidence to 'needs_refresh' rather than guessing. Once you have gathered enough information — or determined you cannot confirm a field — call the visa_intelligence_result tool with your findings. Do not respond with plain text.`;
+  let messages = [{ role: 'user', content: `Find current tourist visa requirements, processing time, documents required, validity, entry type, and fee for an Indian passport holder travelling to: ${destinationKey}.` }];
+  const tools = [{ type: 'web_search_20260209', name: 'web_search', max_uses: 6 }, VISA_INTEL_TOOL];
+  for (let round = 0; round < 4; round++) {
+    let d;
+    try {
+      const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: VISA_SEARCH_MODEL, max_tokens: 3000, system, messages, tools })
+      }, 'Claude-visa-search');
+      if (!r.ok) { console.error(`synthesizeVisaIntelligence [${destinationKey}] HTTP ${r.status}:`, await r.text()); return null; }
+      d = await r.json();
+    } catch (e) {
+      console.error(`synthesizeVisaIntelligence [${destinationKey}] error:`, e.message);
+      return null;
+    }
+    const toolBlock = (d.content || []).find(b => b.type === 'tool_use' && b.name === 'visa_intelligence_result');
+    if (toolBlock && toolBlock.input) return toolBlock.input;
+    if (d.stop_reason === 'pause_turn') {
+      // Server-side web_search loop hit its internal round limit — resend to
+      // resume automatically (documented pattern, NOT an extra "Continue"
+      // user turn, which the API doesn't expect here).
+      messages = [...messages, { role: 'assistant', content: d.content }];
+      continue;
+    }
+    if (round === 0) {
+      // Model responded with plain text instead of the tool — nudge once.
+      messages = [...messages, { role: 'assistant', content: d.content }, { role: 'user', content: "Please call the visa_intelligence_result tool now with your findings (use 'needs_refresh' and empty fields for anything you could not confirm)." }];
+      continue;
+    }
+    console.error(`synthesizeVisaIntelligence [${destinationKey}]: no structured result after search, giving up`);
+    return null;
+  }
+  console.error(`synthesizeVisaIntelligence [${destinationKey}]: exceeded round limit without a structured result`);
+  return null;
+}
+
+// The curated seed list — top 20 real destinations by actual historical
+// demand (visa_cases.country + recommendations.destination, queried direct
+// from Supabase, not guessed), approved 7 Aug 2026. Canonical keys match
+// what customers actually type, same convention as founder_notes/
+// DESTINATION_INFO (e.g. 'dubai' not 'uae', 'bali' not 'indonesia').
+const VISA_INTEL_SEED_DESTINATIONS = ['uk', 'usa', 'dubai', 'switzerland', 'canada', 'australia', 'spain', 'thailand', 'france', 'new zealand', 'singapore', 'greece', 'italy', 'sri lanka', 'bali', 'vietnam', 'georgia', 'south korea', 'japan', 'kazakhstan'];
+
+// Ring buffer — same self-verifiable-without-Render-logs pattern as
+// webhookSigLog/stackedQuestionLog. Records both the monthly batch run and
+// every on-demand trigger, tagged by `trigger` so the two are distinguishable.
+const visaRefreshLog = [];
+function recordVisaRefresh(entry) {
+  visaRefreshLog.unshift({ at: new Date().toISOString(), ...entry });
+  if (visaRefreshLog.length > 100) visaRefreshLog.length = 100;
+}
+app.get('/debug/visa-refresh-log', (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json(visaRefreshLog);
+});
+
+// Sequential, not Promise.all — this runs monthly, not latency-sensitive,
+// and sequential avoids bursting rate limits across 20 back-to-back
+// web-search-grounded calls.
+async function refreshAllVisaIntelligence() {
+  const results = [];
+  for (const dest of VISA_INTEL_SEED_DESTINATIONS) {
+    try {
+      const before = await loadVisaIntelligence(dest);
+      const fields = await synthesizeVisaIntelligence(dest);
+      if (!fields) {
+        recordVisaRefresh({ destination: dest, trigger: 'monthly-refresh', ok: false, reason: 'synthesis failed', before });
+        results.push({ destination: dest, ok: false });
+        continue;
+      }
+      const ok = await upsertVisaIntelligence(dest, fields);
+      recordVisaRefresh({ destination: dest, trigger: 'monthly-refresh', ok, before, after: fields });
+      results.push({ destination: dest, ok, data_confidence: fields.data_confidence });
+    } catch (e) {
+      console.error(`refreshAllVisaIntelligence error for ${dest}:`, e.message);
+      recordVisaRefresh({ destination: dest, trigger: 'monthly-refresh', ok: false, reason: e.message });
+      results.push({ destination: dest, ok: false });
+    }
+  }
+  return results;
+}
+
+app.post('/cron/visa-intelligence-refresh', async (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const results = await refreshAllVisaIntelligence();
+    res.json({ ok: true, count: results.length, results });
+  } catch (e) {
+    console.error('visa-intelligence-refresh cron error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// On-demand live lookup — fire-and-forget, called from mayaTurn well after
+// the customer's reply is already sent (see call site). Writes fresh data
+// for NEXT turn/customer to benefit from immediately; additionally sends a
+// real WhatsApp follow-up (reusing sendSessionMessage, the same free-text
+// send Maya's own replies use) when a phone number is known and the lookup
+// actually succeeds — never promised on website chat without a known phone,
+// since there is no reliable way to push an unsolicited message there today.
+async function triggerVisaLookupAsync(destinationKey, phone, channel) {
+  try {
+    const existing = await loadVisaIntelligence(destinationKey);
+    if (existing && existing.last_updated && (Date.now() - new Date(existing.last_updated).getTime()) < 10 * 60 * 1000) {
+      return; // refreshed within the last 10 minutes — avoid duplicate work on a burst of questions
+    }
+    const fields = await synthesizeVisaIntelligence(destinationKey);
+    if (!fields) {
+      recordVisaRefresh({ destination: destinationKey, trigger: 'on-demand', ok: false, reason: 'synthesis failed', phone, channel });
+      return;
+    }
+    const ok = await upsertVisaIntelligence(destinationKey, fields);
+    recordVisaRefresh({ destination: destinationKey, trigger: 'on-demand', ok, after: fields, phone, channel });
+    if (ok && fields.data_confidence === 'verified' && validPhone(phone)) {
+      const msg = formatVisaFollowUpMessage(destinationKey, fields);
+      if (msg) await sendSessionMessage(phone, msg);
+    }
+  } catch (e) {
+    console.error('triggerVisaLookupAsync error:', e.message);
+  }
+}
+
+function formatVisaFollowUpMessage(destinationKey, fields) {
+  const categoryText = {
+    'visa-free': "you won't need a visa",
+    'evisa': "you'll need an e-visa",
+    'visa-on-arrival': "you can get a visa on arrival",
+    'embassy-visa-required': "you'll need to apply for a visa in advance"
+  }[fields.visa_requirement];
+  if (!categoryText) return null; // 'unclear' or missing — nothing confident to follow up with
+  const label = destinationKey.replace(/\b\w/g, c => c.toUpperCase());
+  let msg = `Quick follow-up on the ${label} visa question — as of today, ${categoryText}`;
+  if (fields.processing_time) msg += `, typically taking ${fields.processing_time}`;
+  msg += '.';
+  if (fields.estimated_fee) msg += ` Fee is usually around ${fields.estimated_fee}.`;
+  msg += " I'll also get our expert to confirm the exact details before you book anything.";
+  return msg;
+}
+
 const OPEN_STATUSES = "(new,called,quoted,follow-up,followup)"; // adjust if your CRM uses different status strings
 
 // Count leads for one assignee by status bucket.
@@ -1449,7 +1740,7 @@ const CHANNEL_ADAPTERS = {
     replyFieldDesc: 'your chat message. Plain text; a line break before a short "•" list is allowed for Stage 2, otherwise keep it a short block with no line breaks.',
     contactCaptureRule: '\n\nUnlike WhatsApp, you do NOT already know this visitor\'s phone number. Once you reach Stage 3 (or handover), naturally ask for their name and a phone/WhatsApp number as part of moving to the next step — e.g. "Let me get our expert to send you a detailed quotation, what\'s the best number to reach you on?" — not as a separate, bureaucratic ask. Capture it in lead.phone the moment they give it.',
     proactiveContentRule: '\n\nUnlike WhatsApp, do NOT wait for the customer to explicitly ask "what should we cover" before giving this. The moment destination + travel month are known (pax/budget can still be open), proactively include this Stage 2-style compact recommendation in your very next reply — you don\'t need to be asked.',
-    visaSnapshotRule: ' For INTERNATIONAL destinations specifically, do NOT defer visa info with phrasing like "our visa expert will send you the checklist" or "will reach out with the requirements" — you already know general visa requirements yourself (see VISA DOCUMENT CHECKLISTS below). GIVE the actual 2-3 line checklist yourself, in THIS message, right now, but ONLY with specifics you are genuinely confident in (see the founder-notes-gating rule in VISA DOCUMENT CHECKLISTS below) — then hand over for the exact quotation/pricing/booking (that part genuinely needs the expert; the checklist does not). ALSO include ONE genuine practical tip in the same message (packing note, money-saving trick, best time for a specific sight, a common first-timer mistake). Both are mandatory, not optional, the moment the trip is qualified. NEVER say or imply the customer does not need an agent, does not need our help, or can just do this on their own — even where individuals genuinely can self-apply, frame it as we will guide you through it or we handle this for you, never as you do not need an agent.\n\nWRONG (deferring information you already have):\n"Perfect! I have got everything I need. Let me get our visa expert to send you the full document checklist, plus a customised itinerary. What is the best number to reach you on?"\n\nALSO WRONG (undermines your own business, and states unverified specifics as certain):\n"You can apply directly through the Visa Application Centre — no agent required. You will need bank statements, confirmed return flights, and hotel booking."\n\nRIGHT (give only what you are confident in, never imply the customer does not need EscapeNFly):\n"Perfect! For Singapore, as Indian passport holders you will need: passport valid 6+ months with blank pages, recent photos, and completed application form — we will handle the full documentation and submission for you. One tip: book Universal Studios tickets online in advance, it is noticeably cheaper than at the gate. I will get our expert to send your exact itinerary, quotation, and the complete visa checklist — what is the best number to reach you on?"',
+    visaSnapshotRule: ' For INTERNATIONAL destinations specifically, do NOT defer visa info with phrasing like "our visa expert will send you the checklist" or "will reach out with the requirements" — you already know general visa requirements yourself (see VISA DOCUMENT CHECKLISTS below). GIVE the actual 2-3 line checklist yourself, in THIS message, right now, but ONLY with specifics you are genuinely confident in (see the CHECKLIST CONFIDENCE GATING rule below — prefer a "VISA INTELLIGENCE FOR THIS DESTINATION" block\'s documents_required first, founder notes second) — then hand over for the exact quotation/pricing/booking (that part genuinely needs the expert; the checklist does not). If you also mention the current fee or processing time, pull it from the VISA INTELLIGENCE block using the "typically... as of..." framing from TIMELINE/FEASIBILITY CONFIDENCE — never from memory, and never naming any external source. ALSO include ONE genuine practical tip in the same message (packing note, money-saving trick, best time for a specific sight, a common first-timer mistake). Both are mandatory, not optional, the moment the trip is qualified. NEVER say or imply the customer does not need an agent, does not need our help, or can just do this on their own — even where individuals genuinely can self-apply, frame it as we will guide you through it or we handle this for you, never as you do not need an agent.\n\nWRONG (deferring information you already have):\n"Perfect! I have got everything I need. Let me get our visa expert to send you the full document checklist, plus a customised itinerary. What is the best number to reach you on?"\n\nALSO WRONG (undermines your own business, and states unverified specifics as certain):\n"You can apply directly through the Visa Application Centre — no agent required. You will need bank statements, confirmed return flights, and hotel booking."\n\nRIGHT (give only what you are confident in, never imply the customer does not need EscapeNFly):\n"Perfect! For Singapore, as Indian passport holders you will need: passport valid 6+ months with blank pages, recent photos, and completed application form — we will handle the full documentation and submission for you. One tip: book Universal Studios tickets online in advance, it is noticeably cheaper than at the gate. I will get our expert to send your exact itinerary, quotation, and the complete visa checklist — what is the best number to reach you on?"',
     conversationLengthRule: '\n\nKEEP THIS SHORT — people come here for a human travel consultant, not an extended AI chat. Aim to reach handover within 4-5 customer messages total. Ask for ONLY: destination, travel month, headcount (a number — "2 people"), and budget. That is enough to qualify and hand off. Do NOT ask for, and do NOT mention that the expert will later collect: individual companion/traveller names, passport numbers, or passport expiry dates — leave that out of this conversation entirely, do not even reference it as a future step. That is handled later by the documentation team once the enquiry is confirmed. The moment you have destination + month + headcount + budget + the customer\'s own name and phone, move straight to handover — do not add extra confirmation questions or ask for anything more just to be thorough.'
   }
 };
@@ -1611,11 +1902,13 @@ ONLY ASK WHAT'S RELEVANT TO THE ACTUAL INTENT. A visa-only enquiry (intent: visa
 VISA DOCUMENT CHECKLISTS — still give these in full immediately when asked, since this is decision-relevant, not blog content:
 Example — Singapore tourist visa for Indian passport holders: passport with 6+ months validity and blank pages, recent passport-size photos (white background, 35x45mm), completed Form 14A, last 3 months bank statements, covering letter, confirmed return flight details and hotel booking, submitted via an authorised visa agent (Indian nationals apply through an agent for Singapore specifically). Give equivalent genuine checklists for other countries you know — do NOT assume every country requires an agent or forbids direct application. Many Schengen countries (including France) and others process applications through VFS Global or the relevant visa application centre, where the applicant CAN apply themselves — state this accurately per country rather than repeating the Singapore pattern everywhere. If you are not certain whether direct application is possible for a specific country, say so rather than asserting either way, and offer that EscapeNFly can guide them through it either way.
 
-CHECKLIST CONFIDENCE GATING — this matters, a real production mistake happened here before: if a "FOUNDER NOTES FOR THIS DESTINATION" block is present in this context with real visa_info for the destination being discussed, use that exact information confidently. If NO such founder notes exist for this destination, stick to only the universally-safe basics that are true almost everywhere (passport validity 6+ months, recent photo, completed application form, proof of funds) and explicitly say the exact list can vary and our expert will confirm the complete, precise checklist — do NOT state specific document counts (like an exact bank statement duration) or specific booking requirements with confidence you do not actually have. In particular: NEVER state that confirmed, paid flight or hotel bookings are a visa requirement unless a founder-notes block confirms this for that specific country — many countries want proof of intended travel plans, not non-refundable pre-booked travel, and wrongly telling a customer to book and pay before their visa is approved can cost them real money if the visa is refused. When in doubt, say less, not more.
+VISA CATEGORY CONFIDENCE — the direct, permanent fix for a real, serious mistake (Maya once told an Indian customer the US was ESTA-eligible; it is not, and India is not a Visa Waiver Program country): state the visa CATEGORY (visa-free / eVisa / visa-on-arrival / embassy visa required) confidently ONLY when a "VISA INTELLIGENCE FOR THIS DESTINATION" block is present in this context for that destination — that block only ever appears when EscapeNFly's own data for it is verified, current, and specifically checked against an official source. NEVER state or imply a visa category from your own general knowledge, even when you feel confident about it — general knowledge is exactly what caused the past mistake. If no such block is present for the destination being discussed, say exactly: "Let me verify the latest requirement before I advise you." — then continue the conversation naturally (keep gathering their trip details, or move to handover) rather than stalling on it or guessing. Do not repeat that exact sentence more than once per destination in one conversation. Speak entirely in EscapeNFly's own voice about visa facts — "we've verified", "our records show", "as of our latest check" — never naming VisaHQ, a government website, or any other external source to the customer, exactly like founder-notes facts are never attributed to a source today.
 
-TIMELINE/FEASIBILITY CONFIDENCE — a SEPARATE and equally serious gating rule, added after a real production mistake: NEVER state a specific visa processing time or suggest a travel date is achievable ("book your appointment within 2 weeks", "processing takes 4-6 weeks") unless a founder-notes block explicitly confirms the CURRENT real timeline for that destination. Visa processing time is not the same thing as appointment AVAILABILITY — some countries have fast processing but a long wait just to get an interview slot at all, and general knowledge about "typical processing time" can be dangerously wrong about actual current appointment scarcity. If founder notes do not cover this, say plainly that appointment availability can vary significantly and changes over time, and that our expert will check the real current situation before the customer commits to non-refundable bookings — do NOT imply a near-term travel date is safely achievable when you do not actually know the current wait situation. This is exactly the class of mistake that has real financial consequences for a customer if they book flights/hotels assuming a visa will be ready in time.
+CHECKLIST CONFIDENCE GATING — this matters, a real production mistake happened here before. For the document CHECKLIST specifically (separate from the category rule above): if a "VISA INTELLIGENCE FOR THIS DESTINATION" block lists documents_required, use that exact list confidently. Otherwise, if a "FOUNDER NOTES FOR THIS DESTINATION" block is present in this context with real visa_info for the destination being discussed, use that exact information confidently. If NEITHER exists for this destination, stick to only the universally-safe basics that are true almost everywhere (passport validity 6+ months, recent photo, completed application form, proof of funds) and explicitly say the exact list can vary and our expert will confirm the complete, precise checklist — do NOT state specific document counts (like an exact bank statement duration) or specific booking requirements with confidence you do not actually have. In particular: NEVER state that confirmed, paid flight or hotel bookings are a visa requirement unless a verified block confirms this for that specific country — many countries want proof of intended travel plans, not non-refundable pre-booked travel, and wrongly telling a customer to book and pay before their visa is approved can cost them real money if the visa is refused. When in doubt, say less, not more.
 
-WHAT YOU MUST NEVER STATE: exact visa fees, current processing times, approval chances or guarantees, live flight/hotel prices, package costs, or availability — UNLESS a specific figure is given to you verbatim in a "FOUNDER NOTES FOR THIS DESTINATION" block in this context, in which case use that exact figure (it is verified, not a guess). Without founder notes for that destination, do NOT invent a number or range from your own general knowledge (e.g. do not say "typically 15-20 days" or "4-6 weeks" unless founder notes literally say so) — instead say something honest and generic like "our expert will confirm the exact processing time for you," or, for the document checklist specifically, keep to only the universally-safe basics (passport, photo, application form) rather than a long invented list. Frame the handoff as progress, not a brush-off — e.g. "I'll get our expert to send you an exact quotation" rather than a flat "someone will call you." Never guarantee visa approval.
+TIMELINE/FEASIBILITY CONFIDENCE — a SEPARATE and equally serious gating rule, added after a real production mistake: NEVER state a specific visa processing time, appointment wait, or fee from your own general knowledge ("book your appointment within 2 weeks", "processing takes 4-6 weeks") — these change too often to trust memory, even memory you feel confident in. If a "VISA INTELLIGENCE FOR THIS DESTINATION" block is present, use its processing_time/estimated_fee figures, always framed as "typically [X], as of [the date shown in that block]" — never as a guarantee, and never implying a near-term travel date is safely achievable just because processing is normally fast (appointment AVAILABILITY is a separate thing from processing speed, and can be scarce even when processing itself is quick). If no such block is present, say exactly: "Let me verify the latest requirement before I advise you." and let our expert confirm before the customer commits to any non-refundable booking. This is exactly the class of mistake that has real financial consequences for a customer if they book flights/hotels assuming a visa will be ready in time.
+
+WHAT YOU MUST NEVER STATE: exact visa fees, current processing times, approval chances or guarantees, live flight/hotel prices, package costs, or availability — UNLESS a specific figure is given to you verbatim in a "VISA INTELLIGENCE FOR THIS DESTINATION" or "FOUNDER NOTES FOR THIS DESTINATION" block in this context, in which case use that exact figure (both are verified, not a guess). Without either block for that destination, do NOT invent a number or range from your own general knowledge (e.g. do not say "typically 15-20 days" or "4-6 weeks" unless one of those blocks literally says so) — for visa fee, processing time, or category specifically, say exactly: "Let me verify the latest requirement before I advise you."; for anything else not covered by those blocks (flight/hotel prices, package costs), say something honest and generic like "our expert will confirm the exact pricing for you." For the document checklist without either block, keep to only the universally-safe basics (passport, photo, application form) rather than a long invented list. Frame the handoff as progress, not a brush-off — e.g. "I'll get our expert to send you an exact quotation" rather than a flat "someone will call you." Never guarantee visa approval.
 
 INTENT — on EVERY turn, classify the customer's current need as exactly one of:
 holiday | visa | flights | hotel | cruise | corporate | mice | existing_booking | complaint | human_support | other_travel | off_topic
@@ -1701,7 +1994,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotesList = [], intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, debugRef = null) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotesList = [], visaIntelList = [], intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, debugRef = null) {
   const todayStr = new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
   const currentDateLine = `\n\nTODAY'S ACTUAL DATE: ${todayStr}. Use this to reason correctly about relative time — if a customer says a month without a year (e.g. "December"), assume the NEXT upcoming occurrence of that month from today's real date, not a past or arbitrary year. NEVER offer already-past years as options when asking a customer to confirm their travel year.`;
   const knownLine = (known && Object.values(known).some(v => v))
@@ -1736,6 +2029,25 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
       ? `\n\nFOUNDER NOTES FOR THIS TRIP (from Vineet or the EscapeNFly team directly — VERIFIED, TREAT AS GROUND TRUTH per country, overrides your own general knowledge including any specific numbers you might otherwise guess). This is a MULTI-COUNTRY trip — treat each country's facts as completely separate. Do NOT blend, average, or combine numbers across countries (never average two countries' budget minimums into one figure), and do NOT attribute one country's hidden gem, visa detail, or tip to a different country in the same trip:` +
         founderNotesList.map(fn => `\n\n— ${String(fn.destination || '').toUpperCase()} —` + formatFounderNotesFields(fn)).join('')
       : '';
+  // Only 'verified' rows are ever rendered — a 'needs_refresh'/'stale' row
+  // is deliberately treated the same as no row at all, which is what makes
+  // the "Let me verify the latest requirement before I advise you." rule
+  // fire correctly (see CHAT_CORE's VISA CATEGORY CONFIDENCE section).
+  const formatVisaIntelFields = (vi) =>
+    (vi.visa_requirement && vi.visa_requirement !== 'unclear' ? `\nCategory: ${vi.visa_requirement}` : '') +
+    (vi.processing_time ? `\nProcessing time: ${vi.processing_time}` : '') +
+    (vi.documents_required && vi.documents_required.length ? `\nDocuments required: ${vi.documents_required.join(', ')}` : '') +
+    (vi.validity ? `\nValidity: ${vi.validity}` : '') +
+    (vi.entry_type ? `\nEntry type: ${vi.entry_type}` : '') +
+    (vi.estimated_fee ? `\nEstimated fee: ${vi.estimated_fee}` : '') +
+    (vi.consultant_tips ? `\nConsultant tip (Vineet/EscapeNFly team, verified): ${vi.consultant_tips}` : '');
+  const verifiedVisaIntel = (visaIntelList || []).filter(vi => vi.data_confidence === 'verified' && vi.visa_requirement && vi.visa_requirement !== 'unclear');
+  const visaLine = verifiedVisaIntel.length === 1
+    ? `\n\nVISA INTELLIGENCE FOR THIS DESTINATION (EscapeNFly's own verified data, last checked ${verifiedVisaIntel[0].last_updated ? new Date(verifiedVisaIntel[0].last_updated).toLocaleDateString('en-IN') : 'recently'} — treat as ground truth, never attribute this to any external source by name):` + formatVisaIntelFields(verifiedVisaIntel[0])
+    : verifiedVisaIntel.length > 1
+      ? `\n\nVISA INTELLIGENCE FOR THIS TRIP (EscapeNFly's own verified data per country — never attribute to any external source by name):` +
+        verifiedVisaIntel.map(vi => `\n\n— ${String(vi.destination_country || '').toUpperCase()} — last checked ${vi.last_updated ? new Date(vi.last_updated).toLocaleDateString('en-IN') : 'recently'} —` + formatVisaIntelFields(vi)).join('')
+      : '';
   const liveDataLine = (liveWeather || forexRate)
     ? `\n\nLIVE DATA FOR THIS DESTINATION (fetched just now — use only if genuinely relevant to what the customer is asking, don't force it into every reply):${liveWeather ? `\nCurrent weather in ${liveWeather.city} right now: ${liveWeather.tempC}°C, ${liveWeather.condition}. This is CURRENT conditions only, not a seasonal forecast — do not use it to answer "what's the best time to visit" or predict weather for a future travel month, only for "what's it like there right now" or a trip happening imminently.` : ''}${forexRate ? `\nCurrent exchange rate: 1 INR = ${forexRate.rate.toFixed(4)} ${forexRate.currency}. You may mention this if the customer asks about currency/forex, but note rates fluctuate daily so frame it as "around" or "currently", not a locked-in number.` : ''}`
     : '';
@@ -1764,7 +2076,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         body: JSON.stringify({
           model: CHAT_MODEL,
           max_tokens: 600,
-          system: buildChatSystem(channel, intent) + currentDateLine + knownLine + founderLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine,
+          system: buildChatSystem(channel, intent) + currentDateLine + knownLine + founderLine + visaLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine,
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }
@@ -1888,6 +2200,18 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       : [];
     console.log(`🔎 founderNotes lookup for [${founderDestKeys.join(', ') || '(none)'}]:`, founderNotesList.length ? JSON.stringify(founderNotesList) : 'NOT FOUND');
 
+    // Same resolution pattern as founder_notes above, against visa_intelligence's
+    // own (separate, smaller) destination list. A row only ever gets injected
+    // into the prompt if data_confidence is 'verified' — see visaLine in
+    // callMayaJSON — so a missing or stale row correctly falls through to the
+    // "Let me verify..." rule rather than silently having no effect.
+    const messageVisaKeys = await allVisaIntelDestinationKeyMatches(message);
+    const knownVisaKeys = await allVisaIntelDestinationKeyMatches(chat.known?.destination || '');
+    const visaDestKeys = messageVisaKeys.length ? messageVisaKeys : knownVisaKeys;
+    const visaIntelList = visaDestKeys.length
+      ? (await Promise.all(visaDestKeys.map(k => loadVisaIntelligence(k)))).filter(Boolean)
+      : [];
+
     const destInfo = messageDestKey ? lookupDestinationInfo(messageDestKey) : (chat.known?.destination ? lookupDestinationInfo(chat.known.destination) : lookupDestinationInfo(message));
     const [liveWeather, forexRate] = destInfo
       ? await Promise.all([loadLiveWeather(destInfo.city), loadForexRate(destInfo.currency)])
@@ -1915,7 +2239,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       ? await loadCustomerProfile(statusLookupPhone) : {};
 
     const debugRef = {};
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotesList, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations, returningProfile, debugRef);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotesList, visaIntelList, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations, returningProfile, debugRef);
     tAI = Date.now();
 
     if (!parsed) {
@@ -1985,6 +2309,28 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     // the generic fallback text, nothing to learn from checking that.
     if (reply !== FALLBACK_REPLY) {
       checkStackedQuestionAsync(reply, effectivePhone, channel).catch(() => {});
+    }
+
+    // ── VISA INTELLIGENCE — on-demand live lookup (fire-and-forget) ──
+    // Same "reply already sent, this cannot delay or alter it" discipline as
+    // the stacked-question check above. Scoped to intent === 'visa' to keep
+    // background cost proportional to genuine visa enquiries. Prefers the
+    // curated visa_intelligence key already resolved above; falls back to
+    // Maya's own freshly-extracted lead.destination (a single, non-compound-
+    // looking word) so the table can genuinely expand to destinations
+    // outside the initial 20 based on real questions, not just the seed list.
+    if (effectiveIntent === 'visa') {
+      const curatedKey = visaDestKeys[0] || '';
+      const rawDest = String(chat.known.destination || '').trim().toLowerCase();
+      const looksCompound = /\b(and|or)\b|[\/&,]/.test(rawDest);
+      const fallbackKey = (!curatedKey && rawDest && !looksCompound && /^[a-z\s]{3,30}$/.test(rawDest) && !DOMESTIC.some(d => rawDest.includes(d))) ? rawDest : '';
+      const visaTriggerKey = curatedKey || fallbackKey;
+      if (visaTriggerKey) {
+        const alreadyVerified = visaIntelList.some(vi => vi.destination_country === visaTriggerKey && vi.data_confidence === 'verified');
+        if (!alreadyVerified) {
+          triggerVisaLookupAsync(visaTriggerKey, effectivePhone, channel).catch(() => {});
+        }
+      }
     }
 
     // ── LEAD CAPTURE (background from customer's perspective) ──
@@ -2481,7 +2827,7 @@ app.get('/health', (req, res) => res.json({
   endpoints: [
     '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/website-chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
     '/notify/manual-lead',
-    '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary'
+    '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh'
   ]
 }));
 

@@ -1069,6 +1069,106 @@ app.get('/debug/webhook-sig-log', (req, res) => {
   res.json(webhookSigLog);
 });
 
+// ── STACKED-QUESTION DETECTION — PHASE 1: DETECT + LOG ONLY ──
+// Two-tier, same observe-mode discipline as the AiSensy signature work:
+// this NEVER touches what the customer receives (runs after the reply is
+// already sent — see the call site in mayaTurn, well after "SEND FIRST").
+// Purely gathers real data on how often stacking actually happens and how
+// reliable Tier 1 is, so Phase 2 (enforcement) is a deliberate decision
+// made from evidence, not a guess.
+//
+// TIER 1 (free, instant, always runs): a hand-tuned heuristic built from
+// today's real audit evidence, not a generic NLP attempt. Known limitation,
+// stated plainly: this is deliberately imprecise — it exists to cheaply
+// narrow down candidates for Tier 2, not to be the final word. Do not treat
+// a Tier-1-only flag as confirmed; that's exactly why Tier 2 exists.
+const QUESTION_WORDS_RE = /\b(when|where|who|why|how|what|which)\b/g;
+const STACKED_FIELD_WORDS = ['name','phone','number','whatsapp','budget','month','date','dates','day','days','night','nights','people','pax','traveller','travellers','city','destination','style','category','preference','class','duration'];
+
+function tier1StackedQuestionCheck(replyText) {
+  const text = String(replyText || '');
+  const qMarks = (text.match(/\?/g) || []).length;
+  if (qMarks === 0) return { flagged: false, reason: 'no question marks' };
+  if (qMarks >= 2) return { flagged: true, reason: `${qMarks} question marks in one reply` };
+
+  // Exactly one '?' — the common real-world shape ("...and how many people
+  // will be going?") is grammatically ONE sentence with a compound ask, so
+  // question-mark counting alone would miss it. Isolate the sentence
+  // carrying that '?' and look for compound-ask signals within it.
+  const sentenceMatch = text.match(/([^.!?]*\?)\s*$/);
+  const sentence = (sentenceMatch ? sentenceMatch[1] : text).toLowerCase();
+
+  const qWordHits = sentence.match(QUESTION_WORDS_RE) || [];
+  if (qWordHits.length >= 2) return { flagged: true, reason: `repeated question words in one sentence: ${qWordHits.join(', ')}` };
+
+  const hasConjunction = /,\s*(and\s+)?|\band\s+/.test(sentence);
+  if (hasConjunction) {
+    const fieldHits = STACKED_FIELD_WORDS.filter(w => sentence.includes(w));
+    if (fieldHits.length >= 2) return { flagged: true, reason: `conjunction + multiple field words: ${fieldHits.join(', ')}` };
+  }
+  return { flagged: false, reason: 'single clean question' };
+}
+
+// TIER 2 (cheap, conditional — only runs when Tier 1 flags something):
+// asks the same cheap chat model a tiny, focused yes/no question, capped
+// at 5 output tokens to keep this fast and near-free. Only incurred on the
+// minority of turns Tier 1 already suspects, not on every message.
+async function tier2ConfirmStackedQuestion(replyText) {
+  try {
+    const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: CHAT_MODEL,
+        max_tokens: 5,
+        system: 'You check WhatsApp messages for one specific rule violation: does this message ask the reader more than one distinct question that each need a separate answer? A single question offering a choice between two named options (e.g. "Dubai or Kazakhstan?") counts as ONE question, not two. Reply with exactly one word: YES or NO.',
+        messages: [{ role: 'user', content: String(replyText || '') }]
+      })
+    }, 'Tier2-stacked-question-check');
+    if (!r.ok) return { checked: false, reason: `HTTP ${r.status}` };
+    const d = await r.json();
+    const text = (d.content || []).map(b => b.text || '').join('').trim().toUpperCase();
+    return { checked: true, verdict: text.startsWith('YES') ? 'YES' : (text.startsWith('NO') ? 'NO' : `UNCLEAR:${text}`) };
+  } catch (e) {
+    return { checked: false, reason: e.message };
+  }
+}
+
+// Ring buffer sized larger than the signature log — expected higher volume,
+// and entries here carry full reply text specifically so a human can
+// review a real sample later and judge Tier 1's actual false-positive rate
+// themselves, not just trust the flag count.
+const stackedQuestionLog = [];
+function recordStackedQuestionCheck(entry) {
+  stackedQuestionLog.unshift({ at: new Date().toISOString(), ...entry });
+  if (stackedQuestionLog.length > 200) stackedQuestionLog.length = 200;
+}
+
+// Fire-and-forget — called well after the customer's reply is already sent
+// (see call site in mayaTurn). Never awaited by anything customer-facing,
+// never alters chat.msgs, never touches the reply itself. Tier 2 only
+// spends real API cost on the subset Tier 1 already flags.
+async function checkStackedQuestionAsync(replyText, phone, channel) {
+  try {
+    const tier1 = tier1StackedQuestionCheck(replyText);
+    const entry = { phone, channel, reply: replyText, tier1Flagged: tier1.flagged, tier1Reason: tier1.reason, tier2Triggered: false };
+    if (tier1.flagged) {
+      const tier2 = await tier2ConfirmStackedQuestion(replyText);
+      entry.tier2Triggered = true;
+      entry.tier2 = tier2;
+      console.log(`❓ [stacked-question] phone:${phone} tier1:FLAGGED (${tier1.reason}) tier2:${tier2.checked ? tier2.verdict : `CHECK-FAILED(${tier2.reason})`}`);
+    }
+    recordStackedQuestionCheck(entry);
+  } catch (e) {
+    console.error('checkStackedQuestionAsync error:', e.message);
+  }
+}
+
+app.get('/debug/stacked-question-log', (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json(stackedQuestionLog);
+});
+
 const OPEN_STATUSES = "(new,called,quoted,follow-up,followup)"; // adjust if your CRM uses different status strings
 
 // Count leads for one assignee by status bucket.
@@ -1879,6 +1979,13 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     }
     chat.phone = effectivePhone;
     chat.known.phone = effectivePhone;
+
+    // Fire-and-forget, detection/logging only — customer already has their
+    // reply (see "SEND FIRST" above), this cannot delay or alter it. Skip
+    // the generic fallback text, nothing to learn from checking that.
+    if (reply !== FALLBACK_REPLY) {
+      checkStackedQuestionAsync(reply, effectivePhone, channel).catch(() => {});
+    }
 
     // ── LEAD CAPTURE (background from customer's perspective) ──
     if ((parsed.ready || parsed.handover) && validPhone(effectivePhone)) {

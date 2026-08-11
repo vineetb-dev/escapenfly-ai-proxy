@@ -1639,20 +1639,33 @@ function tier1aVisaClaimCheck(replyText) {
   return { flagged: false, reason: 'no tier1a match' };
 }
 
-// Layer 1b (free, instant): just "does the word visa/esta/e-visa appear at
-// all" — deliberately loose. Tier 1a already handles the clear-cut cases;
-// this only decides whether Tier 2 is worth calling for the ambiguous
-// remainder. If this is false, skip Tier 2 entirely (near-impossible to make
-// a visa claim without visa vocabulary).
-function tier1bHasVisaSignal(replyText) {
-  return /\bvisa\b|\bevisa\b|\be-visa\b|\besta\b/i.test(String(replyText || ''));
-}
+// Layer 1b — REMOVED (11 Aug 2026, after a real miss). It used to gate Tier
+// 2 behind a loose "does the word visa/esta/e-visa appear anywhere"
+// keyword check, on the theory that you can't make a visa claim without
+// visa vocabulary. A real reply proved that false: "you'll need an eTA
+// (Electronic Travel Authorization)" for Canada is a specific, wrong
+// category claim that names no visa-family word at all — it only happened
+// to also contain the word "visa" elsewhere in the same message (a
+// coincidental comparison, "...simpler than a traditional visa"), which is
+// what let it reach Tier 2 at all; a differently-phrased version without
+// that aside would have skipped Tier 2 entirely. Given Layer 0 has already
+// established there's no verified data to fall back on — the actual risk
+// condition — gating Tier 2 behind a keyword guess added a blind spot for
+// every travel-authorization scheme name (ETIAS, NZeTA, K-ETA, "travel
+// authorization", "pre-clearance", ...) without adding real savings. Tier 2
+// now runs on every reply that reaches this point, full stop.
 
-// Layer 2 — cheap confirming call, only reached on a Tier 1b hit with no
-// Tier 1a match (the genuinely ambiguous middle ground: could be a
-// compliant deferral, or a claim phrased to dodge the regex). Short timeout
-// so a hung call can't stall the reply-first path — see the fail-closed
-// handling at the call site.
+// Layer 2 — cheap confirming call, now the sole gate after Tier 1a (the
+// genuinely ambiguous-or-uncovered remainder: could be a compliant
+// deferral, or a claim phrased to dodge both Tier 1a's regex and any
+// specific scheme-name vocabulary). Short timeout so a hung call can't
+// stall the reply-first path — see the fail-closed handling at the call
+// site. Prompt broadened (11 Aug 2026) after the eTA miss: the category
+// list is now open-ended rather than 4 enumerated types (a literal-minded
+// classifier was very plausibly reading "eTA" as not matching any of the
+// 4 named options), and the reply is explicitly scored on its WORST part,
+// not overall tone — a reply with one unhedged claim is a violation even
+// if it also contains a correctly-hedged sentence elsewhere.
 async function tier2ConfirmVisaClaim(replyText) {
   try {
     const controller = new AbortController();
@@ -1663,7 +1676,7 @@ async function tier2ConfirmVisaClaim(replyText) {
       body: JSON.stringify({
         model: CHAT_MODEL,
         max_tokens: 10,
-        system: 'You check a travel consultant\'s WhatsApp/chat reply for one specific rule violation: does this reply state or clearly imply a SPECIFIC visa category (visa-free / e-visa / visa-on-arrival / visa required), a SPECIFIC fee amount, or a SPECIFIC processing/appointment timeframe, presented AS IF it were a confirmed, current fact? Properly hedged/deferred language (e.g. "let me verify", "our expert will confirm the exact fee/requirement") is NOT a violation, even if it mentions visas. Reply with exactly one word: YES (violates) or NO (compliant).',
+        system: 'You check a travel consultant\'s WhatsApp/chat reply for one specific rule violation: does ANY part of this reply state or clearly imply a SPECIFIC visa or entry-authorization requirement as a confirmed, current fact? This includes: a specific category or named scheme (visa-free, e-visa, visa-on-arrival, a full visa requirement, OR any named travel-authorization/pre-clearance scheme such as eTA, ETIAS, ESTA, K-ETA, NZeTA, or similar — the category list is illustrative, not exhaustive: judge the CONCEPT "what specific entry requirement applies", not just these exact words), a SPECIFIC fee amount, or a SPECIFIC processing/appointment timeframe. Judge the reply by its WORST part: if even ONE sentence states something specific as fact, the reply is a violation — even if OTHER sentences in the SAME reply are correctly hedged ("let me verify", "our expert will confirm the exact fee"). Only answer NO if NO part of the reply makes any such specific claim. Reply with exactly one word: YES (violates) or NO (compliant).',
         messages: [{ role: 'user', content: String(replyText || '') }]
       }),
       signal: controller.signal
@@ -1718,7 +1731,9 @@ async function applyVisaSafetyBackstop(reply, hadVerifiedVisaData, destinationLa
     console.log(`🛑 [visa-safety] BLOCKED (tier1a: ${tier1a.reason}) [${phone}]`);
     return substitute;
   }
-  if (!tier1bHasVisaSignal(reply)) return reply; // no visa vocabulary at all — nothing plausible to check further
+  // No keyword pre-filter here anymore — see the removal note above
+  // tier2ConfirmVisaClaim. Layer 0 already established there's no verified
+  // data; Tier 2 runs unconditionally on whatever Tier 1a didn't block.
   const tier2 = await tier2ConfirmVisaClaim(reply);
   if (!tier2.checked || tier2.verdict !== 'NO') {
     // Fail CLOSED on error/timeout/unclear, not open — given the stakes, an

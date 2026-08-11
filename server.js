@@ -624,9 +624,30 @@ async function allVisaIntelDestinationKeyMatches(text) {
 // Explicit column allowlist on every write — consultant_tips is FOUNDER-
 // AUTHORED ONLY and must never appear here, on any code path that reaches
 // this function (monthly refresh or on-demand lookup alike).
+//
+// NEVER-DOWNGRADE GUARD (added 11 Aug 2026, after a real incident): a
+// 'needs_refresh' result — from a duplicate/overlapping refresh run hitting
+// web_search rate limits — silently overwrote uk's complete 'verified' row
+// (fee, processing time, full document list) with an incomplete one. A
+// non-'verified' result is now refused as a WRITE whenever an existing
+// 'verified' row is already in place — the good data survives a failed
+// re-verification attempt instead of being clobbered by it. A 'verified'
+// result can always overwrite anything (that's the whole point of the
+// refresh job keeping data current); only a downgrade is blocked.
+// Returns { ok, skipped, reason? } rather than a bare boolean so callers can
+// log/report the skip distinctly from a genuine write failure.
 async function upsertVisaIntelligence(destinationKey, fields) {
   const VALID_REQ = ['visa-free', 'evisa', 'visa-on-arrival', 'embassy-visa-required', 'unclear'];
   const VALID_ENTRY = ['single', 'multiple'];
+  const incomingConfidence = fields.data_confidence === 'verified' ? 'verified' : 'needs_refresh';
+
+  if (incomingConfidence !== 'verified') {
+    const existing = await loadVisaIntelligence(destinationKey);
+    if (existing && existing.data_confidence === 'verified') {
+      return { ok: false, skipped: true, reason: `refused to downgrade existing verified row with a ${incomingConfidence} result` };
+    }
+  }
+
   const nowIso = new Date().toISOString();
   const payload = {
     destination_country: destinationKey,
@@ -636,7 +657,7 @@ async function upsertVisaIntelligence(destinationKey, fields) {
     validity: fields.validity || null,
     entry_type: VALID_ENTRY.includes(fields.entry_type) ? fields.entry_type : null,
     estimated_fee: fields.estimated_fee || null,
-    data_confidence: fields.data_confidence === 'verified' ? 'verified' : 'needs_refresh',
+    data_confidence: incomingConfidence,
     last_updated: nowIso,
     source_notes: fields.source_notes ? cap(fields.source_notes, 500) : null,
     updated_at: nowIso
@@ -647,12 +668,12 @@ async function upsertVisaIntelligence(destinationKey, fields) {
       headers: { ...SB_HEADERS, 'Prefer': 'resolution=merge-duplicates,return=minimal' },
       body: JSON.stringify(payload)
     }, 'SB-upsertVisaIntel');
-    if (!r.ok) { console.error('upsertVisaIntelligence failed:', r.status, await r.text()); return false; }
+    if (!r.ok) { console.error('upsertVisaIntelligence failed:', r.status, await r.text()); return { ok: false, skipped: false, reason: `HTTP ${r.status}` }; }
     visaIntelKeyListCache = { keys: null, fetchedAt: 0 }; // invalidate — a new destination may have just been added
-    return true;
+    return { ok: true, skipped: false };
   } catch (e) {
     console.error('upsertVisaIntelligence error:', e.message);
-    return false;
+    return { ok: false, skipped: false, reason: e.message };
   }
 }
 
@@ -1377,6 +1398,21 @@ app.get('/debug/visa-refresh-log', (req, res) => {
   res.json(visaRefreshLog);
 });
 
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Shared with the on-demand path (triggerVisaLookupAsync) — a destination
+// refreshed more recently than this is skipped rather than reprocessed.
+// Real incident (11 Aug 2026): two overlapping runs of this exact job both
+// started from the top of the seed list, each redoing uk/usa before this
+// existed — this is fix #2 of that incident, independent of fix #1 (the
+// concurrency lock on the endpoint itself), so a duplicate run converges to
+// a no-op on anything just-refreshed instead of racing it.
+const VISA_REFRESH_COOLDOWN_MS = 10 * 60 * 1000;
+// Fix #4 of the same incident: a real pacing delay between destinations —
+// back-to-back web-search-grounded calls across 20 destinations were
+// hitting rate limits, which is very likely why most of them landed as
+// 'needs_refresh' rather than 'verified' on the first run.
+const VISA_REFRESH_PACING_MS = 8000;
+
 // Sequential, not Promise.all — this runs monthly, not latency-sensitive,
 // and sequential avoids bursting rate limits across 20 back-to-back
 // web-search-grounded calls.
@@ -1385,32 +1421,50 @@ async function refreshAllVisaIntelligence() {
   for (const dest of VISA_INTEL_SEED_DESTINATIONS) {
     try {
       const before = await loadVisaIntelligence(dest);
+      if (before && before.last_updated && (Date.now() - new Date(before.last_updated).getTime()) < VISA_REFRESH_COOLDOWN_MS) {
+        recordVisaRefresh({ destination: dest, trigger: 'monthly-refresh', ok: true, skipped: true, reason: 'refreshed within the last 10 minutes — skipping', before });
+        results.push({ destination: dest, ok: true, skipped: true });
+        continue;
+      }
       const fields = await synthesizeVisaIntelligence(dest);
       if (!fields) {
         recordVisaRefresh({ destination: dest, trigger: 'monthly-refresh', ok: false, reason: 'synthesis failed', before });
         results.push({ destination: dest, ok: false });
-        continue;
+      } else {
+        const upsertResult = await upsertVisaIntelligence(dest, fields);
+        recordVisaRefresh({ destination: dest, trigger: 'monthly-refresh', ok: upsertResult.ok, skipped: upsertResult.skipped, reason: upsertResult.reason, before, after: fields });
+        results.push({ destination: dest, ok: upsertResult.ok, skipped: upsertResult.skipped, data_confidence: fields.data_confidence });
       }
-      const ok = await upsertVisaIntelligence(dest, fields);
-      recordVisaRefresh({ destination: dest, trigger: 'monthly-refresh', ok, before, after: fields });
-      results.push({ destination: dest, ok, data_confidence: fields.data_confidence });
     } catch (e) {
       console.error(`refreshAllVisaIntelligence error for ${dest}:`, e.message);
       recordVisaRefresh({ destination: dest, trigger: 'monthly-refresh', ok: false, reason: e.message });
       results.push({ destination: dest, ok: false });
     }
+    await sleep(VISA_REFRESH_PACING_MS);
   }
   return results;
 }
 
+// Concurrency lock — fix #1 of the 11 Aug 2026 incident. A second trigger
+// while one is already in flight is REJECTED (409), not queued or raced —
+// simple in-memory flag, sufficient for a single-instance Render deployment
+// and a job that's only ever triggered manually or by one external cron.
+let visaRefreshInProgress = false;
 app.post('/cron/visa-intelligence-refresh', async (req, res) => {
   if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  if (visaRefreshInProgress) {
+    console.log('🔒 [visa-refresh] rejected — a refresh is already in progress');
+    return res.status(409).json({ ok: false, error: 'a visa-intelligence refresh is already in progress; try again once it completes' });
+  }
+  visaRefreshInProgress = true;
   try {
     const results = await refreshAllVisaIntelligence();
     res.json({ ok: true, count: results.length, results });
   } catch (e) {
     console.error('visa-intelligence-refresh cron error:', e.message);
     res.status(500).json({ error: e.message });
+  } finally {
+    visaRefreshInProgress = false;
   }
 });
 
@@ -1432,9 +1486,9 @@ async function triggerVisaLookupAsync(destinationKey, phone, channel) {
       recordVisaRefresh({ destination: destinationKey, trigger: 'on-demand', ok: false, reason: 'synthesis failed', phone, channel });
       return;
     }
-    const ok = await upsertVisaIntelligence(destinationKey, fields);
-    recordVisaRefresh({ destination: destinationKey, trigger: 'on-demand', ok, after: fields, phone, channel });
-    if (ok && fields.data_confidence === 'verified' && validPhone(phone)) {
+    const upsertResult = await upsertVisaIntelligence(destinationKey, fields);
+    recordVisaRefresh({ destination: destinationKey, trigger: 'on-demand', ok: upsertResult.ok, skipped: upsertResult.skipped, reason: upsertResult.reason, after: fields, phone, channel });
+    if (upsertResult.ok && fields.data_confidence === 'verified' && validPhone(phone)) {
       const msg = formatVisaFollowUpMessage(destinationKey, fields);
       if (msg) await sendSessionMessage(phone, msg);
     }

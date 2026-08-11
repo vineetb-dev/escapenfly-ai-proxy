@@ -1460,6 +1460,156 @@ function formatVisaFollowUpMessage(destinationKey, fields) {
   return msg;
 }
 
+// ── VISA SAFETY BACKSTOP — code-level, BLOCKS and substitutes (not log-only) ──
+// Direct response to the CHAT_CORE banner rule not holding reliably on real
+// traffic even after elevation (UK/Dubai/Thailand/USA replays on 7 Aug 2026
+// still stated unverified category/fee/timing claims). Runs synchronously on
+// the REPLY-FIRST path, BEFORE onReply — unlike checkStackedQuestionAsync,
+// which is log-only and runs after send, this one can change what the
+// customer receives. Deliberately narrow in scope (category/fee/processing-
+// time only, matching exactly what the CHAT_CORE banner promises) so the
+// prompt rule and this backstop can never silently drift apart.
+//
+// Layer 0 (free, deterministic — no text analysis): only runs at all when no
+// verified visa_intelligence row existed this turn. If one did, a confident
+// claim is legitimate and this whole block is skipped. Computed by the
+// caller (mayaTurn) from the same visaIntelList already loaded for the
+// prompt — no extra DB call.
+//
+// Layer 1a (free, instant): unambiguous phrases that essentially cannot
+// appear in a compliant reply — auto-blocks with zero LLM dependency.
+// Validated 7/7 against every real violation observed in today's replays,
+// 0/7 false positives against compliant replies (see
+// scratchpad/test-visa-safety-tiers.js — kept as the source of truth for
+// these patterns; update both together if either changes).
+const TIER1A_CATEGORY_RE = [
+  /\b(don'?t|do not|won'?t|will not)\s+need\s+(a|any)\s+(e[\s-]?visa|visa)\b/i,
+  /\bvisa[\s-]*free\b/i,
+  /\bno\s+visa\s+(is\s+)?required\b/i,
+  /\bvisa[\s-]*on[\s-]*arrival\b/i,
+  /\b(you'?ll|you will|you'?d|customers?|travellers?|applicants?)\s+(both\s+|all\s+)?(will\s+)?need\s+.{0,40}\bvisas?\b/i,
+  /\bvisa\s+(is\s+)?required\b/i,
+  /\brequires?\s+.{0,20}\bvisas?\b/i
+];
+const TIER1A_FEE_RE = /(₹|\$|£|€)\s?\d[\d,]*.{0,30}\bvisa\b|\bvisa\b.{0,30}(₹|\$|£|€)\s?\d[\d,]*|\b(USD|INR|EUR|GBP)\s?\d[\d,]*.{0,30}\bvisa\b|\bvisa\b.{0,30}\b(USD|INR|EUR|GBP)\s?\d[\d,]*/i;
+const TIMING_NUMBER_RE = /\b\d+\+?\s*(day|days|week|weeks|month|months)\b/i;
+// Prefix-matched (process/processed/processing, appoint/appointment) rather
+// than exact \bword\b — \bprocess\b alone does not match "processed".
+const TIMING_CONTEXT_RE = /\b(process\w*|appoint\w*|interview\w*|wait\w*|turnaround|slot\w*)\b/i;
+function splitSentences(text) { return String(text || '').split(/(?<=[.!?])\s+/); }
+
+function tier1aVisaClaimCheck(replyText) {
+  const text = String(replyText || '');
+  for (const re of TIER1A_CATEGORY_RE) {
+    if (re.test(text)) return { flagged: true, reason: `category phrase: ${re}` };
+  }
+  if (TIER1A_FEE_RE.test(text)) return { flagged: true, reason: 'fee amount near "visa"' };
+  // Timing is sentence-scoped: requires BOTH a day/week/month count AND a
+  // process/appointment/interview/wait word in the SAME sentence — avoids
+  // false-triggering on an unrelated "passport valid for 6 months" mention
+  // elsewhere in an otherwise-compliant reply.
+  for (const s of splitSentences(text)) {
+    if (TIMING_NUMBER_RE.test(s) && TIMING_CONTEXT_RE.test(s)) {
+      return { flagged: true, reason: `timing claim: "${s.trim().slice(0, 120)}"` };
+    }
+  }
+  return { flagged: false, reason: 'no tier1a match' };
+}
+
+// Layer 1b (free, instant): just "does the word visa/esta/e-visa appear at
+// all" — deliberately loose. Tier 1a already handles the clear-cut cases;
+// this only decides whether Tier 2 is worth calling for the ambiguous
+// remainder. If this is false, skip Tier 2 entirely (near-impossible to make
+// a visa claim without visa vocabulary).
+function tier1bHasVisaSignal(replyText) {
+  return /\bvisa\b|\bevisa\b|\be-visa\b|\besta\b/i.test(String(replyText || ''));
+}
+
+// Layer 2 — cheap confirming call, only reached on a Tier 1b hit with no
+// Tier 1a match (the genuinely ambiguous middle ground: could be a
+// compliant deferral, or a claim phrased to dodge the regex). Short timeout
+// so a hung call can't stall the reply-first path — see the fail-closed
+// handling at the call site.
+async function tier2ConfirmVisaClaim(replyText) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: CHAT_MODEL,
+        max_tokens: 10,
+        system: 'You check a travel consultant\'s WhatsApp/chat reply for one specific rule violation: does this reply state or clearly imply a SPECIFIC visa category (visa-free / e-visa / visa-on-arrival / visa required), a SPECIFIC fee amount, or a SPECIFIC processing/appointment timeframe, presented AS IF it were a confirmed, current fact? Properly hedged/deferred language (e.g. "let me verify", "our expert will confirm the exact fee/requirement") is NOT a violation, even if it mentions visas. Reply with exactly one word: YES (violates) or NO (compliant).',
+        messages: [{ role: 'user', content: String(replyText || '') }]
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (!r.ok) return { checked: false, reason: `HTTP ${r.status}` };
+    const d = await r.json();
+    const text = (d.content || []).map(b => b.text || '').join('').trim().toUpperCase();
+    return { checked: true, verdict: text.startsWith('YES') ? 'YES' : (text.startsWith('NO') ? 'NO' : `UNCLEAR:${text}`) };
+  } catch (e) {
+    return { checked: false, reason: e.name === 'AbortError' ? 'timeout' : e.message };
+  }
+}
+
+// Deliberately short and generic — does NOT try to reconstruct whatever
+// qualifying question or itinerary content was in the blocked reply (that
+// content is discarded). Per explicit product decision: this path should be
+// rare, a visibly-different reply is itself a useful signal for later
+// spot-checks, and reconstructing the rest via a second Claude call would
+// add real REPLY-FIRST latency to smooth every block. Opens with the exact
+// mandated sentence from the CHAT_CORE banner rule, so behavior stays
+// consistent with what the prompt claims Maya does.
+function buildVisaSafetySubstitute(destinationLabel) {
+  const destPart = destinationLabel ? ` for ${destinationLabel}` : '';
+  return `Let me verify the latest visa requirement${destPart} before I advise you on that specifically — I don't want to give you incorrect details. I'll get our expert to confirm the exact requirement, fee, and timing for you.`;
+}
+
+// Ring buffer — same self-verifiable-without-Render-logs pattern as every
+// other detector today. Records the ORIGINAL (blocked) reply text alongside
+// the substitution, specifically so the false-positive rate can be judged
+// from real traffic, not assumed from the local test set alone.
+const visaSafetyBlockLog = [];
+function recordVisaSafetyBlock(entry) {
+  visaSafetyBlockLog.unshift({ at: new Date().toISOString(), ...entry });
+  if (visaSafetyBlockLog.length > 100) visaSafetyBlockLog.length = 100;
+}
+app.get('/debug/visa-safety-block-log', (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json(visaSafetyBlockLog);
+});
+
+// Orchestrator — called synchronously from mayaTurn, BEFORE onReply. Returns
+// the reply to actually send (either the original, unchanged, or the
+// substitute). hadVerifiedVisaData is computed by the caller from the same
+// visaIntelList already loaded for this turn's prompt (Layer 0).
+async function applyVisaSafetyBackstop(reply, hadVerifiedVisaData, destinationLabel, phone, channel) {
+  if (hadVerifiedVisaData) return reply; // verified data existed — a confident claim is legitimate, nothing to check
+  const tier1a = tier1aVisaClaimCheck(reply);
+  if (tier1a.flagged) {
+    const substitute = buildVisaSafetySubstitute(destinationLabel);
+    recordVisaSafetyBlock({ tier: '1a', reason: tier1a.reason, original: reply, substitute, destination: destinationLabel, phone, channel });
+    console.log(`🛑 [visa-safety] BLOCKED (tier1a: ${tier1a.reason}) [${phone}]`);
+    return substitute;
+  }
+  if (!tier1bHasVisaSignal(reply)) return reply; // no visa vocabulary at all — nothing plausible to check further
+  const tier2 = await tier2ConfirmVisaClaim(reply);
+  if (!tier2.checked || tier2.verdict !== 'NO') {
+    // Fail CLOSED on error/timeout/unclear, not open — given the stakes, an
+    // infra hiccup should produce an occasional unnecessary "let me verify"
+    // rather than risk an unverified claim reaching the customer undetected.
+    const substitute = buildVisaSafetySubstitute(destinationLabel);
+    const reason = tier2.checked ? `tier2 confirmed: ${tier2.verdict}` : `tier2 check failed (${tier2.reason}) — failing closed`;
+    recordVisaSafetyBlock({ tier: tier2.checked ? '2' : '2-failclosed', reason, original: reply, substitute, destination: destinationLabel, phone, channel });
+    console.log(`🛑 [visa-safety] BLOCKED (${reason}) [${phone}]`);
+    return substitute;
+  }
+  return reply;
+}
+
 const OPEN_STATUSES = "(new,called,quoted,follow-up,followup)"; // adjust if your CRM uses different status strings
 
 // Count leads for one assignee by status bucket.
@@ -2259,7 +2409,17 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       return FALLBACK_REPLY;
     }
 
-    const reply = parsed.reply || FALLBACK_REPLY;
+    let reply = parsed.reply || FALLBACK_REPLY;
+
+    // ── VISA SAFETY BACKSTOP — runs BEFORE send, unlike every other check in
+    // this function. See applyVisaSafetyBackstop's own comment block for the
+    // full design; hadVerifiedVisaData reuses the same visaIntelList already
+    // loaded for this turn's prompt (Layer 0), no extra DB call.
+    if (reply !== FALLBACK_REPLY) {
+      const hadVerifiedVisaData = visaIntelList.some(vi => vi.data_confidence === 'verified' && vi.visa_requirement && vi.visa_requirement !== 'unclear');
+      const destinationLabel = parsed.lead?.destination || visaDestKeys[0] || chat.known?.destination || '';
+      reply = await applyVisaSafetyBackstop(reply, hadVerifiedVisaData, destinationLabel, phone, channel); // effectivePhone isn't resolved yet at this point in the turn — phone is the correct value pre-send
+    }
 
     // ══ SEND FIRST — customer waits for nothing below this line ══
     if (onReply) await onReply(reply);

@@ -621,6 +621,26 @@ async function allVisaIntelDestinationKeyMatches(text) {
   return ordered.slice(0, MAX_MULTI_DESTINATIONS);
 }
 
+// Guards against the model itself writing garbage/placeholder text into a
+// field instead of following the schema's "empty string if not found"
+// instruction — real cases seen in the wild: the literal string
+// "needs_refresh_placeholder", and a malformed value that's nothing but
+// escaped/literal quote characters (e.g. '""') left over from the model
+// half-encoding "empty" rather than actually returning an empty string.
+// Strips quote characters before checking emptiness (catches the second
+// case), then checks a blocklist of placeholder-ish tokens (catches the
+// first). Applied to every free-text field on every write — this is the
+// real enforcement; the system prompt asking nicely for an empty string is
+// not sufficient on its own, since this is exactly what slipped past it.
+const PLACEHOLDER_VALUE_RE = /^(needs?[\s_-]?refresh(ing)?[\s_-]?placeholder|placeholder|null|nil|none|n\/?a|tbd|unknown|pending|not[\s_-]?(available|found|confirmed|applicable))$/i;
+function sanitizeVisaTextField(value) {
+  if (typeof value !== 'string') return null;
+  const stripped = value.replace(/["'“”‘’]/g, '').trim();
+  if (!stripped) return null;
+  if (PLACEHOLDER_VALUE_RE.test(stripped)) return null;
+  return value.trim();
+}
+
 // Explicit column allowlist on every write — consultant_tips is FOUNDER-
 // AUTHORED ONLY and must never appear here, on any code path that reaches
 // this function (monthly refresh or on-demand lookup alike).
@@ -648,18 +668,21 @@ async function upsertVisaIntelligence(destinationKey, fields) {
     }
   }
 
+  const sanitizedDocs = Array.isArray(fields.documents_required)
+    ? fields.documents_required.map(sanitizeVisaTextField).filter(Boolean)
+    : [];
   const nowIso = new Date().toISOString();
   const payload = {
     destination_country: destinationKey,
     visa_requirement: VALID_REQ.includes(fields.visa_requirement) ? fields.visa_requirement : 'unclear',
-    processing_time: fields.processing_time || null,
-    documents_required: Array.isArray(fields.documents_required) && fields.documents_required.length ? fields.documents_required : null,
-    validity: fields.validity || null,
+    processing_time: sanitizeVisaTextField(fields.processing_time),
+    documents_required: sanitizedDocs.length ? sanitizedDocs : null,
+    validity: sanitizeVisaTextField(fields.validity),
     entry_type: VALID_ENTRY.includes(fields.entry_type) ? fields.entry_type : null,
-    estimated_fee: fields.estimated_fee || null,
+    estimated_fee: sanitizeVisaTextField(fields.estimated_fee),
     data_confidence: incomingConfidence,
     last_updated: nowIso,
-    source_notes: fields.source_notes ? cap(fields.source_notes, 500) : null,
+    source_notes: (() => { const s = sanitizeVisaTextField(fields.source_notes); return s ? cap(s, 500) : null; })(),
     updated_at: nowIso
   };
   try {
@@ -1339,8 +1362,54 @@ const VISA_INTEL_TOOL = {
   }
 };
 
+// Sanitizes the free-text fields of a visa_intelligence_result tool call
+// before they reach either write path — the DB upsert (upsertVisaIntelligence)
+// or the customer-facing WhatsApp follow-up (formatVisaFollowUpMessage).
+// Both read from synthesizeVisaIntelligence's return value below, never from
+// the raw tool_use input directly, so sanitizing once here covers both at
+// once (same "one function" principle as the rest of this module).
+//
+// Real incident (11 Aug 2026 recovery-check run): the model, when it had
+// nothing confident to report, sometimes wrote non-empty junk text instead
+// of the true empty string the schema promises ("empty string if not
+// confidently found") — e.g. new zealand's processing_time came back as the
+// literal string "needs_refresh_placeholder" and its source_notes as the
+// literal string "placeholder", and japan's estimated_fee came back as the
+// literal two-character string `""` (a stray quoted-empty-string artifact,
+// not an actual empty string). Nothing previously enforced that promise —
+// `fields.x || null` in upsertVisaIntelligence only catches JS-falsy values,
+// so any non-empty junk string sailed straight through into the database
+// (and would have sailed into a customer message too, had confidence been
+// 'verified'). Both symptoms share one root cause — an unconfirmed field
+// rendered as visible junk instead of a true empty value — even though the
+// exact junk text differs, so one filter here covers both.
+function sanitizeVisaText(value) {
+  if (typeof value !== 'string') return null;
+  let v = value.trim();
+  // Strip repeated layers of literal wrapping quote characters, e.g. the
+  // two-character string `""` or `''` (handles doubled/stray encoding).
+  while (v.length >= 2 && ((v[0] === '"' && v[v.length - 1] === '"') || (v[0] === "'" && v[v.length - 1] === "'"))) {
+    v = v.slice(1, -1).trim();
+  }
+  if (!v) return null;
+  if (/placeholder/i.test(v)) return null; // internal marker text leaking into a real field — never real visa data
+  return v;
+}
+function sanitizeVisaFields(input) {
+  return {
+    ...input,
+    processing_time: sanitizeVisaText(input.processing_time),
+    estimated_fee: sanitizeVisaText(input.estimated_fee),
+    validity: sanitizeVisaText(input.validity),
+    source_notes: sanitizeVisaText(input.source_notes),
+    documents_required: Array.isArray(input.documents_required)
+      ? input.documents_required.map(sanitizeVisaText).filter(Boolean)
+      : input.documents_required
+  };
+}
+
 async function synthesizeVisaIntelligence(destinationKey) {
-  const system = `You are a meticulous research assistant producing CURRENT, VERIFIED tourist-visa facts for Indian passport holders travelling to ${destinationKey}. Use the web_search tool to check OFFICIAL PRIMARY SOURCES ONLY: the destination's government immigration/foreign-affairs website, its embassy or consulate site, or its official e-visa portal. Do NOT use, cite, or rely on any travel agency, visa consultancy, or third-party aggregator site — this specifically excludes VisaHQ, iVisa, Sherpa, and any similar service, even if one appears prominently in search results. If you cannot find or confidently confirm a field from an official source, leave it empty (or use 'unclear' for the category) and set data_confidence to 'needs_refresh' rather than guessing. Once you have gathered enough information — or determined you cannot confirm a field — call the visa_intelligence_result tool with your findings. Do not respond with plain text.`;
+  const system = `You are a meticulous research assistant producing CURRENT, VERIFIED tourist-visa facts for Indian passport holders travelling to ${destinationKey}. Use the web_search tool to check OFFICIAL PRIMARY SOURCES ONLY: the destination's government immigration/foreign-affairs website, its embassy or consulate site, or its official e-visa portal. Do NOT use, cite, or rely on any travel agency, visa consultancy, or third-party aggregator site — this specifically excludes VisaHQ, iVisa, Sherpa, and any similar service, even if one appears prominently in search results. If you cannot find or confidently confirm a field from an official source, that field's value MUST be a genuinely empty string ('') — never a placeholder word, never text describing your uncertainty, never a quote character or anything else standing in for "unknown". An empty string is the only correct way to say a field wasn't found (use 'unclear' only for the visa_requirement category specifically); set data_confidence to 'needs_refresh' in that case rather than guessing. Once you have gathered enough information — or determined you cannot confirm a field — call the visa_intelligence_result tool with your findings. Do not respond with plain text.`;
   let messages = [{ role: 'user', content: `Find current tourist visa requirements, processing time, documents required, validity, entry type, and fee for an Indian passport holder travelling to: ${destinationKey}.` }];
   const tools = [{ type: 'web_search_20260209', name: 'web_search', max_uses: 6 }, VISA_INTEL_TOOL];
   for (let round = 0; round < 4; round++) {
@@ -1358,7 +1427,7 @@ async function synthesizeVisaIntelligence(destinationKey) {
       return null;
     }
     const toolBlock = (d.content || []).find(b => b.type === 'tool_use' && b.name === 'visa_intelligence_result');
-    if (toolBlock && toolBlock.input) return toolBlock.input;
+    if (toolBlock && toolBlock.input) return sanitizeVisaFields(toolBlock.input);
     if (d.stop_reason === 'pause_turn') {
       // Server-side web_search loop hit its internal round limit — resend to
       // resume automatically (documented pattern, NOT an extra "Continue"

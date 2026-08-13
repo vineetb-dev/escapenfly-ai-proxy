@@ -1,3 +1,11 @@
+// Local dev only — Render sets real env vars directly, and dotenv never
+// overrides a var that's already set in process.env, so this is a no-op in
+// production. .env is gitignored; never commit real secrets into it.
+// quiet:true suppresses dotenv's own promotional console tip on every
+// startup (confirmed genuine — shipped in the official v17.4.2 package,
+// not a tampered dependency — but there's no reason for a third party's
+// product name showing up in this server's logs).
+require('dotenv').config({ quiet: true });
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -104,6 +112,24 @@ const ROUTING_MODEL = process.env.ROUTING_MODEL || 'claude-sonnet-4-6';
 // lookup, never on the customer-facing reply path.
 const VISA_SEARCH_MODEL = process.env.VISA_SEARCH_MODEL || 'claude-sonnet-5';
 const CRON_SECRET   = process.env.CRON_SECRET || 'change-me-please';
+// Internal costing-audit review (13 Aug 2026) — async, admin/manager-only,
+// quality over latency, so it reuses the sonnet tier already proven for
+// visa search rather than introducing a third model into this file.
+const COSTING_AUDIT_MODEL = process.env.COSTING_AUDIT_MODEL || 'claude-sonnet-5';
+// Deliberately NOT the same value as CRON_SECRET. This one is shipped into
+// escapenfly-crm's client JS (the CRM has no backend of its own — same
+// reason /ai and /notify/manual-lead below are already unauthenticated
+// today), so it must never double as the secret that gates the real
+// cron-only endpoints (daily-digest, stale-check, ...) — reusing CRON_SECRET
+// here would hand anyone reading CRM's source the ability to trigger those
+// too, not just this endpoint.
+const COSTING_AUDIT_SECRET = process.env.COSTING_AUDIT_SECRET || 'change-me-please';
+// Used ONLY for costing_audits writes (see runCostingAudit below) — never
+// wired into any other table's access. RLS is enabled on costing_audits
+// specifically so this is the one table in this project that needs it;
+// every other table's SB_KEY (anon/publishable) access is today's known,
+// separately-tracked open item.
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 const DEDUPE_MS   = 24 * 60 * 60 * 1000; // one lead per phone per 24h
 const CHAT_TTL_MS = 24 * 60 * 60 * 1000; // Maya memory window
@@ -114,6 +140,16 @@ const STALE_REALERT_HOURS = 48;          // don't re-nag about the same ongoing 
 const SB_HEADERS = {
   'apikey': SB_KEY,
   'Authorization': `Bearer ${SB_KEY}`,
+  'Content-Type': 'application/json'
+};
+// Bypasses RLS — costing_audits writes only, see SUPABASE_SERVICE_ROLE_KEY
+// above. Falls back to SB_HEADERS's (read-only-by-RLS) key if the service
+// role key isn't configured yet, so a missing env var fails loudly (every
+// insert gets rejected by RLS and logged) rather than silently using an
+// unintended identity.
+const SB_SERVICE_HEADERS = {
+  'apikey': SUPABASE_SERVICE_ROLE_KEY || SB_KEY,
+  'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY || SB_KEY}`,
   'Content-Type': 'application/json'
 };
 
@@ -1192,6 +1228,12 @@ function cronAuthOk(req) {
   const supplied = req.query.secret || req.headers['x-cron-secret'] || '';
   return CRON_SECRET && supplied === CRON_SECRET;
 }
+// Separate gate, separate secret — see COSTING_AUDIT_SECRET above for why
+// this must not share CRON_SECRET's value.
+function costingAuditAuthOk(req) {
+  const supplied = req.query.secret || req.headers['x-costing-audit-secret'] || '';
+  return COSTING_AUDIT_SECRET && supplied === COSTING_AUDIT_SECRET;
+}
 
 // ── AISENSY WEBHOOK SIGNATURE — PHASE 1: OBSERVE ONLY ──
 // Computes AiSensy's documented scheme (HMAC-SHA256 of the raw request
@@ -1716,6 +1758,20 @@ function recordVisaSafetyBlock(entry) {
 app.get('/debug/visa-safety-block-log', (req, res) => {
   if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
   res.json(visaSafetyBlockLog);
+});
+
+// Same self-verifiable-without-Render-logs ring buffer pattern as every
+// other detector in this file — records every /internal/costing-audit
+// attempt (success, skip, and failure) so the manager-facing
+// "AI costing review" feature can be checked without Render dashboard access.
+const costingAuditLog = [];
+function recordCostingAudit(entry) {
+  costingAuditLog.unshift({ at: new Date().toISOString(), ...entry });
+  if (costingAuditLog.length > 200) costingAuditLog.length = 200;
+}
+app.get('/debug/costing-audit-log', (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json(costingAuditLog);
 });
 
 // Orchestrator — called synchronously from mayaTurn, BEFORE onReply. Returns
@@ -2289,7 +2345,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotesList = [], visaIntelList = [], intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, debugRef = null) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotesList = [], visaIntelList = [], intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, debugRef = null, model = CHAT_MODEL) {
   const todayStr = new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
   const currentDateLine = `\n\nTODAY'S ACTUAL DATE: ${todayStr}. Use this to reason correctly about relative time — if a customer says a month without a year (e.g. "December"), assume the NEXT upcoming occurrence of that month from today's real date, not a past or arbitrary year. NEVER offer already-past years as options when asking a customer to confirm their travel year.`;
   const knownLine = (known && Object.values(known).some(v => v))
@@ -2369,7 +2425,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
           'anthropic-version': '2023-06-01'
         },
         body: JSON.stringify({
-          model: CHAT_MODEL,
+          model,
           max_tokens: 600,
           system: buildChatSystem(channel, intent) + currentDateLine + knownLine + founderLine + visaLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine,
           messages: msgs,
@@ -3123,18 +3179,398 @@ app.post('/webhook/website', async (req, res) => {
   }
 });
 
+// ═══════════════════ AI-ASSISTED INTERNAL COSTING AUDIT (13 Aug 2026) ═══
+// Admin/Manager only, never customer-facing, never touches a costing,
+// markup, quotation, visa record, or booking. Called fire-and-forget from
+// escapenfly-crm (its own direct Supabase writes already completed before
+// this is ever hit) after the consultant clicks "Done" on an edited costing
+// or exports the client-facing quote. See escapenfly-crm/CLAUDE.md and this
+// repo's CLAUDE.md for the full design writeup.
+//
+// Mirrors calcRow() in escapenfly-crm/index.html exactly (same GST/TCS/
+// markup formula) — keep the two in sync if that formula ever changes.
+function calcRowServer(row) {
+  const net = parseFloat(row.net) || 0, mkp = parseFloat(row.mkp) || 0, tax = row.tax || '18gst';
+  let gst = 0, tcs = 0, sell = 0, firm = 'vineet', netProfit = mkp;
+  if (tax === '18gst') { gst = Math.round(mkp * .18); tcs = 0; sell = net + mkp; netProfit = mkp - gst; firm = 'vineet'; }
+  else if (tax === '5gst5tcs') { const base = net + mkp; gst = Math.round(base * .05); tcs = Math.round(base * .02); sell = base + gst + tcs; netProfit = mkp; firm = 'vivek'; }
+  else if (tax === '5gst_corp') { const base2 = net + mkp; gst = Math.round(base2 * .05); tcs = 0; sell = base2 + gst; netProfit = mkp; firm = 'vivek'; }
+  else if (tax === '2tcs_only') { const base3 = net + mkp; gst = 0; tcs = Math.round(base3 * .02); sell = base3 + tcs; netProfit = mkp; firm = 'vivek'; }
+  else { gst = 0; tcs = 0; sell = net + mkp; netProfit = mkp; firm = 'vineet'; }
+  return { net, mkp, gst, tcs, sell, profit: netProfit, firm };
+}
+
+async function loadMarkupDefaultsForAudit() {
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/markup_defaults?select=category,percent`, { headers: SB_HEADERS }, 'SB-costAudit-markup');
+    if (!r.ok) return {};
+    const rows = await r.json();
+    const out = {};
+    rows.forEach(row => { out[row.category] = row.percent; });
+    return out;
+  } catch (e) { console.error('loadMarkupDefaultsForAudit error:', e.message); return {}; }
+}
+
+async function fetchEntityForAudit(entityType, entityId) {
+  const table = entityType === 'lead' ? 'enquiries' : 'bookings';
+  const fields = entityType === 'lead'
+    ? 'id,assigned_to_name,assigned_to_email,pax_adults,pax_children,original_message_text,cost_rows,cost_sets,history,status,enquiry_type,created_at,updated_at'
+    : 'id,assigned_to_name,assigned_to_email,destination,departure_date,return_date,nights,pax_adults,pax_children,cost_rows,cost_sets,history,service_type,created_at,updated_at';
+  const r = await fetchRetry(`${SB_URL}/rest/v1/${table}?id=eq.${entityId}&is_deleted=eq.false&select=${fields}`, { headers: SB_HEADERS }, 'SB-costAudit-fetchEntity');
+  if (!r.ok) return null;
+  const rows = await r.json();
+  return rows[0] || null;
+}
+
+// Builds the COSTING DATA grounding block from a fresh server-side fetch of
+// the entity — never trusts a client-supplied snapshot for what actually
+// gets reviewed.
+function buildCostingDataBlock(entityType, row, costSetId) {
+  const costSets = (row.cost_sets && row.cost_sets.length) ? row.cost_sets : [{ id: null, label: 'Option 1', rows: row.cost_rows || [] }];
+  const activeSet = (costSetId && costSets.find(cs => cs.id === costSetId)) || costSets[0];
+  const lineItems = (activeSet.rows || []).map(r => {
+    const c = calcRowServer(r);
+    return {
+      category: r.cat || '', vendor: r.vendor || '', details: r.details || '',
+      net: c.net, markup: c.mkp, markup_pct: c.net > 0 ? Math.round((c.mkp / c.net) * 1000) / 10 : null,
+      tax_type: r.tax || '', computed_sell: c.sell, computed_profit: c.profit
+    };
+  });
+  const totals = lineItems.reduce((a, li) => ({ net: a.net + li.net, sell: a.sell + li.computed_sell, profit: a.profit + li.computed_profit }), { net: 0, sell: 0, profit: 0 });
+
+  let destination, depDate, retDate, nights, adults, children, consultantName, consultantEmail, statusLabel;
+  if (entityType === 'lead') {
+    let ex = {};
+    try { ex = JSON.parse(row.original_message_text || '{}'); } catch (_) {}
+    destination = ex.dest || ''; depDate = ex.dep || ''; retDate = ex.ret || ''; nights = ex.nights || '';
+    adults = row.pax_adults; children = row.pax_children;
+    consultantName = row.assigned_to_name; consultantEmail = row.assigned_to_email;
+    statusLabel = row.status || '';
+  } else {
+    destination = row.destination || ''; depDate = row.departure_date || ''; retDate = row.return_date || ''; nights = row.nights || '';
+    adults = row.pax_adults; children = row.pax_children;
+    consultantName = row.assigned_to_name; consultantEmail = row.assigned_to_email;
+    statusLabel = 'booking';
+  }
+
+  return {
+    block: {
+      entity_type: entityType, consultant: { name: consultantName || '', email: consultantEmail || '' },
+      destination, dep_date: depDate || '', ret_date: retDate || '', nights: nights || '',
+      pax: { adults: adults || null, children: children || null },
+      cost_set_label: activeSet.label || '', line_items: lineItems, totals,
+      status: statusLabel, created_at: row.created_at, updated_at: row.updated_at
+    },
+    destination, consultantEmail, activeSetId: activeSet.id || null
+  };
+}
+
+// Hash covers only the content that should trigger a re-review — dates,
+// pax, and line items — deliberately excludes updated_at (which changes on
+// every unrelated field save, e.g. editing lead notes) so the dedup check
+// below only ever fires a new Claude call when the costing itself changed.
+function computeGroundingHash(costingBlock) {
+  const stable = {
+    line_items: costingBlock.line_items.map(li => ({ category: li.category, vendor: li.vendor, details: li.details, net: li.net, markup: li.markup, tax_type: li.tax_type })),
+    dep_date: costingBlock.dep_date, ret_date: costingBlock.ret_date, nights: costingBlock.nights,
+    pax: costingBlock.pax, destination: costingBlock.destination
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex');
+}
+
+function isVisaRelevantForAudit(entityRow, entityType, lineItems) {
+  const dept = (entityType === 'lead' ? entityRow.enquiry_type : entityRow.service_type) || '';
+  if (/visa/i.test(dept)) return true;
+  return lineItems.some(li => /visa/i.test(li.category || ''));
+}
+
+// "Comparable" = same assigned_to_email, exact-match destination string —
+// there is no destination taxonomy in this system, so a "Bali" vs "Bali,
+// Indonesia" typo genuinely won't match. Known limitation, not a bug.
+// Deliberately returns null (whole block omitted from grounding) below a
+// minimum sample size — per spec, this is supporting evidence only, never
+// a "score," and thin data shouldn't manufacture false confidence.
+async function computeConsultantHistory(assignedEmail, destination, excludeId) {
+  if (!assignedEmail) return null;
+  try {
+    const destKey = String(destination || '').trim().toLowerCase();
+    const [leadsR, bkR] = await Promise.all([
+      fetchRetry(`${SB_URL}/rest/v1/enquiries?is_deleted=eq.false&assigned_to_email=eq.${encodeURIComponent(assignedEmail)}&select=id,cost_rows,original_message_text&limit=50`, { headers: SB_HEADERS }, 'SB-costHist-leads'),
+      fetchRetry(`${SB_URL}/rest/v1/bookings?is_deleted=eq.false&assigned_to_email=eq.${encodeURIComponent(assignedEmail)}&select=id,cost_rows,destination&limit=50`, { headers: SB_HEADERS }, 'SB-costHist-bk')
+    ]);
+    const leads = leadsR.ok ? await leadsR.json() : [];
+    const bks = bkR.ok ? await bkR.json() : [];
+    const allRows = [];
+    leads.forEach(l => {
+      if (l.id === excludeId) return;
+      let dest = '';
+      try { dest = (JSON.parse(l.original_message_text || '{}').dest || '').trim().toLowerCase(); } catch (_) {}
+      (l.cost_rows || []).forEach(r => allRows.push({ ...r, __dest: dest }));
+    });
+    bks.forEach(b => {
+      if (b.id === excludeId) return;
+      const dest = String(b.destination || '').trim().toLowerCase();
+      (b.cost_rows || []).forEach(r => allRows.push({ ...r, __dest: dest }));
+    });
+    if (allRows.length < 3) return null;
+
+    const byCategory = {};
+    allRows.forEach(r => {
+      const c = calcRowServer(r);
+      if (c.net <= 0) return;
+      const pct = (c.mkp / c.net) * 100;
+      if (!byCategory[r.cat]) byCategory[r.cat] = [];
+      byCategory[r.cat].push(pct);
+    });
+    const avgMarkupPctByCategory = {};
+    Object.keys(byCategory).forEach(cat => {
+      const arr = byCategory[cat];
+      avgMarkupPctByCategory[cat] = Math.round((arr.reduce((s, v) => s + v, 0) / arr.length) * 10) / 10;
+    });
+
+    const destRows = destKey ? allRows.filter(r => r.__dest === destKey) : [];
+    let sellRange = null;
+    if (destRows.length) {
+      const sells = destRows.map(r => calcRowServer(r).sell).filter(v => v > 0);
+      if (sells.length) sellRange = { min: Math.min(...sells), max: Math.max(...sells), n: sells.length };
+    }
+
+    return { comparable_count: allRows.length, avg_markup_pct_by_category: avgMarkupPctByCategory, sell_price_range_for_destination: sellRange };
+  } catch (e) {
+    console.error('computeConsultantHistory error:', e.message);
+    return null;
+  }
+}
+
+// Drops any flag whose evidence is empty or looks like placeholder junk —
+// same discipline as sanitizeVisaFields() above, applied to a new field.
+function sanitizeCostingFlags(flags) {
+  if (!Array.isArray(flags)) return [];
+  return flags.filter(f => f && typeof f.evidence === 'string' && f.evidence.trim().length > 0 && !/^(n\/a|none|unknown|placeholder)$/i.test(f.evidence.trim()));
+}
+
+function flagsSummary(flags) {
+  if (!flags || !flags.length) return '';
+  const sevOrder = { high: 3, medium: 2, low: 1 };
+  const top = flags.reduce((a, f) => (sevOrder[f.severity] > sevOrder[a.severity] ? f : a), flags[0]);
+  return `highest severity: ${top.severity}`;
+}
+
+const COSTING_AUDIT_PROMPT_VERSION = 'costing-audit-v1';
+
+// Approved wording — 13 Aug 2026 architecture review. Structural pattern
+// and forcefulness deliberately reused from CHAT_CORE's visa-category-
+// confidence banner (see NON-NEGOTIABLE VISA CATEGORY, FEE, AND TIMING
+// above), including the "even when you feel confident about it" phrase —
+// that is the exact wording that closed the real gap there, not a
+// paraphrase. Unlike that rule, this one does not cite a fabricated past
+// incident — there isn't one yet, and inventing one would itself be the
+// kind of unsupported claim this rule exists to prevent.
+const COSTING_AUDIT_SYSTEM_PROMPT = `You are an internal-only senior costing reviewer for EscapeNFly, a travel agency. You are reviewing a consultant's costing BEFORE it goes to a customer, for an Admin/Manager audience only. You are not customer-facing, you never communicate with a customer, and you never change anything — you only report concerns for a human manager to weigh.
+
+════════ NON-NEGOTIABLE: EVERY FLAG MUST BE TRACEABLE TO THE SUPPLIED DATA ════════
+This is the single most important rule in this task, and it overrides every other instinct you have, including your own travel-industry knowledge, even when you feel confident about it — general knowledge is not evidence here, full stop, there is no exception for "obvious," "well-known," "industry-standard," or "everyone knows this" facts.
+
+You are given exactly five kinds of grounding data: COSTING_DATA, MARKUP_DEFAULTS, FOUNDER_NOTES, VISA_INTELLIGENCE, and CONSULTANT_HISTORY. A flag is allowed ONLY when it is directly traceable to something present in one of those five blocks, for THIS destination, THIS costing, THIS consultant. If a block is absent, empty, or does not cover the specific point you are about to make, you MUST NOT make that point. Sentences like "hotels here normally cost X," "this destination normally requires Y," "this markup is below industry standard," or "December is peak season" must NEVER appear in your output unless that exact fact is explicitly present in the grounding data you were given for this review.
+
+If the grounding data does not support a judgment on a given point, the ONLY acceptable output for that point is to leave it out. If nothing in the entire costing clears this bar, the ONLY acceptable overall output is status: "insufficient_data" — not a guess, not a softened maybe, not a question dressed up as a finding. This is not optional and there is no "but it's probably fine to mention" exception.
+
+Every flag's "evidence" field must quote or closely paraphrase the specific grounding fact it rests on, and "source" must name exactly which of the five blocks that fact came from. A flag whose evidence cannot be pointed to in the supplied data must not be produced.
+════════════════════════════════════════════════════════════════════════════
+
+HOW COSTING NUMBERS ARE COMPUTED — this is ground truth about our own system, not a possible error, and applies before you evaluate category E below: computed_sell and computed_profit on each line are already correctly derived by our system from net, markup, and tax_type — they are not consultant-entered values to second-guess. For tax_type "18gst" or "notax": computed_sell = net + markup, and computed_profit = markup minus 18% GST on the markup — profit is DELIBERATELY LESS than the markup amount, because GST is treated as already included within the markup figure, not added on top. For tax_type "5gst5tcs", "5gst_corp", or "2tcs_only": GST/TCS is added ON TOP of (net + markup) to form computed_sell, and computed_profit equals the markup amount unchanged. A computed_profit that is less than a line's markup is normal and expected for 18gst/notax lines — this is NOT a consistency error, do not flag it. The only genuine profit/sell-related consistency issue is if a line's own computed_sell/computed_profit contradicts ITS OWN net/markup/tax_type per the formula just given, or if totals.sell/totals.profit do not equal the sum of every line's own computed_sell/computed_profit.
+
+WHAT TO LOOK FOR (only ever within the rule above):
+A. MARKUP — consultant's markup (per line and overall) vs. MARKUP_DEFAULTS for that category, and vs. CONSULTANT_HISTORY if supplied.
+B. ITINERARY / PACING — only when FOUNDER_NOTES or the costing's own dates/nights give a real, specific, contradicting basis.
+C. SEASON / DESTINATION — only when FOUNDER_NOTES contains destination-specific seasonal guidance the travel dates conflict with.
+D. VISA — only when VISA_INTELLIGENCE is supplied and something in the costing/enquiry conflicts with it.
+E. INTERNAL CONSISTENCY — dates/nights that don't mathematically align, pax vs. quantities that don't reconcile, line totals that don't sum to the stated total, markup math that doesn't compute. Always check this category — it never needs outside knowledge, it's evidence-complete by construction.
+
+Respond only by calling the costing_audit_result tool. Keep every field short and operational — no essay, no restating the whole costing back, no generic praise. "recommended_review" describes what a human should look at; it is never an instruction to change a number ("review whether the higher markup was intentional," never "reduce the markup to 18%").`;
+
+const COSTING_AUDIT_TOOL = {
+  name: 'costing_audit_result',
+  description: "Structured internal audit result for a consultant's costing — admin/manager-only, never customer-facing.",
+  input_schema: {
+    type: 'object',
+    properties: {
+      status: { type: 'string', enum: ['flags', 'no_concerns', 'insufficient_data'] },
+      flags: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+            category: { type: 'string', enum: ['markup', 'consistency', 'itinerary', 'season', 'visa', 'other'] },
+            issue: { type: 'string' },
+            evidence: { type: 'string' },
+            source: { type: 'string', enum: ['MARKUP_DEFAULTS', 'founder_notes', 'visa_intelligence', 'costing', 'historical_costing'] },
+            recommended_review: { type: 'string' }
+          },
+          required: ['severity', 'category', 'issue', 'evidence', 'source', 'recommended_review']
+        }
+      }
+    },
+    required: ['status', 'flags']
+  }
+};
+
+// Orchestrator. Never throws past its own boundary, never touches the
+// enquiries/bookings row except appending one hist[] pointer note AFTER a
+// successful (non-failed) audit — a failed Claude call writes only a
+// 'failed' costing_audits row and stops there. The costing itself, already
+// saved by the CRM before this ever runs, is never at risk from anything
+// in this function.
+async function runCostingAudit(entityType, entityId, costSetId, triggeredBy) {
+  const logBase = { entity_type: entityType, entity_id: entityId, cost_set_id: costSetId || null, triggered_by: triggeredBy };
+  try {
+    const row = await fetchEntityForAudit(entityType, entityId);
+    if (!row) { recordCostingAudit({ ...logBase, result: 'not_found' }); return; }
+
+    const { block: costingBlock, destination, consultantEmail, activeSetId } = buildCostingDataBlock(entityType, row, costSetId);
+    if (!costingBlock.line_items.length) { recordCostingAudit({ ...logBase, result: 'no_line_items' }); return; }
+
+    const groundingHash = computeGroundingHash(costingBlock);
+
+    const costSetFilter = activeSetId ? `cost_set_id=eq.${encodeURIComponent(activeSetId)}` : `cost_set_id=is.null`;
+    const lastR = await fetchRetry(
+      `${SB_URL}/rest/v1/costing_audits?entity_type=eq.${entityType}&entity_id=eq.${entityId}&${costSetFilter}&order=created_at.desc&limit=1&select=grounding_hash`,
+      { headers: SB_HEADERS }, 'SB-costAudit-lastHash'
+    );
+    if (lastR.ok) {
+      const lastRows = await lastR.json();
+      if (lastRows[0] && lastRows[0].grounding_hash === groundingHash) {
+        recordCostingAudit({ ...logBase, result: 'skipped_unchanged', grounding_hash: groundingHash });
+        return;
+      }
+    }
+
+    const [markupDefaults, founderNotes, visaIntel, consultantHistory] = await Promise.all([
+      loadMarkupDefaultsForAudit(),
+      loadFounderNotes(destination),
+      isVisaRelevantForAudit(row, entityType, costingBlock.line_items) ? loadVisaIntelligence(destination) : Promise.resolve(null),
+      computeConsultantHistory(consultantEmail, destination, entityId)
+    ]);
+    const verifiedVisaIntel = (visaIntel && visaIntel.data_confidence === 'verified') ? visaIntel : null;
+
+    const grounding = {
+      COSTING_DATA: costingBlock,
+      MARKUP_DEFAULTS: markupDefaults,
+      FOUNDER_NOTES: founderNotes || null,
+      VISA_INTELLIGENCE: verifiedVisaIntel,
+      CONSULTANT_HISTORY: consultantHistory
+    };
+
+    const auditRow = {
+      entity_type: entityType, entity_id: entityId, cost_set_id: activeSetId,
+      triggered_by: triggeredBy, grounding_hash: groundingHash, grounding_snapshot: grounding,
+      model: COSTING_AUDIT_MODEL, prompt_version: COSTING_AUDIT_PROMPT_VERSION
+    };
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: COSTING_AUDIT_MODEL, max_tokens: 1500,
+          system: COSTING_AUDIT_SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: JSON.stringify(grounding) }],
+          tools: [COSTING_AUDIT_TOOL],
+          tool_choice: { type: 'tool', name: 'costing_audit_result' }
+        }),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (!r.ok) throw new Error(`Claude HTTP ${r.status}: ${await r.text()}`);
+      const d = await r.json();
+      const toolBlock = (d.content || []).find(b => b.type === 'tool_use' && b.name === 'costing_audit_result');
+      if (!toolBlock || !toolBlock.input) throw new Error('No costing_audit_result tool call in response');
+
+      const parsed = toolBlock.input;
+      const flags = sanitizeCostingFlags(parsed.flags);
+      auditRow.status = flags.length ? 'flags' : (parsed.status === 'insufficient_data' ? 'insufficient_data' : 'no_concerns');
+      auditRow.flags = flags;
+      auditRow.raw_response = parsed;
+    } catch (claudeErr) {
+      auditRow.status = 'failed';
+      auditRow.error = claudeErr.message;
+    }
+
+    const insertR = await fetchRetry(`${SB_URL}/rest/v1/costing_audits`, {
+      method: 'POST', headers: { ...SB_SERVICE_HEADERS, Prefer: 'return=representation' }, body: JSON.stringify(auditRow)
+    }, 'SB-costAudit-insert');
+    if (!insertR.ok) {
+      console.error('costing_audits insert failed:', insertR.status, await insertR.text());
+      recordCostingAudit({ ...logBase, result: 'db_insert_failed', status: auditRow.status });
+      return;
+    }
+
+    if (auditRow.status !== 'failed') {
+      const note = auditRow.status === 'flags'
+        ? `AI costing review: ${auditRow.flags.length} flag(s), ${flagsSummary(auditRow.flags)} — see Admin > Costing Review`
+        : `AI costing review: ${auditRow.status === 'no_concerns' ? 'no concerns' : 'insufficient data to assess'}`;
+      const hist = Array.isArray(row.history) ? row.history : [];
+      hist.push({ s: row.status || '', by: 'AI Costing Review', at: new Date().toISOString(), note });
+      const table = entityType === 'lead' ? 'enquiries' : 'bookings';
+      await fetchRetry(`${SB_URL}/rest/v1/${table}?id=eq.${entityId}`, {
+        method: 'PATCH', headers: SB_HEADERS, body: JSON.stringify({ history: hist })
+      }, 'SB-costAudit-histPointer');
+    }
+
+    recordCostingAudit({ ...logBase, result: 'completed', status: auditRow.status, flag_count: (auditRow.flags || []).length, grounding_hash: groundingHash });
+  } catch (e) {
+    console.error('runCostingAudit fatal error:', e.message);
+    recordCostingAudit({ ...logBase, result: 'fatal_error', error: e.message });
+    // Best-effort failure record only — never throws further, and never
+    // touches the entity's own row. This is the one guarantee this whole
+    // feature exists to keep: a failed audit must be invisible to the
+    // costing itself.
+    try {
+      await fetchRetry(`${SB_URL}/rest/v1/costing_audits`, {
+        method: 'POST', headers: SB_SERVICE_HEADERS,
+        body: JSON.stringify({
+          entity_type: entityType, entity_id: entityId, cost_set_id: costSetId || null,
+          triggered_by: triggeredBy, grounding_hash: 'error', grounding_snapshot: {},
+          model: COSTING_AUDIT_MODEL, prompt_version: COSTING_AUDIT_PROMPT_VERSION,
+          status: 'failed', error: e.message
+        })
+      }, 'SB-costAudit-insertFailed');
+    } catch (_) {}
+  }
+}
+
+app.post('/internal/costing-audit', (req, res) => {
+  if (!costingAuditAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  const { entity_type, entity_id, cost_set_id, triggered_by } = req.body || {};
+  if (!entity_type || !entity_id || !triggered_by) {
+    return res.status(400).json({ error: 'entity_type, entity_id, and triggered_by are required' });
+  }
+  if (['lead', 'booking'].indexOf(entity_type) < 0) {
+    return res.status(400).json({ error: 'entity_type must be "lead" or "booking"' });
+  }
+  res.json({ status: 'started' });
+  runCostingAudit(entity_type, entity_id, cost_set_id || null, triggered_by).catch(e => {
+    console.error('costing-audit endpoint error:', e.message);
+  });
+});
+
 // ── HEALTH ──
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   service: 'EscapeNFly AI Engine',
   version: '3.9',
-  state: 'persistent + reply-first + sales-consultant Maya + forced-tool-use structured output + channel-split brain (whatsapp/website) + unsupported-media auto-reply + spam filter + manual-lead notify + team notification crons',
+  state: 'persistent + reply-first + sales-consultant Maya + forced-tool-use structured output + channel-split brain (whatsapp/website) + unsupported-media auto-reply + spam filter + manual-lead notify + team notification crons + AI costing audit',
   endpoints: [
     '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/website-chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
-    '/notify/manual-lead',
+    '/notify/manual-lead', '/internal/costing-audit',
     '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh'
   ]
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.9 running on port ${PORT}`));
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.9 running on port ${PORT}`));
+}

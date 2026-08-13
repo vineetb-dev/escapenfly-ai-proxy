@@ -1,2 +1,4 @@
 tests/last-run-results.json
 node_modules/
+.env
+.env.*

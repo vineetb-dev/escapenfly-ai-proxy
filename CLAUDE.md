@@ -107,6 +107,25 @@ independent of whatever the AI router itself returns — defense in depth,
 added after a departed employee was still receiving new customer leads
 via the fallback pool.
 
+**When a seat changes hands (14 Aug 2026 finding), renaming `TEAM`'s key
+is NOT optional/cosmetic — it's load-bearing.** Found during Riya Negi's
+onboarding: the `sales7@escapenfly.com` seat moved from Shubham → Anurag
+in the CRM's `team_members` around 26 Jun 2026, but this file's `TEAM`
+entry was never touched — it sat as `shubham: {name:'Shubham', ...}` in
+`DEPARTED_KEYS` the entire time. Net effect: Anurag received **zero**
+AI-routed WhatsApp leads for ~2 months (confirmed — every enquiry under
+his email in the CRM was manually sourced, not one AI-routed). Nothing
+crashed and nothing logged an error; the seat just silently stopped
+getting new leads. `assignTeamWithClaude`'s JSON-schema line
+(`"key": "lalit|divya|anjan|riya|prabhjot|damini"`) is a second, separate
+place that must list a key by name or Claude can never emit it as a
+routing decision even if it's un-departed and present in the roster —
+missing that update would have reproduced the exact same silent gap.
+Next time this seat (or any seat) changes hands: rename the `TEAM` key,
+remove it from `DEPARTED_KEYS`, update `REP_KEYS` and the
+`team_lead_digest` `results.<key>` reference, AND add the new key to
+that JSON-schema enum line — all four, in the same change.
+
 ## Debug endpoints (all `CRON_SECRET`-gated, none hardcode the secret)
 `/debug/webhook-sig-log`, `/debug/stacked-question-log`,
 `/debug/visa-safety-block-log`, `/debug/visa-refresh-log` — ring

@@ -161,7 +161,10 @@ const TEAM = {
   lalit:    { name: 'Lalit Mehta',     email: 'sales6@escapenfly.com',   wa: '916283285244', dept: 'Domestic & Short Haul' },
   divya:    { name: 'Divya Nigam',     email: 'sales1@escapenfly.com',   wa: '917888871148', dept: 'Short Haul & Island' },
   anjan:    { name: 'Anjan Pramanick', email: 'sales3@escapenfly.com',   wa: '919875903349', dept: 'Long Haul' },
-  shubham:  { name: 'Shubham',         email: 'sales7@escapenfly.com',   wa: '919875921281', dept: 'Short Haul & Long Haul' },
+  // sales7@escapenfly.com seat history: Shubham → Anurag (never updated here,
+  // which is exactly why this key sat stale and departed for ~2 months while
+  // Anurag was actually active — see CLAUDE.md, 14 Aug 2026) → Riya Negi now.
+  riya:     { name: 'Riya Negi',       email: 'sales7@escapenfly.com',   wa: '919875903348', dept: 'Air Tickets & Holidays' },
   prabhjot: { name: 'Prabhjot Singh',  email: 'support2@escapenfly.com', wa: '919569933206', dept: 'Air Tickets, Corporate & Catch-All' },
   damini:   { name: 'Damini',          email: 'support3@escapenfly.com', wa: '919888002635', dept: 'Visa' },
   admin:    { name: 'Vineet Bansal',   email: 'vineet.b@escapenfly.com', wa: '919216320050', dept: 'Admin' },
@@ -170,7 +173,7 @@ const TEAM = {
 };
 
 // v3.2 — recipient rosters for the new notification jobs
-const REP_KEYS = ['lalit', 'divya', 'anjan', 'shubham', 'prabhjot']; // individual digest, non-visa
+const REP_KEYS = ['lalit', 'divya', 'anjan', 'riya', 'prabhjot']; // individual digest, non-visa
 const VISA_REP_KEYS = ['damini', 'prabhjot'];                        // visa-specific individual + appt reminder
 const FOUNDER_KEYS = ['admin', 'vivek', 'abhishek', 'prabhjot'];      // team digest, booking alert, EOD summary
 const STALE_CC_KEY = 'admin';                                        // stale alert CC
@@ -180,7 +183,13 @@ const STALE_CC_KEY = 'admin';                                        // stale al
 // Claude's routing prompt, and their own individual WA sends. Their
 // count still flows into team_lead_digest's results.<key> below since
 // that AiSensy template has a fixed, pre-approved slot for them.
-const DEPARTED_KEYS = ['shubham']; // left the company; leads reassigned to Divya
+// No current departures. (14 Aug 2026: 'shubham' key removed from this
+// array and repurposed as 'riya' above — it had been left departed here
+// for ~2 months after Anurag actually took over the seat, so that seat
+// received zero AI-routed leads that whole time. Don't let that repeat:
+// whoever inherits sales7@escapenfly.com next needs both TEAM's key
+// renamed AND removed from here in the same change.)
+const DEPARTED_KEYS = [];
 
 const ISLAND     = ['maldives','mauritius','seychelles','bali','lakshadweep'];
 const SHORT_HAUL = ['dubai','uae','thailand','bangkok','phuket','singapore','malaysia','sri lanka','nepal','bhutan','myanmar','middle east'];
@@ -245,7 +254,7 @@ Intent: ${data.intent || 'Not specified'}
 Summary: ${data.leadSummary || data.query || data.type || 'Not specified'}
 
 Respond with ONLY a JSON object, no other text:
-{"key": "lalit|divya|anjan|prabhjot|damini", "reasoning": "one short sentence"}`;
+{"key": "lalit|divya|anjan|riya|prabhjot|damini", "reasoning": "one short sentence"}`;
 
   try {
     const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
@@ -1903,7 +1912,7 @@ app.post('/cron/daily-digest', async (req, res) => {
       await sendWA(t.wa, 'team_lead_digest', [
         t.name,
         String(results.lalit.live), String(results.divya.live), String(results.anjan.live),
-        String(results.shubham.live), String(results.prabhjot.live), String(results.damini.live),
+        String(results.riya.live), String(results.prabhjot.live), String(results.damini.live),
         String(totalLive)
       ]);
     }

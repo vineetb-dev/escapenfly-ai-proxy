@@ -96,7 +96,16 @@ const AISENSY_WEBHOOK_SECRET = process.env.AISENSY_WEBHOOK_SECRET || '';
 const WA_NUM        = (process.env.WA_NUM || '919851739851').replace(/\D/g, '');
 const MAYA_CAMPAIGN = process.env.MAYA_CAMPAIGN || 'maya_session';
 const CRM_URL       = process.env.CRM_URL || 'https://escapenfly-crm.netlify.app';
-const CHAT_MODEL    = process.env.CHAT_MODEL || 'claude-haiku-4-5-20251001';
+const CHAT_MODEL    = process.env.CHAT_MODEL || 'claude-sonnet-5';
+// Deliberately independent of CHAT_MODEL — the visa-safety and stacked-
+// question Tier 2 checks are narrow, cheap yes/no classifiers, not Maya's
+// reply model. Before this constant existed, both hardcoded `CHAT_MODEL`
+// directly, which meant changing Maya's reply model silently changed what
+// model audited that model's own output too — never a deliberate decision,
+// just two features accidentally sharing one constant. Decoupled 2026-08-14
+// when CHAT_MODEL moved off Haiku, so the classifier stays on the fast/cheap
+// tier it was actually designed for regardless of what generates the reply.
+const SAFETY_CLASSIFIER_MODEL = process.env.SAFETY_CLASSIFIER_MODEL || 'claude-haiku-4-5-20251001';
 const ROUTING_MODEL = process.env.ROUTING_MODEL || 'claude-sonnet-4-6';
 // Separate from CHAT_MODEL/ROUTING_MODEL — this is the only model in this
 // file that needs the web_search server tool, which Haiku 4.5 (CHAT_MODEL)
@@ -1285,7 +1294,7 @@ async function tier2ConfirmStackedQuestion(replyText) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: CHAT_MODEL,
+        model: SAFETY_CLASSIFIER_MODEL,
         max_tokens: 5,
         system: 'You check WhatsApp messages for one specific rule violation: does this message ask the reader more than one distinct question that each need a separate answer? A single question offering a choice between two named options (e.g. "Dubai or Kazakhstan?") counts as ONE question, not two. Reply with exactly one word: YES or NO.',
         messages: [{ role: 'user', content: String(replyText || '') }]
@@ -1674,7 +1683,7 @@ async function tier2ConfirmVisaClaim(replyText) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: CHAT_MODEL,
+        model: SAFETY_CLASSIFIER_MODEL,
         max_tokens: 10,
         system: 'You check a travel consultant\'s WhatsApp/chat reply for one specific rule violation: does ANY part of this reply state or clearly imply a SPECIFIC visa or entry-authorization requirement as a confirmed, current fact? This includes: a specific category or named scheme (visa-free, e-visa, visa-on-arrival, a full visa requirement, OR any named travel-authorization/pre-clearance scheme such as eTA, ETIAS, ESTA, K-ETA, NZeTA, or similar — the category list is illustrative, not exhaustive: judge the CONCEPT "what specific entry requirement applies", not just these exact words), a SPECIFIC fee amount, or a SPECIFIC processing/appointment timeframe. Judge the reply by its WORST part: if even ONE sentence states something specific as fact, the reply is a violation — even if OTHER sentences in the SAME reply are correctly hedged ("let me verify", "our expert will confirm the exact fee"). Only answer NO if NO part of the reply makes any such specific claim. Reply with exactly one word: YES (violates) or NO (compliant).',
         messages: [{ role: 'user', content: String(replyText || '') }]
@@ -2289,7 +2298,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotesList = [], visaIntelList = [], intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, debugRef = null) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotesList = [], visaIntelList = [], intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, debugRef = null, model = CHAT_MODEL) {
   const todayStr = new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
   const currentDateLine = `\n\nTODAY'S ACTUAL DATE: ${todayStr}. Use this to reason correctly about relative time — if a customer says a month without a year (e.g. "December"), assume the NEXT upcoming occurrence of that month from today's real date, not a past or arbitrary year. NEVER offer already-past years as options when asking a customer to confirm their travel year.`;
   const knownLine = (known && Object.values(known).some(v => v))
@@ -2369,7 +2378,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
           'anthropic-version': '2023-06-01'
         },
         body: JSON.stringify({
-          model: CHAT_MODEL,
+          model,
           max_tokens: 600,
           system: buildChatSystem(channel, intent) + currentDateLine + knownLine + founderLine + visaLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine,
           messages: msgs,
@@ -2394,6 +2403,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         // Validation: intent whitelist (belt-and-suspenders — schema enum
         // already constrains this, but guard against edge-case drift)
         if (!VALID_INTENTS.includes(parsed.intent)) parsed.intent = 'other_travel';
+        if (debugRef) { debugRef.usage = d.usage; debugRef.model = d.model; }
         return parsed;
       }
       if (debugRef) { debugRef.status = r.status; debugRef.errorType = 'no_tool_use_block'; debugRef.errorMessage = JSON.stringify(d).slice(0, 300); }
@@ -3137,4 +3147,30 @@ app.get('/health', (req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.9 running on port ${PORT}`));
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.9 running on port ${PORT}`));
+}
+
+// Exposed for the isolated model-comparison harness (tests/model-lab/) only —
+// no production code path calls into these via require(). callMayaJSON and
+// mayaTurn are the actual reply-generation and full-turn functions; the rest
+// are the exact functions mayaTurn's context-resolution block calls, exported
+// so the harness can mirror that sequencing with the SAME underlying lookups
+// rather than reimplementing the Supabase queries themselves.
+module.exports = {
+  callMayaJSON,
+  mayaTurn,
+  guessDestinationKeyFromMessage,
+  allFounderDestinationKeyMatches,
+  loadFounderNotes,
+  allVisaIntelDestinationKeyMatches,
+  loadVisaIntelligence,
+  lookupDestinationInfo,
+  loadLiveWeather,
+  loadForexRate,
+  guessIntentFromMessage,
+  validPhone,
+  loadEnquiryStatus,
+  loadPastDestinations,
+  loadCustomerProfile
+};

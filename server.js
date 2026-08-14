@@ -1708,7 +1708,23 @@ async function tier2ConfirmVisaClaim(replyText) {
 // add real REPLY-FIRST latency to smooth every block. Opens with the exact
 // mandated sentence from the CHAT_CORE banner rule, so behavior stays
 // consistent with what the prompt claims Maya does.
+//
+// One deliberate exception to "short and generic": a multi-country region
+// (Europe, Schengen, Southeast Asia, ...) gets a variant that asks which
+// specific country, instead of the flat deflection. Found in real production
+// traffic (14 Aug 2026) — a customer asked about "Europe... visa", got this
+// exact substitute, then on their next message got a near-identical
+// deflection again because nothing in either path ever asked which country
+// would actually resolve to real, verified data. Not a rare edge case —
+// Europe/Schengen/Southeast Asia are common real phrasings for this
+// business, so this list is checked every time, not just on repeat.
+const MULTI_COUNTRY_REGION_TERMS = ['europe', 'schengen', 'southeast asia', 'south east asia', 'scandinavia', 'the gulf', 'middle east', 'caribbean', 'balkans', 'baltics', 'benelux'];
 function buildVisaSafetySubstitute(destinationLabel) {
+  const normalized = String(destinationLabel || '').trim().toLowerCase();
+  const isMultiCountryRegion = destinationLabel && MULTI_COUNTRY_REGION_TERMS.some(term => normalized.includes(term));
+  if (isMultiCountryRegion) {
+    return `Let me verify the latest visa requirement for whichever country in ${destinationLabel} you're most excited about — which one should I check first? I'll get you exact, verified details for that one.`;
+  }
   const destPart = destinationLabel ? ` for ${destinationLabel}` : '';
   return `Let me verify the latest visa requirement${destPart} before I advise you on that specifically — I don't want to give you incorrect details. I'll get our expert to confirm the exact requirement, fee, and timing for you.`;
 }
@@ -2178,7 +2194,7 @@ The direct, permanent fix for a real, serious mistake (Maya once told an Indian 
 
 State the visa CATEGORY (visa-free / eVisa / visa-on-arrival / embassy visa required), a specific FEE, or a specific PROCESSING/APPOINTMENT TIME confidently ONLY when a "VISA INTELLIGENCE FOR THIS DESTINATION" block is present in this context for that destination — that block only ever appears when EscapeNFly's own data for it is verified, current, and specifically checked against an official source. NEVER state or imply any of these three from your own general knowledge, even when you feel confident about it — general knowledge is exactly what caused the past mistake. When present, frame fee/processing figures as "typically [X], as of [the date shown in that block]" — never as a guarantee, and never implying a near-term travel date is safely achievable just because processing is normally fast (appointment AVAILABILITY is separate from processing speed, and can be scarce even when processing itself is quick).
 
-If no such block is present for the destination being discussed, say exactly: "Let me verify the latest requirement before I advise you." — then continue the conversation naturally (keep gathering their trip details, or move to handover) rather than stalling on it or guessing. Do not repeat that exact sentence more than once per destination in one conversation.
+If no such block is present for the destination being discussed, say exactly: "Let me verify the latest requirement before I advise you." — then continue the conversation naturally (keep gathering their trip details, or move to handover) rather than stalling on it or guessing. Do not repeat that exact sentence more than once per destination in one conversation. SPECIAL CASE — the destination is a multi-country region (Europe, Schengen, Southeast Asia, Scandinavia, the Gulf, etc.) rather than one named country: the verification line above can't resolve to anything until a specific country is named, so fold the resolving question into the SAME sentence rather than leaving it for a separate turn — e.g. for "Europe": "Let me verify the latest requirement for whichever country you're most excited about — which one within Europe should I check first? I'll get you exact, verified visa details for that one." This turns the deflection into forward progress instead of a dead end, and gives the customer a concrete reason to answer.
 
 Speak entirely in EscapeNFly's own voice about visa facts — "we've verified", "our records show", "as of our latest check" — never naming VisaHQ, a government website, or any other external source to the customer, exactly like founder-notes facts are never attributed to a source today.
 

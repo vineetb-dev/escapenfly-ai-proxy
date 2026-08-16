@@ -12,8 +12,30 @@ stacked-question detection, visa lookups, lead routing — runs
 fire-and-forget **after** the reply is already sent.
 
 ## The two-model split
-- `CHAT_MODEL` = Haiku 4.5 — Maya's actual conversational replies. Fast,
-  cheap, REPLY-FIRST.
+- `CHAT_MODEL` = claude-sonnet-5 — Maya's actual conversational replies.
+  Switched from Haiku 4.5 on 2026-08-14 after a 65-scenario, 3-model
+  comparison (tests/model-lab/) plus AI-triage review: Sonnet had the
+  lowest triage flag count (26 vs Haiku 47, Opus 59), the cleanest
+  objective pass rate (57/65 vs Haiku 47/65, Opus 55/65), zero fabricated
+  business-history claims (unlike Opus — "we've planned hundreds of
+  these," an identical invented "20-30%" savings figure in two unrelated
+  scenarios), and zero incomplete lead-field extraction (Haiku left
+  travel_style empty on 3 scenarios where it was clearly implied).
+  Haiku's confirmed issues: re-asking already-known information,
+  repeating its own question verbatim across turns, a literal
+  "<UNKNOWN>" string leaking into structured lead output instead of an
+  empty string. Pricing: Sonnet 5 is at intro pricing ($2/$10 per MTok)
+  through 2026-08-31, reverting to standard ($3/$15) after — factored
+  into the decision, not a deciding factor at current traffic volume.
+  Before switching, the visa-safety backstop was replayed against the
+  real mayaTurn path with CHAT_MODEL forced to Sonnet across the full
+  known violation set (ESTA, Canada eTA, ETIAS, NZeTA, K-ETA) — 5/5
+  produced a safe customer-facing reply (2 via the backstop firing, 3
+  because Sonnet's own reply was already correctly hedged).
+- `SAFETY_CLASSIFIER_MODEL` = Haiku 4.5, independent of CHAT_MODEL —
+  the visa-safety and stacked-question Tier 2 classifiers. Decoupled
+  2026-08-14 (previously both hardcoded CHAT_MODEL directly, which meant
+  a reply-model change would have silently changed the classifier too).
 - `VISA_SEARCH_MODEL` = claude-sonnet-5 — used only for the visa
   intelligence refresh/lookup, which needs the `web_search` tool.
   **Haiku 4.5 does not support `web_search_20260209`** — don't try to
@@ -31,11 +53,12 @@ banner formatting. The actual fix is a code-level, non-optional backstop:
   `onReply` fires, when Layer 0's precondition holds (a destination was
   resolved this turn AND no `verified` `visa_intelligence` row exists).
 - Tier 1a: instant regex block on near-unambiguous violating phrases.
-- Tier 2: a cheap Haiku classifier call, checking for **any** unhedged
-  visa/authorization-scheme claim anywhere in the reply — runs on every
-  Layer-0-eligible turn (there is deliberately **no keyword pre-filter**
-  gating this; one existed, it created a blind spot that let the Canada
-  eTA case through, it was removed).
+- Tier 2: a cheap Haiku classifier call (`SAFETY_CLASSIFIER_MODEL`),
+  checking for **any** unhedged visa/authorization-scheme claim anywhere
+  in the reply — runs on every Layer-0-eligible turn (there is
+  deliberately **no keyword pre-filter** gating this; one existed, it
+  created a blind spot that let the Canada eTA case through, it was
+  removed).
 - On a confirmed violation: the entire reply is replaced with a fixed
   template ("Let me verify the latest visa requirement... before I
   advise you"), fail-closed on Tier 2 timeout/error.
@@ -71,9 +94,10 @@ Escapenfly's own voice always ("we've verified", not any source name).
 Separate from the visa backstop — this one is **detect-and-log only**,
 not enforce, because a stacked question is a UX problem, not a
 safety/financial one. Two tiers: regex heuristic, then a conditional
-cheap-model check on ambiguous cases. Don't confuse this with the visa
-backstop's enforce-and-block behavior — they're deliberately different
-severity responses to different classes of problem.
+cheap-model check (`SAFETY_CLASSIFIER_MODEL`) on ambiguous cases. Don't
+confuse this with the visa backstop's enforce-and-block behavior —
+they're deliberately different severity responses to different classes
+of problem.
 
 ## AI-assisted internal costing audit (13 Aug 2026)
 Admin/Manager only, never customer-facing, never touches a costing, markup,
@@ -117,6 +141,25 @@ migration — these are two different repos, keep that distinction clear).
 independent of whatever the AI router itself returns — defense in depth,
 added after a departed employee was still receiving new customer leads
 via the fallback pool.
+
+**When a seat changes hands (14 Aug 2026 finding), renaming `TEAM`'s key
+is NOT optional/cosmetic — it's load-bearing.** Found during Riya Negi's
+onboarding: the `sales7@escapenfly.com` seat moved from Shubham → Anurag
+in the CRM's `team_members` around 26 Jun 2026, but this file's `TEAM`
+entry was never touched — it sat as `shubham: {name:'Shubham', ...}` in
+`DEPARTED_KEYS` the entire time. Net effect: Anurag received **zero**
+AI-routed WhatsApp leads for ~2 months (confirmed — every enquiry under
+his email in the CRM was manually sourced, not one AI-routed). Nothing
+crashed and nothing logged an error; the seat just silently stopped
+getting new leads. `assignTeamWithClaude`'s JSON-schema line
+(`"key": "lalit|divya|anjan|riya|prabhjot|damini"`) is a second, separate
+place that must list a key by name or Claude can never emit it as a
+routing decision even if it's un-departed and present in the roster —
+missing that update would have reproduced the exact same silent gap.
+Next time this seat (or any seat) changes hands: rename the `TEAM` key,
+remove it from `DEPARTED_KEYS`, update `REP_KEYS` and the
+`team_lead_digest` `results.<key>` reference, AND add the new key to
+that JSON-schema enum line — all four, in the same change.
 
 ## Debug endpoints (all `CRON_SECRET`-gated, none hardcode the secret)
 `/debug/webhook-sig-log`, `/debug/stacked-question-log`,

@@ -104,7 +104,16 @@ const AISENSY_WEBHOOK_SECRET = process.env.AISENSY_WEBHOOK_SECRET || '';
 const WA_NUM        = (process.env.WA_NUM || '919851739851').replace(/\D/g, '');
 const MAYA_CAMPAIGN = process.env.MAYA_CAMPAIGN || 'maya_session';
 const CRM_URL       = process.env.CRM_URL || 'https://escapenfly-crm.netlify.app';
-const CHAT_MODEL    = process.env.CHAT_MODEL || 'claude-haiku-4-5-20251001';
+const CHAT_MODEL    = process.env.CHAT_MODEL || 'claude-sonnet-5';
+// Deliberately independent of CHAT_MODEL — the visa-safety and stacked-
+// question Tier 2 checks are narrow, cheap yes/no classifiers, not Maya's
+// reply model. Before this constant existed, both hardcoded `CHAT_MODEL`
+// directly, which meant changing Maya's reply model silently changed what
+// model audited that model's own output too — never a deliberate decision,
+// just two features accidentally sharing one constant. Decoupled 2026-08-14
+// when CHAT_MODEL moved off Haiku, so the classifier stays on the fast/cheap
+// tier it was actually designed for regardless of what generates the reply.
+const SAFETY_CLASSIFIER_MODEL = process.env.SAFETY_CLASSIFIER_MODEL || 'claude-haiku-4-5-20251001';
 const ROUTING_MODEL = process.env.ROUTING_MODEL || 'claude-sonnet-4-6';
 // Separate from CHAT_MODEL/ROUTING_MODEL — this is the only model in this
 // file that needs the web_search server tool, which Haiku 4.5 (CHAT_MODEL)
@@ -188,7 +197,10 @@ const TEAM = {
   lalit:    { name: 'Lalit Mehta',     email: 'sales6@escapenfly.com',   wa: '916283285244', dept: 'Domestic & Short Haul' },
   divya:    { name: 'Divya Nigam',     email: 'sales1@escapenfly.com',   wa: '917888871148', dept: 'Short Haul & Island' },
   anjan:    { name: 'Anjan Pramanick', email: 'sales3@escapenfly.com',   wa: '919875903349', dept: 'Long Haul' },
-  shubham:  { name: 'Shubham',         email: 'sales7@escapenfly.com',   wa: '919875921281', dept: 'Short Haul & Long Haul' },
+  // sales7@escapenfly.com seat history: Shubham → Anurag (never updated here,
+  // which is exactly why this key sat stale and departed for ~2 months while
+  // Anurag was actually active — see CLAUDE.md, 14 Aug 2026) → Riya Negi now.
+  riya:     { name: 'Riya Negi',       email: 'sales7@escapenfly.com',   wa: '919875903348', dept: 'Air Tickets & Holidays' },
   prabhjot: { name: 'Prabhjot Singh',  email: 'support2@escapenfly.com', wa: '919569933206', dept: 'Air Tickets, Corporate & Catch-All' },
   damini:   { name: 'Damini',          email: 'support3@escapenfly.com', wa: '919888002635', dept: 'Visa' },
   admin:    { name: 'Vineet Bansal',   email: 'vineet.b@escapenfly.com', wa: '919216320050', dept: 'Admin' },
@@ -197,7 +209,7 @@ const TEAM = {
 };
 
 // v3.2 — recipient rosters for the new notification jobs
-const REP_KEYS = ['lalit', 'divya', 'anjan', 'shubham', 'prabhjot']; // individual digest, non-visa
+const REP_KEYS = ['lalit', 'divya', 'anjan', 'riya', 'prabhjot']; // individual digest, non-visa
 const VISA_REP_KEYS = ['damini', 'prabhjot'];                        // visa-specific individual + appt reminder
 const FOUNDER_KEYS = ['admin', 'vivek', 'abhishek', 'prabhjot'];      // team digest, booking alert, EOD summary
 const STALE_CC_KEY = 'admin';                                        // stale alert CC
@@ -207,7 +219,13 @@ const STALE_CC_KEY = 'admin';                                        // stale al
 // Claude's routing prompt, and their own individual WA sends. Their
 // count still flows into team_lead_digest's results.<key> below since
 // that AiSensy template has a fixed, pre-approved slot for them.
-const DEPARTED_KEYS = ['shubham']; // left the company; leads reassigned to Divya
+// No current departures. (14 Aug 2026: 'shubham' key removed from this
+// array and repurposed as 'riya' above — it had been left departed here
+// for ~2 months after Anurag actually took over the seat, so that seat
+// received zero AI-routed leads that whole time. Don't let that repeat:
+// whoever inherits sales7@escapenfly.com next needs both TEAM's key
+// renamed AND removed from here in the same change.)
+const DEPARTED_KEYS = [];
 
 const ISLAND     = ['maldives','mauritius','seychelles','bali','lakshadweep'];
 const SHORT_HAUL = ['dubai','uae','thailand','bangkok','phuket','singapore','malaysia','sri lanka','nepal','bhutan','myanmar','middle east'];
@@ -272,7 +290,7 @@ Intent: ${data.intent || 'Not specified'}
 Summary: ${data.leadSummary || data.query || data.type || 'Not specified'}
 
 Respond with ONLY a JSON object, no other text:
-{"key": "lalit|divya|anjan|prabhjot|damini", "reasoning": "one short sentence"}`;
+{"key": "lalit|divya|anjan|riya|prabhjot|damini", "reasoning": "one short sentence"}`;
 
   try {
     const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
@@ -1327,7 +1345,7 @@ async function tier2ConfirmStackedQuestion(replyText) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: CHAT_MODEL,
+        model: SAFETY_CLASSIFIER_MODEL,
         max_tokens: 5,
         system: 'You check WhatsApp messages for one specific rule violation: does this message ask the reader more than one distinct question that each need a separate answer? A single question offering a choice between two named options (e.g. "Dubai or Kazakhstan?") counts as ONE question, not two. Reply with exactly one word: YES or NO.',
         messages: [{ role: 'user', content: String(replyText || '') }]
@@ -1716,7 +1734,7 @@ async function tier2ConfirmVisaClaim(replyText) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: CHAT_MODEL,
+        model: SAFETY_CLASSIFIER_MODEL,
         max_tokens: 10,
         system: 'You check a travel consultant\'s WhatsApp/chat reply for one specific rule violation: does ANY part of this reply state or clearly imply a SPECIFIC visa or entry-authorization requirement as a confirmed, current fact? This includes: a specific category or named scheme (visa-free, e-visa, visa-on-arrival, a full visa requirement, OR any named travel-authorization/pre-clearance scheme such as eTA, ETIAS, ESTA, K-ETA, NZeTA, or similar — the category list is illustrative, not exhaustive: judge the CONCEPT "what specific entry requirement applies", not just these exact words), a SPECIFIC fee amount, or a SPECIFIC processing/appointment timeframe. Judge the reply by its WORST part: if even ONE sentence states something specific as fact, the reply is a violation — even if OTHER sentences in the SAME reply are correctly hedged ("let me verify", "our expert will confirm the exact fee"). Only answer NO if NO part of the reply makes any such specific claim. Reply with exactly one word: YES (violates) or NO (compliant).',
         messages: [{ role: 'user', content: String(replyText || '') }]
@@ -1741,9 +1759,92 @@ async function tier2ConfirmVisaClaim(replyText) {
 // add real REPLY-FIRST latency to smooth every block. Opens with the exact
 // mandated sentence from the CHAT_CORE banner rule, so behavior stays
 // consistent with what the prompt claims Maya does.
-function buildVisaSafetySubstitute(destinationLabel) {
-  const destPart = destinationLabel ? ` for ${destinationLabel}` : '';
-  return `Let me verify the latest visa requirement${destPart} before I advise you on that specifically — I don't want to give you incorrect details. I'll get our expert to confirm the exact requirement, fee, and timing for you.`;
+//
+// One deliberate exception to "short and generic": a multi-country region
+// (Europe, Schengen, Southeast Asia, ...) gets a variant that asks which
+// specific country, instead of the flat deflection. Found in real production
+// traffic (14 Aug 2026) — a customer asked about "Europe... visa", got this
+// exact substitute, then on their next message got a near-identical
+// deflection again because nothing in either path ever asked which country
+// would actually resolve to real, verified data. Not a rare edge case —
+// Europe/Schengen/Southeast Asia are common real phrasings for this
+// business, so this list is checked every time, not just on repeat.
+const MULTI_COUNTRY_REGION_TERMS = ['europe', 'schengen', 'southeast asia', 'south east asia', 'scandinavia', 'the gulf', 'middle east', 'caribbean', 'balkans', 'baltics', 'benelux'];
+
+// Splits a destination label into individual place names on common
+// separators — "Japan, South Korea", "Japan and South Korea", "Japan &
+// Korea" all become ['Japan', 'South Korea'] / ['Japan', 'Korea']. Shared by
+// the distinct-named-countries substitute below and by repeat detection.
+function splitDestinationTokens(label) {
+  return String(label || '')
+    .split(/\s*(?:,|&|\/|\band\b)\s*/i)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+function joinWithAnd(items) {
+  if (items.length <= 1) return items[0] || '';
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
+}
+
+// Every substitute variant below contains at least one of these phrases —
+// used by priorVisaSafetyBlockCount to recognize a prior turn's substitute
+// inside chat.msgs. Deliberately more specific than a single word like
+// "visa" (which genuine, correct Maya replies about verified data also use)
+// so this doesn't over-fire once a destination actually verifies.
+const VISA_SUBSTITUTE_MARKERS = ['visa requirement', 'visa details', 'visa verification'];
+
+// buildVisaSafetySubstitute is otherwise a pure function with no memory of
+// its own — without this, a destination stuck at needs_refresh across
+// multiple turns repeats the identical canned sentence forever, because
+// nothing about the block itself ever changes. The "don't repeat verbatim"
+// rule in Maya's own prompt has no jurisdiction here since this text
+// replaces Maya's reply entirely, after the prompt already ran. Real case
+// (14 Aug 2026, phone weba1d9a8ede3044f04b161): "Japan and South Korea"
+// stayed needs_refresh across 2 turns, customer got the byte-for-byte same
+// sentence twice. Scans chat.msgs (already loaded for this turn, no extra
+// I/O) rather than adding new persisted state — chat.known gets rebuilt
+// from a field whitelist every turn (mergeLeadData) so it can't hold ad hoc
+// tracking fields, but msgs is saved as-is and already contains every prior
+// substitute verbatim.
+function priorVisaSafetyBlockCount(msgs, destinationLabel) {
+  const currentTokens = splitDestinationTokens(destinationLabel).map(s => s.toLowerCase()).filter(Boolean);
+  if (!currentTokens.length) return 0;
+  return (msgs || []).filter(m => {
+    if (m.role !== 'assistant') return false;
+    const text = String(m.content || '').toLowerCase();
+    if (!VISA_SUBSTITUTE_MARKERS.some(marker => text.includes(marker))) return false;
+    return currentTokens.some(tok => text.includes(tok));
+  }).length;
+}
+
+function buildVisaSafetySubstitute(destinationLabel, priorBlockCount = 0) {
+  const normalized = String(destinationLabel || '').trim().toLowerCase();
+  const isMultiCountryRegion = destinationLabel && MULTI_COUNTRY_REGION_TERMS.some(term => normalized.includes(term));
+  if (isMultiCountryRegion) {
+    if (priorBlockCount >= 2) return `Just to make sure I get you the right visa details — which specific country in ${destinationLabel} should I check? Happy to keep planning the rest in the meantime.`;
+    if (priorBlockCount === 1) return `I still need to know which country in ${destinationLabel} to check first — once you tell me that, I can get you exact, verified visa details right away.`;
+    return `Let me verify the latest visa requirement for whichever country in ${destinationLabel} you're most excited about — which one should I check first? I'll get you exact, verified details for that one.`;
+  }
+
+  // Genuinely distinct named countries (e.g. "Japan, South Korea") rather
+  // than one shared-regime region like Schengen — say so explicitly so this
+  // doesn't read as if one answer covers both (it doesn't; their visa
+  // regimes are unrelated).
+  const namedCountries = splitDestinationTokens(destinationLabel);
+  if (namedCountries.length > 1) {
+    const listJoined = joinWithAnd(namedCountries);
+    const plural = namedCountries.length === 2 ? 'both' : 'all of them';
+    if (priorBlockCount >= 2) return `Our expert is still confirming ${listJoined}'s visa requirements individually — that's still in progress. Meanwhile, happy to keep moving on the rest of the plan with you.`;
+    if (priorBlockCount === 1) return `Still confirming those separately with our expert — ${listJoined} each have their own visa requirement, and I don't want to mix them up or guess. I'll have ${plural} verified for you as soon as possible.`;
+    return `${listJoined} have separate visa requirements, so I want to verify each individually rather than assume they're the same — I'll get our expert to confirm the exact requirement, fee, and timing for ${plural}.`;
+  }
+
+  const destForPart = destinationLabel ? ` for ${destinationLabel}` : '';
+  const destThePart = destinationLabel ? ` the ${destinationLabel}` : ' that';
+  if (priorBlockCount >= 2) return `Still with our expert on${destThePart} visa verification — genuinely don't want to give you an unverified answer here. While that's in progress, happy to move ahead on the rest of your itinerary if you'd like.`;
+  if (priorBlockCount === 1) return `I know — still working on getting the exact visa requirement${destForPart} confirmed with our expert, didn't want to send you a guess. I'll update you the moment it's verified.`;
+  return `Let me verify the latest visa requirement${destForPart} before I advise you on that specifically — I don't want to give you incorrect details. I'll get our expert to confirm the exact requirement, fee, and timing for you.`;
 }
 
 // Ring buffer — same self-verifiable-without-Render-logs pattern as every
@@ -1777,12 +1878,16 @@ app.get('/debug/costing-audit-log', (req, res) => {
 // Orchestrator — called synchronously from mayaTurn, BEFORE onReply. Returns
 // the reply to actually send (either the original, unchanged, or the
 // substitute). hadVerifiedVisaData is computed by the caller from the same
-// visaIntelList already loaded for this turn's prompt (Layer 0).
-async function applyVisaSafetyBackstop(reply, hadVerifiedVisaData, destinationLabel, phone, channel) {
+// visaIntelList already loaded for this turn's prompt (Layer 0). msgs is
+// chat.msgs (prior turns only — the current reply hasn't been pushed onto it
+// yet at this point), used to vary the substitute if this destination has
+// already been blocked earlier in the same conversation.
+async function applyVisaSafetyBackstop(reply, hadVerifiedVisaData, destinationLabel, phone, channel, msgs = []) {
   if (hadVerifiedVisaData) return reply; // verified data existed — a confident claim is legitimate, nothing to check
+  const priorBlockCount = priorVisaSafetyBlockCount(msgs, destinationLabel);
   const tier1a = tier1aVisaClaimCheck(reply);
   if (tier1a.flagged) {
-    const substitute = buildVisaSafetySubstitute(destinationLabel);
+    const substitute = buildVisaSafetySubstitute(destinationLabel, priorBlockCount);
     recordVisaSafetyBlock({ tier: '1a', reason: tier1a.reason, original: reply, substitute, destination: destinationLabel, phone, channel });
     console.log(`🛑 [visa-safety] BLOCKED (tier1a: ${tier1a.reason}) [${phone}]`);
     return substitute;
@@ -1795,7 +1900,7 @@ async function applyVisaSafetyBackstop(reply, hadVerifiedVisaData, destinationLa
     // Fail CLOSED on error/timeout/unclear, not open — given the stakes, an
     // infra hiccup should produce an occasional unnecessary "let me verify"
     // rather than risk an unverified claim reaching the customer undetected.
-    const substitute = buildVisaSafetySubstitute(destinationLabel);
+    const substitute = buildVisaSafetySubstitute(destinationLabel, priorBlockCount);
     const reason = tier2.checked ? `tier2 confirmed: ${tier2.verdict}` : `tier2 check failed (${tier2.reason}) — failing closed`;
     recordVisaSafetyBlock({ tier: tier2.checked ? '2' : '2-failclosed', reason, original: reply, substitute, destination: destinationLabel, phone, channel });
     console.log(`🛑 [visa-safety] BLOCKED (${reason}) [${phone}]`);
@@ -1863,7 +1968,7 @@ app.post('/cron/daily-digest', async (req, res) => {
       await sendWA(t.wa, 'team_lead_digest', [
         t.name,
         String(results.lalit.live), String(results.divya.live), String(results.anjan.live),
-        String(results.shubham.live), String(results.prabhjot.live), String(results.damini.live),
+        String(results.riya.live), String(results.prabhjot.live), String(results.damini.live),
         String(totalLive)
       ]);
     }
@@ -2225,7 +2330,7 @@ The direct, permanent fix for a real, serious mistake (Maya once told an Indian 
 
 State the visa CATEGORY (visa-free / eVisa / visa-on-arrival / embassy visa required), a specific FEE, or a specific PROCESSING/APPOINTMENT TIME confidently ONLY when a "VISA INTELLIGENCE FOR THIS DESTINATION" block is present in this context for that destination — that block only ever appears when EscapeNFly's own data for it is verified, current, and specifically checked against an official source. NEVER state or imply any of these three from your own general knowledge, even when you feel confident about it — general knowledge is exactly what caused the past mistake. When present, frame fee/processing figures as "typically [X], as of [the date shown in that block]" — never as a guarantee, and never implying a near-term travel date is safely achievable just because processing is normally fast (appointment AVAILABILITY is separate from processing speed, and can be scarce even when processing itself is quick).
 
-If no such block is present for the destination being discussed, say exactly: "Let me verify the latest requirement before I advise you." — then continue the conversation naturally (keep gathering their trip details, or move to handover) rather than stalling on it or guessing. Do not repeat that exact sentence more than once per destination in one conversation.
+If no such block is present for the destination being discussed, say exactly: "Let me verify the latest requirement before I advise you." — then continue the conversation naturally (keep gathering their trip details, or move to handover) rather than stalling on it or guessing. Do not repeat that exact sentence more than once per destination in one conversation. SPECIAL CASE — the destination is a multi-country region (Europe, Schengen, Southeast Asia, Scandinavia, the Gulf, etc.) rather than one named country: the verification line above can't resolve to anything until a specific country is named, so fold the resolving question into the SAME sentence rather than leaving it for a separate turn — e.g. for "Europe": "Let me verify the latest requirement for whichever country you're most excited about — which one within Europe should I check first? I'll get you exact, verified visa details for that one." This turns the deflection into forward progress instead of a dead end, and gives the customer a concrete reason to answer.
 
 Speak entirely in EscapeNFly's own voice about visa facts — "we've verified", "our records show", "as of our latest check" — never naming VisaHQ, a government website, or any other external source to the customer, exactly like founder-notes facts are never attributed to a source today.
 
@@ -2450,6 +2555,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         // Validation: intent whitelist (belt-and-suspenders — schema enum
         // already constrains this, but guard against edge-case drift)
         if (!VALID_INTENTS.includes(parsed.intent)) parsed.intent = 'other_travel';
+        if (debugRef) { debugRef.usage = d.usage; debugRef.model = d.model; }
         return parsed;
       }
       if (debugRef) { debugRef.status = r.status; debugRef.errorType = 'no_tool_use_block'; debugRef.errorMessage = JSON.stringify(d).slice(0, 300); }
@@ -2612,7 +2718,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     if (reply !== FALLBACK_REPLY) {
       const hadVerifiedVisaData = visaIntelList.some(vi => vi.data_confidence === 'verified' && vi.visa_requirement && vi.visa_requirement !== 'unclear');
       const destinationLabel = parsed.lead?.destination || visaDestKeys[0] || chat.known?.destination || '';
-      reply = await applyVisaSafetyBackstop(reply, hadVerifiedVisaData, destinationLabel, phone, channel); // effectivePhone isn't resolved yet at this point in the turn — phone is the correct value pre-send
+      reply = await applyVisaSafetyBackstop(reply, hadVerifiedVisaData, destinationLabel, phone, channel, chat.msgs); // effectivePhone isn't resolved yet at this point in the turn — phone is the correct value pre-send
     }
 
     // ══ SEND FIRST — customer waits for nothing below this line ══
@@ -2674,19 +2780,43 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
 
     // ── VISA INTELLIGENCE — on-demand live lookup (fire-and-forget) ──
     // Same "reply already sent, this cannot delay or alter it" discipline as
-    // the stacked-question check above. Scoped to intent === 'visa' to keep
-    // background cost proportional to genuine visa enquiries. Prefers the
-    // curated visa_intelligence key already resolved above; falls back to
+    // the stacked-question check above. Prefers the curated visa_intelligence
+    // keys already resolved above (ALL of them — not just the first; a
+    // multi-country enquiry like "Japan and South Korea" resolves
+    // visaDestKeys to both, and until 14 Aug 2026 this only ever triggered a
+    // lookup for visaDestKeys[0], leaving Korea's row permanently stuck at
+    // needs_refresh no matter how many times the customer asked, since
+    // nothing else in the codepath ever attempted it either). Falls back to
     // Maya's own freshly-extracted lead.destination (a single, non-compound-
-    // looking word) so the table can genuinely expand to destinations
-    // outside the initial 20 based on real questions, not just the seed list.
-    if (effectiveIntent === 'visa') {
-      const curatedKey = visaDestKeys[0] || '';
+    // looking word) only when there's no curated key at all, so the table
+    // can genuinely expand to destinations outside the initial 20 based on
+    // real questions, not just the seed list.
+    //
+    // Gate is effectiveIntent === 'visa' OR a direct \bvisa\b match on this
+    // turn's own message — NOT effectiveIntent alone (found 14 Aug 2026,
+    // same transcript as the two bugs above). effectiveIntent is tuned for
+    // STAGE_LOGIC flow selection, where guessIntentFromMessage deliberately
+    // stays 'holiday' for any broader multi-topic message ("plan my trip AND
+    // check visa formalities") to avoid locking into the narrow visa-only
+    // conversational flow — correct for THAT purpose. But real customers
+    // usually ask about visas exactly that way, mixed into broader planning
+    // (confirmed in two separate real transcripts the same day: the Europe
+    // case and this Japan/South Korea one), and reusing that same narrow
+    // classification as the refresh trigger's gate meant this on-demand
+    // expansion mechanism almost never engaged for the most common real
+    // phrasing — even though the safety backstop above (content-based, not
+    // intent-gated) correctly fired every time. The backstop kept detecting
+    // "no safe data for this" every turn while nothing ever actually went to
+    // go get that data. A direct message-level check decouples this trigger
+    // from STAGE_LOGIC's flow-selection tuning without touching it.
+    const messageHasVisaSignal = /\bvisa\b/i.test(message);
+    if (effectiveIntent === 'visa' || messageHasVisaSignal) {
+      const curatedKeys = visaDestKeys.length ? visaDestKeys : [];
       const rawDest = String(chat.known.destination || '').trim().toLowerCase();
       const looksCompound = /\b(and|or)\b|[\/&,]/.test(rawDest);
-      const fallbackKey = (!curatedKey && rawDest && !looksCompound && /^[a-z\s]{3,30}$/.test(rawDest) && !DOMESTIC.some(d => rawDest.includes(d))) ? rawDest : '';
-      const visaTriggerKey = curatedKey || fallbackKey;
-      if (visaTriggerKey) {
+      const fallbackKey = (!curatedKeys.length && rawDest && !looksCompound && /^[a-z\s]{3,30}$/.test(rawDest) && !DOMESTIC.some(d => rawDest.includes(d))) ? rawDest : '';
+      const visaTriggerKeys = curatedKeys.length ? curatedKeys : (fallbackKey ? [fallbackKey] : []);
+      for (const visaTriggerKey of visaTriggerKeys) {
         const alreadyVerified = visaIntelList.some(vi => vi.destination_country === visaTriggerKey && vi.data_confidence === 'verified');
         if (!alreadyVerified) {
           triggerVisaLookupAsync(visaTriggerKey, effectivePhone, channel).catch(() => {});
@@ -3574,3 +3704,27 @@ const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.9 running on port ${PORT}`));
 }
+
+// Exposed for the isolated model-comparison harness (tests/model-lab/) only —
+// no production code path calls into these via require(). callMayaJSON and
+// mayaTurn are the actual reply-generation and full-turn functions; the rest
+// are the exact functions mayaTurn's context-resolution block calls, exported
+// so the harness can mirror that sequencing with the SAME underlying lookups
+// rather than reimplementing the Supabase queries themselves.
+module.exports = {
+  callMayaJSON,
+  mayaTurn,
+  guessDestinationKeyFromMessage,
+  allFounderDestinationKeyMatches,
+  loadFounderNotes,
+  allVisaIntelDestinationKeyMatches,
+  loadVisaIntelligence,
+  lookupDestinationInfo,
+  loadLiveWeather,
+  loadForexRate,
+  guessIntentFromMessage,
+  validPhone,
+  loadEnquiryStatus,
+  loadPastDestinations,
+  loadCustomerProfile
+};

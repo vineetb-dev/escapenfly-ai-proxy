@@ -1232,8 +1232,12 @@ async function notifyTeam(assigned, leadData) {
     ok = await sendWA(assigned.wa, 'team_lead_notification',
       [assigned.name, leadData.name || 'Unknown', leadData.destination || 'TBD', assigned.name]) && ok;
   }
-  ok = await sendWA(WA_NUM, 'team_lead_notification',
-    ['Vineet', leadData.name || 'Unknown', leadData.destination || 'TBD', assigned.name]) && ok;
+  // v-fix (17 Aug 2026): Vineet's unconditional real-time CC on this
+  // template removed — pure duplication for him specifically, he already
+  // gets the same new-lead information via the 10am individual_lead_digest
+  // + team_lead_digest. Rep's own send above is unchanged. If this
+  // function is ever asked to notify someone else too, add them
+  // explicitly rather than reviving a blanket founder-tier CC here.
   return ok;
 }
 
@@ -2108,7 +2112,26 @@ app.post('/cron/visa-appointments', async (req, res) => {
   }
 });
 
-// ── /cron/booking-check — newly booked leads → founder tier (run every ~15-30 min) ──
+// ── /cron/booking-check — newly booked leads → founder tier, once daily ──
+// v-fix (17 Aug 2026): was near-real-time (Render trigger every ~15-30
+// min), one booking_confirmed_alert TEMPLATE send per booking per founder.
+// Now batches everything still booking_notified=false into ONE digest
+// per founder. Query itself is UNCHANGED (still booking_notified=eq.false,
+// not a "last 24h" time-window filter) — that flag-based selection is
+// actually more robust for a daily cadence than a rigid time window would
+// be: if a run is ever skipped or delayed, eq.false still catches every
+// unnotified booking on the next run, whereas a hardcoded 24h window
+// could silently drop one that's now >24h old. Skips the send entirely
+// if nothing's new.
+//
+// SCHEDULE CHANGE — code alone does not do this. Render's Cron Jobs
+// dashboard entry for this endpoint needs its trigger frequency changed
+// from ~every 15-30 min to once daily; nothing in this repo controls
+// that. Until that's changed on Render's side, this still runs as often
+// as before — it'll just send fewer, batched messages each time instead
+// of one message per booking (still correct, just not the "once daily"
+// cadence intended). Same category of external-schedule dependency
+// flagged for /cron/stale-check earlier.
 app.post('/cron/booking-check', async (req, res) => {
   if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
   res.json({ status: 'started' });
@@ -2120,27 +2143,53 @@ app.post('/cron/booking-check', async (req, res) => {
     if (!r.ok) { console.error('booking-check query failed:', r.status, await r.text()); return; }
     const rows = await r.json();
 
+    if (!rows.length) {
+      console.log('🎉 [booking-check] 0 new bookings — nothing to notify.');
+      return;
+    }
+
+    const lines = [];
+    let totalValue = 0;
     for (const row of rows) {
       let lead = {};
       try { lead = JSON.parse(row.original_message_text || '{}'); } catch (e) {}
       const customerName = lead.name || 'Unknown';
       const destination = lead.dest || 'their trip';
       const pax = String(row.pax_adults || '-');
-      const value = row.budget_max ? String(row.budget_max) : '0';
+      const value = row.budget_max || 0;
+      totalValue += value;
+      lines.push(`• ${customerName} (${destination}) — ${pax} pax, ₹${value}`);
+      console.log(`🎉 [booking] Queued for digest: ${customerName} (${destination}) — ₹${value}`);
+    }
 
-      for (const key of FOUNDER_KEYS) {
-        const t = TEAM[key];
-        await sendWA(t.wa, 'booking_confirmed_alert', [t.name, customerName, destination, pax, value]);
-      }
+    // Same reasoning as the stale-check Vineet digest: booking_confirmed_alert
+    // is an approved TEMPLATE with a fixed single-booking shape (name/dest/
+    // pax/value) and can't carry a variable-length list, so a real batched
+    // message has to go via sendSessionMessage (free text) instead of
+    // sendWA. Same real caveat applies here, to ALL FOUNDER_KEYS recipients
+    // this time, not just Vineet: session messages only deliver within a
+    // 24h window opened by the recipient messaging the business number
+    // first, which none of Vineet/Vivek/Abhishek/Prabhjot are guaranteed to
+    // have open at any given run. If this digest silently stops arriving
+    // for someone, check that before assuming a code regression.
+    const digestMsg = `🎉 Booking digest — ${rows.length} new booking${rows.length === 1 ? '' : 's'} confirmed (₹${totalValue} total):\n\n${lines.join('\n')}`;
+    for (const key of FOUNDER_KEYS) {
+      const t = TEAM[key];
+      const ok = await sendSessionMessage(t.wa, digestMsg);
+      if (!ok) console.error(`⚠️ [booking-check] digest send FAILED for ${t.name} — likely no open 24h session.`);
+    }
 
-      await fetchRetry(`${SB_URL}/rest/v1/enquiries?id=eq.${row.id}`, {
+    for (const row of rows) {
+      const patchR = await fetchRetry(`${SB_URL}/rest/v1/enquiries?id=eq.${row.id}`, {
         method: 'PATCH',
         headers: { ...SB_HEADERS, Prefer: 'return=minimal' },
         body: JSON.stringify({ booking_notified: true })
       }, 'SB-markBookingNotified');
-      console.log(`🎉 [booking] Confirmed alert sent for ${customerName} (${destination}) — ₹${value}`);
+      if (!patchR.ok) {
+        console.error(`⚠️ [booking-check] booking_notified write FAILED for ${row.id} — this booking WILL reappear in the next digest: ${patchR.status} ${await patchR.text()}`);
+      }
     }
-    console.log(`🎉 [booking-check] ${rows.length} new booking(s) notified.`);
+    console.log(`🎉 [booking-check] ${rows.length} new booking(s) batched into one digest per founder (₹${totalValue} total).`);
   } catch (e) {
     console.error('booking-check error:', e);
   }

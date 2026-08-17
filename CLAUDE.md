@@ -190,10 +190,45 @@ said 31 live leads, actual was 5):
   which needs external AiSensy/Meta approval — not something a code
   change alone can do.
 - Reps' own per-lead `stale_lead_alert` sends are unchanged by either fix.
-- **Flagged, not fixed**: Vineet is also unconditionally CC'd in real time
-  on every single `team_lead_notification` (new-lead alert), separately
-  from the stale-check volume above. Whether that should change too is
-  his call, not made here.
+
+**18 Aug 2026 follow-up — the two items above that were flagged-not-fixed are now fixed:**
+- `notifyTeam()`'s unconditional real-time Vineet CC on `team_lead_notification`
+  is **removed**. He already gets the same information via the 10am
+  `individual_lead_digest` + `team_lead_digest`, so this was pure
+  duplication for him specifically. The assigned rep's own send is
+  untouched. Verified against the real, unmodified function (not a
+  rewrite/mock of the logic) by running the actual server locally and
+  hitting `/notify/manual-lead` — with no `AISENSY_KEY` configured
+  locally, `sendWA` no-ops before any network call, so this was safe to
+  run for real: exactly one `sendWA skipped` log line appeared (the rep),
+  zero for Vineet/`WA_NUM`.
+- `/cron/booking-check` batches everything still `booking_notified=false`
+  into **one digest per founder** instead of one `booking_confirmed_alert`
+  template send per booking per founder (was near-real-time, ~every
+  15-30 min). Query itself is unchanged (`booking_notified=eq.false`, not
+  a "last 24h" time window) — deliberately kept as a flag-based selection
+  rather than a rigid time window, since that's robust to a missed/delayed
+  run (nothing gets silently dropped for being >24h old). Skips the send
+  entirely if nothing's new. Same template-shape constraint as the
+  stale-check fix applies here too — `booking_confirmed_alert` is a
+  fixed single-booking template, so batching required switching to
+  `sendSessionMessage` (free text), which means the same 24h-session-
+  window caveat now applies to **all four `FOUNDER_KEYS` recipients**
+  (Vineet, Vivek, Abhishek, Prabhjot), not just Vineet. Verified the real
+  digest-construction code (unmodified) end-to-end with `node --require`
+  preloading a `global.fetch` mock so the process could not reach the
+  real network at all — 3 synthetic bookings correctly produced exactly
+  4 sends (one per founder, not 12), correct running total (₹230000),
+  correct per-line formatting.
+- **Schedule change still needed on Render's side, separately from this
+  code change** — same category as the stale-check schedule assumption
+  found earlier. Render's Cron Jobs entry for `/cron/booking-check`
+  currently triggers every ~15-30 min; nothing in this repo controls
+  that. Until someone changes it in Render's dashboard, this endpoint
+  still *runs* that often — it'll just send fewer, batched messages each
+  time instead of one per booking (still correct, just not the intended
+  once-daily cadence). Verify the current setting in Render before
+  assuming this behaves as "once daily" in production.
 
 ## Debug endpoints (all `CRON_SECRET`-gated, none hardcode the secret)
 `/debug/webhook-sig-log`, `/debug/stacked-question-log`,

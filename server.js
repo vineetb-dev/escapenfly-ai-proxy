@@ -1928,11 +1928,17 @@ async function countLeadsFor(assignedName, opts = {}) {
     return (await r.json()).length;
   }
 
+  // v-fix (17 Aug 2026): "live"/"urgent" previously only excluded
+  // booked/lost, not cancelled — silently counting cancelled leads as
+  // still-live. Found investigating a reported wrong digest count
+  // (Divya showed 31 live, real number was 5 — all 26 of the gap was her
+  // cancelled leads). Now matches the CRM's own "Active" definition
+  // exactly (["booked","lost","cancelled"].indexOf(status)<0 in index.html).
   const [newCount, followupCount, urgentCount, liveCount] = await Promise.all([
     countWhere(`&status=eq.new`),
     countWhere(`&status=in.(follow-up,followup)`),
-    countWhere(`&priority=eq.high&status=neq.booked&status=neq.lost`),
-    countWhere(`&status=neq.booked&status=neq.lost`)
+    countWhere(`&priority=eq.high&status=neq.booked&status=neq.lost&status=neq.cancelled`),
+    countWhere(`&status=neq.booked&status=neq.lost&status=neq.cancelled`)
   ]);
   return { new: newCount, followup: followupCount, urgent: urgentCount, live: liveCount };
 }
@@ -1993,6 +1999,15 @@ app.post('/cron/stale-check', async (req, res) => {
     const rows = await r.json();
 
     let alertedCount = 0;
+    // v-fix (17 Aug 2026): Vineet used to get the SAME approved
+    // stale_lead_alert template sent once PER LEAD (unconditional CC
+    // inside this loop) — with this cron firing multiple times a day
+    // (confirmed ~4x/day from last_stale_alert_at timestamps during
+    // investigation), that was N separate WhatsApp pings just for him,
+    // every run. Collected here instead and sent as ONE digest message
+    // after the loop. Reps keep their own per-lead template send
+    // unchanged — that granularity is useful to them.
+    const vineetDigestLines = [];
     for (const row of rows) {
       // Dedup: skip unless this is a first-time alert, last_activity_at
       // has moved forward since the last alert (someone worked the lead,
@@ -2016,7 +2031,7 @@ app.post('/cron/stale-check', async (req, res) => {
       if (repEntry && repEntry.wa) {
         await sendWA(repEntry.wa, 'stale_lead_alert', [repEntry.name, customerName, destination, String(hoursStale)]);
       }
-      await sendWA(TEAM.admin.wa, 'stale_lead_alert', ['Vineet (CC)', customerName, destination, String(hoursStale)]);
+      vineetDigestLines.push(`• ${customerName} (${destination}) — ${hoursStale}h stale, rep: ${repName}`);
       console.log(`⏰ [stale] ${customerName} (${destination}) — ${hoursStale}h stale, rep: ${repName}`);
 
       // Previously unchecked — a silent failure here would send the alert
@@ -2036,7 +2051,28 @@ app.post('/cron/stale-check', async (req, res) => {
       }
       alertedCount++;
     }
-    console.log(`⏰ [stale-check] ${rows.length} currently stale, ${alertedCount} alerted (rest deduped).`);
+
+    // NOTE — real risk, not silently assumed safe: this uses
+    // sendSessionMessage (the MAYA_CAMPAIGN free-text send Maya's own
+    // customer replies use), because the approved stale_lead_alert
+    // template has a fixed single-lead shape (rep/customer/destination/
+    // hours) and can't carry a variable-length list — there is no
+    // approved multi-lead digest template today. Unlike sendWA's
+    // pre-approved template campaign, WhatsApp Business API session
+    // messages are only deliverable within a 24h window opened by the
+    // RECIPIENT messaging the business number first. Vineet is staff,
+    // not part of the customer inbound flow, so there's no guarantee
+    // he has an open session at any given run. If this silently stops
+    // delivering, check that first — it's not necessarily a code bug.
+    // A real pre-approved batched-digest template is the more durable
+    // fix but needs external AiSensy/Meta template approval, which no
+    // code change here can do.
+    if (vineetDigestLines.length) {
+      const digestMsg = `⏰ Stale-lead digest — ${vineetDigestLines.length} lead${vineetDigestLines.length === 1 ? '' : 's'} newly flagged this run:\n\n${vineetDigestLines.join('\n')}`;
+      const digestOk = await sendSessionMessage(TEAM.admin.wa, digestMsg);
+      if (!digestOk) console.error('⚠️ [stale-check] Vineet digest send FAILED — see sendSessionMessage log above (likely no open 24h session, see comment above this block).');
+    }
+    console.log(`⏰ [stale-check] ${rows.length} currently stale, ${alertedCount} alerted (rest deduped), Vineet digest: ${vineetDigestLines.length ? `sent (${vineetDigestLines.length} leads)` : 'skipped (nothing new)'}.`);
   } catch (e) {
     console.error('stale-check error:', e);
   }

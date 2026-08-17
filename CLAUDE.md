@@ -161,6 +161,40 @@ remove it from `DEPARTED_KEYS`, update `REP_KEYS` and the
 `team_lead_digest` `results.<key>` reference, AND add the new key to
 that JSON-schema enum line — all four, in the same change.
 
+## WhatsApp digest/alert accuracy and volume (17 Aug 2026)
+Two real bugs found investigating a wrong lead-count report (Divya's digest
+said 31 live leads, actual was 5):
+- `countLeadsFor()`'s "live" and "urgent" queries excluded `booked`/`lost`
+  but not `cancelled` — cancelled leads were silently counted as still
+  live/urgent. Now excludes `cancelled` too, matching the CRM's own
+  `["booked","lost","cancelled"].indexOf(status)<0` "Active" definition
+  exactly (`index.html`'s `rCRM()`). If you add another "closed" status to
+  either codebase, update both places — they're two independent
+  reimplementations of the same concept, not shared code.
+- `/cron/stale-check` used to unconditionally send Vineet the SAME approved
+  `stale_lead_alert` template once **per lead**, every run. With the cron
+  actually firing ~4x/day (confirmed from real `last_stale_alert_at`
+  timestamp clusters — every ~6h, not the 2x/day it was assumed to be),
+  that was N separate WhatsApp messages just for his CC, on top of every
+  rep's own per-lead alert. Now batched into one free-text digest per run
+  (skipped entirely if nothing new that run). **This uses
+  `sendSessionMessage`, not `sendWA`** — the only mechanism in this file
+  that can carry a variable-length list, since no approved multi-lead
+  digest template exists. That means it's subject to WhatsApp's 24h
+  session window (recipient must have messaged the business number
+  recently) unlike template sends, which don't need one. Vineet is staff,
+  not part of the customer inbound flow, so this could silently stop
+  delivering if he has no open session at run time — check that first if
+  Vineet reports the digest went quiet, don't assume a code regression.
+  The durable fix is a real pre-approved batched-digest WhatsApp template,
+  which needs external AiSensy/Meta approval — not something a code
+  change alone can do.
+- Reps' own per-lead `stale_lead_alert` sends are unchanged by either fix.
+- **Flagged, not fixed**: Vineet is also unconditionally CC'd in real time
+  on every single `team_lead_notification` (new-lead alert), separately
+  from the stale-check volume above. Whether that should change too is
+  his call, not made here.
+
 ## Debug endpoints (all `CRON_SECRET`-gated, none hardcode the secret)
 `/debug/webhook-sig-log`, `/debug/stacked-question-log`,
 `/debug/visa-safety-block-log`, `/debug/visa-refresh-log`,

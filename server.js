@@ -1947,6 +1947,32 @@ async function countLeadsFor(assignedName, opts = {}) {
   return { new: newCount, followup: followupCount, urgent: urgentCount, live: liveCount };
 }
 
+// v-fix (18 Aug 2026): replaces team_lead_digest's fixed 7-param shape
+// (name + one hardcoded slot per rep) with a single dynamic {{2}} block on
+// the newly-approved team_lead_digest_v2 template. The old template had
+// each rep's NAME baked into its approved static body text, not passed as
+// a parameter — so renaming TEAM's key (e.g. Shubham -> Riya) updated the
+// NUMBER in that slot correctly but could never fix the LABEL, since that
+// text lives on AiSensy's side and needs template re-approval to change.
+// v2 fixes this structurally: every name here is a real parameter, built
+// fresh from TEAM/REP_KEYS at send time, so a future seat change is a
+// TEAM-object-only edit again, same as everywhere else in this file —
+// no template re-approval needed for a name change ever again.
+// Departed reps (DEPARTED_KEYS) are left OUT of the visible per-person
+// list entirely now, rather than being forced to occupy a fixed slot just
+// to keep the old template's shape valid — there's no more technical
+// reason to show a departed name in a founder-facing digest. Their leads
+// (if any remain unassigned away) still count toward the total below,
+// same as before.
+function buildTeamDigestBlock(results, damini, totalLive) {
+  const lines = REP_KEYS
+    .filter(key => !DEPARTED_KEYS.includes(key))
+    .map(key => `${TEAM[key].name}: ${results[key].live}`);
+  lines.push(`${damini.name}: ${results.damini.live}`);
+  lines.push(`Total: ${totalLive}`);
+  return lines.join('\n');
+}
+
 // ── /cron/daily-digest — 10AM Mon-Sat: individual + team lead status ──
 app.post('/cron/daily-digest', async (req, res) => {
   if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
@@ -1973,16 +1999,12 @@ app.post('/cron/daily-digest', async (req, res) => {
     console.log(`📊 [digest] ${damini.name} (visa): new=${dC.new} followup=${dC.followup} urgent=${dC.urgent}`);
 
     const totalLive = Object.values(results).reduce((sum, c) => sum + c.live, 0);
+    const digestBlock = buildTeamDigestBlock(results, damini, totalLive);
     for (const key of FOUNDER_KEYS) {
       const t = TEAM[key];
-      await sendWA(t.wa, 'team_lead_digest', [
-        t.name,
-        String(results.lalit.live), String(results.divya.live), String(results.anjan.live),
-        String(results.riya.live), String(results.prabhjot.live), String(results.damini.live),
-        String(totalLive)
-      ]);
+      await sendWA(t.wa, 'team_lead_digest_v2', [t.name, digestBlock]);
     }
-    console.log(`📊 [digest] Team digest sent to founders. Total live leads: ${totalLive}`);
+    console.log(`📊 [digest] Team digest v2 sent to founders. Total live leads: ${totalLive}\n${digestBlock}`);
   } catch (e) {
     console.error('daily-digest error:', e);
   }

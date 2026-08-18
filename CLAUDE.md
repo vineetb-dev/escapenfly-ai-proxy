@@ -230,6 +230,63 @@ said 31 live leads, actual was 5):
   once-daily cadence). Verify the current setting in Render before
   assuming this behaves as "once daily" in production.
 
+## team_lead_digest → team_lead_digest_v2 (18 Aug 2026) — the actual root-cause fix for the Shubham/Riya digest bug
+The investigation above (Riya/Shubham) concluded the "Shubham has 1, no
+Riya" text was correct code producing a correct NUMBER against a stale
+LABEL baked into `team_lead_digest`'s pre-approved static body text —
+not fixable in `server.js` alone, since WhatsApp templates need
+Meta/AiSensy re-approval to edit body copy, not a code deploy.
+`team_lead_digest_v2` is that re-approved template — genuinely dynamic
+now: `{{1}}` = recipient name (unchanged), `{{2}}` = one multi-line
+free-form block built fresh at send time.
+
+`buildTeamDigestBlock(results, damini, totalLive)` builds that block from
+`TEAM`/`REP_KEYS` directly — one `Name: count` line per rep (skipping
+anyone in `DEPARTED_KEYS`, since there's no more fixed-slot reason to
+show a departed name), then Damini's visa count, then a total. This is
+the structural fix that stops this exact bug class recurring: the next
+seat change is a `TEAM`-object-only edit again, no template resubmission
+ever needed for a name change specifically (a genuinely NEW slot — e.g.
+an additional rep — would still need the template's line count/shape
+touched, but a same-shape name swap now needs nothing on AiSensy's side).
+
+**Verified against real current data** (not synthetic): ran the actual,
+unmodified `/cron/daily-digest` handler locally against real production
+Supabase (read-only — this cron never writes anything) with no
+`AISENSY_KEY` configured locally, so `sendWA` safely no-ops before any
+network call — real code path, zero risk of an unverified send. Real
+output:
+```
+Lalit Mehta: 14
+Divya Nigam: 5
+Anjan Pramanick: 5
+Riya Negi: 2
+Prabhjot Singh: 9
+Damini: 0
+Total: 35
+```
+Cross-checked Lalit (14), Prabhjot (9), Anjan (5) directly against
+Supabase independently of the app's own computation — exact match.
+Riya's 2 also independently confirmed by checking her two enquiries'
+`created_at` timestamps directly. Arithmetic self-consistent
+(14+5+5+2+9+0=35, matches `totalLive`). No "Shubham" anywhere.
+
+**Real AiSensy delivery — NOT verified, stating plainly rather than
+implying otherwise**: there is no real `AISENSY_KEY` available in this
+environment (not in local `.env`, no Render access), so no actual
+network call to AiSensy's API happened for `team_lead_digest_v2` —
+only the constructed request (`campaignName`, `destination`,
+`templateParams`) was confirmed correct via the real `sendWA()` code
+path up to the point it safely no-ops on the missing key. **The one
+thing genuinely unconfirmed is whether AiSensy's live API recognizes
+the exact string `team_lead_digest_v2`** and will actually deliver
+against it — that can only be confirmed once this is live: check
+Render's runtime logs for the `❌ sendWA 'team_lead_digest_v2' → ...
+FAILED` error line (would mean a name/approval mismatch) after the next
+`/cron/daily-digest` run, or manually trigger that cron once with the
+real `CRON_SECRET` and check for it immediately rather than waiting for
+10am.
+
 ## Prompt caching (18 Aug 2026)
 `cache_control` breakpoints added to the two genuinely-large, genuinely-
 static system prompts in this file. **Correction to how this was first

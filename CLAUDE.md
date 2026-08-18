@@ -383,7 +383,19 @@ workflow).
 ## Known, deliberate, NOT-yet-fixed gaps
 - RLS disabled on all Supabase tables except `costing_audits` (see above —
   same as the CRM repo for every other table) — deferred, needs a real
-  design pass, not a quick flip.
+  design pass, not a quick flip. **In progress as of 18 Aug 2026** for the
+  two highest-exposure tables specifically — see the RLS rollout section
+  below.
+- **Deploy step still pending as of 18 Aug 2026 (RLS rollout)**:
+  `ADMIN_WRITE_SECRET` and `VENDOR_CREDS_SECRET` need to be set in
+  Render's env vars, and the SAME values copied into escapenfly-crm's
+  matching JS constants (once those exist — CRM side not deployed yet as
+  of this endpoint's own deploy). Same fail-closed shape as
+  `COSTING_AUDIT_SECRET` below: until both sides are set, every
+  `/internal/roles-write`, `/internal/staff-roles-write`,
+  `/internal/portal-credentials-read`, and `/internal/portal-credentials-
+  write` call returns 401. Real generated values are NOT committed to
+  this repo — Vineet has them from the session that generated them.
 - **Deploy step still pending as of 13 Aug 2026**: `SUPABASE_SERVICE_ROLE_KEY`
   and `COSTING_AUDIT_SECRET` need to be set in Render's env vars (and
   `COSTING_AUDIT_SECRET`'s value copied into escapenfly-crm's
@@ -396,3 +408,77 @@ workflow).
   aren't code bugs, check the AiSensy dashboard (Developer > Webhooks,
   Flows) before assuming a code fix is needed for a "Maya isn't
   responding" report.
+
+## RLS rollout — roles/staff_roles + portal_credentials (18 Aug 2026)
+**The real architectural finding first, confirmed directly in code, not
+assumed**: this system has NO real Supabase Auth anywhere. Checked both
+repos for any `.auth.*()` call — zero. escapenfly-crm's `getSB()` always
+creates its client with the same static anon/publishable key regardless
+of who's "logged into" the CRM's own fake login screen (`doLogin()` is
+pure local JS — hardcoded shared password + optional per-browser
+localStorage password, never touches Supabase). This repo's own Supabase
+calls are the same shape, one static key per table except `costing_audits`
+(service_role). **Consequence: `auth.uid()`/per-person RLS policies are
+not achievable without a real auth migration** — Postgres cannot tell
+which staff member is asking, because no request ever carries one. What
+RLS CAN do without that migration is the coarser "anon key holder" vs.
+"trusted server process that never ships its key to a browser" boundary —
+that's what this rollout targets, deliberately not proposing anything
+finer-grained than that.
+
+Verified directly (not assumed) before designing anything: all 32 public
+tables enumerated via `pg_class`/`information_schema`/`pg_policies`. Only
+`costing_audits` has RLS on. `roles`/`staff_roles` have full anon
+SELECT/INSERT/UPDATE/DELETE grants and **no policy of any kind** — RLS
+enabled with zero policies would default-deny everything, including the
+app's own legitimate reads. `portal_credentials` also has full anon
+grants AND an existing **dormant `anon_all` policy** (`cmd: ALL,
+qual: true`) — flipping RLS on this table without also dropping that
+policy is a pure no-op, not a fix; this is the sharpest footgun in the
+whole rollout and is called out explicitly wherever this table comes up.
+
+**Sequencing, and why it's sequential not atomic**: build the
+service-role-gated proxy endpoint, deploy it alone, verify with real
+disposable data, THEN switch the CRM's direct `sb.from(...)` calls to use
+it, deploy that alone, verify via real UI, THEN and only then enable RLS.
+Never ship the proxy and the RLS flip together. Reason: once the CRM's
+code depends on the new endpoint, a bug there breaks the write/read
+regardless of RLS's state — but the ROLLBACK differs enormously. With RLS
+still off, a broken endpoint's fix is a pure CRM code revert (old direct
+`sb.from()` calls still work, since anon can still write/read directly) —
+fast, single-repo, no coordination needed. With RLS already on, that same
+revert does nothing, because the reverted code hits a database that now
+denies anon — recovery needs a SECOND, uncoordinated Supabase-side change
+under time pressure. `portal_credentials` makes this materially worse
+than `roles`/`staff_roles`: its read (`syncPortalCreds()`) runs on every
+single session load, not just an occasional admin action, so a broken
+proxy there is instantly company-wide-on-next-refresh, not a bounded
+inconvenience for whoever happens to be editing permissions. Checked
+directly: `syncPortalCreds()`'s own `try/catch` means a broken read
+degrades to `rVnd()`'s `"No matches"` empty state, not a crashed app or
+broken CRM — the blast radius is real but bounded to that one tab, which
+is exactly why fast, RLS-still-off rollback is worth protecting.
+
+**Separate secrets, deliberately**: `ADMIN_WRITE_SECRET` (roles/
+staff_roles) and `VENDOR_CREDS_SECRET` (portal_credentials) are two more
+values in the same family as `COSTING_AUDIT_SECRET` — never `CRON_SECRET`
+(shipped to a browser), and also never EACH OTHER or `COSTING_AUDIT_SECRET`
+(different-sensitivity capabilities; one leaked secret shouldn't hand over
+all of them). Same honest limit as `costing_audits` applies to both new
+proxies: a valid secret proves the request came from the CRM app, not
+which staff member is behind it. That's not solved here and isn't
+pretended to be.
+
+### Status as of tonight
+- `/internal/roles-write`, `/internal/staff-roles-write`,
+  `/internal/portal-credentials-read`, `/internal/portal-credentials-write`
+  — built and deployed. Verified locally against real Supabase with
+  disposable test data (a throwaway role, a throwaway `staff_roles` row
+  under a clearly-fake email never used by real staff), confirmed at the
+  DB level independently of the endpoints' own success response, then
+  cleaned up — zero residue in production data. Negative-tested: missing
+  secret and wrong secret both correctly return 401.
+- RLS itself: **not yet touched on either table.** Real grants/policies
+  above are the pre-rollout baseline, not the current state — check this
+  section's own "Status" line for what's actually true before assuming
+  the plan completed.

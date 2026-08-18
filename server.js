@@ -139,6 +139,20 @@ const COSTING_AUDIT_SECRET = process.env.COSTING_AUDIT_SECRET || 'change-me-plea
 // every other table's SB_KEY (anon/publishable) access is today's known,
 // separately-tracked open item.
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+// RLS rollout, 18 Aug 2026 — roles/staff_roles + portal_credentials. Two
+// MORE separate secrets, same reasoning as COSTING_AUDIT_SECRET above:
+// both ship into escapenfly-crm's client JS, so neither may ever double as
+// CRON_SECRET, and they're kept separate from EACH OTHER and from
+// COSTING_AUDIT_SECRET too — role/permission writes and vendor credential
+// access are different-sensitivity capabilities; one leaked secret should
+// not hand over both. Real values generated tonight, NOT committed here —
+// 'change-me-please' fails closed (401) until the real value is set in
+// Render's env vars AND copied into the matching CRM client JS constant,
+// same two-sided setup COSTING_AUDIT_SECRET already needed. Until that's
+// done, /internal/roles-write, /internal/staff-roles-write, and
+// /internal/portal-credentials-* all reject every request.
+const ADMIN_WRITE_SECRET = process.env.ADMIN_WRITE_SECRET || 'change-me-please';
+const VENDOR_CREDS_SECRET = process.env.VENDOR_CREDS_SECRET || 'change-me-please';
 
 const DEDUPE_MS   = 24 * 60 * 60 * 1000; // one lead per phone per 24h
 const CHAT_TTL_MS = 24 * 60 * 60 * 1000; // Maya memory window
@@ -1255,6 +1269,14 @@ function cronAuthOk(req) {
 function costingAuditAuthOk(req) {
   const supplied = req.query.secret || req.headers['x-costing-audit-secret'] || '';
   return COSTING_AUDIT_SECRET && supplied === COSTING_AUDIT_SECRET;
+}
+function adminWriteAuthOk(req) {
+  const supplied = req.query.secret || req.headers['x-admin-write-secret'] || '';
+  return ADMIN_WRITE_SECRET && supplied === ADMIN_WRITE_SECRET;
+}
+function vendorCredsAuthOk(req) {
+  const supplied = req.query.secret || req.headers['x-vendor-creds-secret'] || '';
+  return VENDOR_CREDS_SECRET && supplied === VENDOR_CREDS_SECRET;
 }
 
 // ── AISENSY WEBHOOK SIGNATURE — PHASE 1: OBSERVE ONLY ──
@@ -3828,6 +3850,112 @@ app.post('/internal/costing-audit', (req, res) => {
   });
 });
 
+// ═══════════════════ RLS ROLLOUT (18 Aug 2026) — SERVICE-ROLE PROXIES ═══
+// roles/staff_roles and portal_credentials are moving to RLS with anon
+// writes (and, for portal_credentials, anon reads too) denied. These
+// endpoints are what escapenfly-crm calls instead of writing to those
+// tables directly — they bypass RLS via SB_SERVICE_HEADERS the same way
+// runCostingAudit above already does. Same honest limit as costing_audits:
+// this proves the request came from the CRM app (via the shared secret),
+// NOT which staff member is behind it — there is no real per-user auth in
+// this system yet (see escapenfly-crm/CLAUDE.md and this repo's CLAUDE.md,
+// RLS investigation section). Don't treat a 200 from these as proof a
+// specific person was authorized to make this change.
+
+// ── roles table: create/update or delete a role ──
+app.post('/internal/roles-write', async (req, res) => {
+  if (!adminWriteAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  const { action, id, name, permissions, is_system } = req.body || {};
+  if (!action || !id) return res.status(400).json({ error: 'action and id are required' });
+  try {
+    if (action === 'upsert') {
+      const r = await fetchRetry(`${SB_URL}/rest/v1/roles`, {
+        method: 'POST',
+        headers: { ...SB_SERVICE_HEADERS, Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: JSON.stringify({ id, name, permissions: permissions || {}, is_system: !!is_system })
+      }, 'SB-rolesUpsert');
+      if (!r.ok) { const t = await r.text(); console.error('roles-write upsert failed:', r.status, t); return res.status(500).json({ error: t }); }
+      return res.json({ ok: true });
+    }
+    if (action === 'delete') {
+      const r = await fetchRetry(`${SB_URL}/rest/v1/roles?id=eq.${encodeURIComponent(id)}`, {
+        method: 'DELETE', headers: { ...SB_SERVICE_HEADERS, Prefer: 'return=minimal' }
+      }, 'SB-rolesDelete');
+      if (!r.ok) { const t = await r.text(); console.error('roles-write delete failed:', r.status, t); return res.status(500).json({ error: t }); }
+      return res.json({ ok: true });
+    }
+    res.status(400).json({ error: 'action must be "upsert" or "delete"' });
+  } catch (e) {
+    console.error('roles-write error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── staff_roles table: set or clear one person's permission override ──
+app.post('/internal/staff-roles-write', async (req, res) => {
+  if (!adminWriteAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  const { email, role_id, permission_overrides } = req.body || {};
+  if (!email || !role_id) return res.status(400).json({ error: 'email and role_id are required' });
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/staff_roles`, {
+      method: 'POST',
+      headers: { ...SB_SERVICE_HEADERS, Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify({ email, role_id, permission_overrides: permission_overrides || {}, updated_at: new Date().toISOString() })
+    }, 'SB-staffRolesUpsert');
+    if (!r.ok) { const t = await r.text(); console.error('staff-roles-write failed:', r.status, t); return res.status(500).json({ error: t }); }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('staff-roles-write error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── portal_credentials: read the full list ──
+app.post('/internal/portal-credentials-read', async (req, res) => {
+  if (!vendorCredsAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/portal_credentials?order=category.asc,vendor_name.asc`, {
+      headers: SB_SERVICE_HEADERS
+    }, 'SB-portalCredsRead');
+    if (!r.ok) { const t = await r.text(); console.error('portal-credentials-read failed:', r.status, t); return res.status(500).json({ error: t }); }
+    res.json(await r.json());
+  } catch (e) {
+    console.error('portal-credentials-read error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── portal_credentials: create a new entry, or update an existing one's password ──
+app.post('/internal/portal-credentials-write', async (req, res) => {
+  if (!vendorCredsAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  const { action, id, record } = req.body || {};
+  if (!action) return res.status(400).json({ error: 'action is required' });
+  try {
+    if (action === 'create') {
+      if (!record) return res.status(400).json({ error: 'record is required for create' });
+      const r = await fetchRetry(`${SB_URL}/rest/v1/portal_credentials`, {
+        method: 'POST', headers: { ...SB_SERVICE_HEADERS, Prefer: 'return=minimal' }, body: JSON.stringify(record)
+      }, 'SB-portalCredsCreate');
+      if (!r.ok) { const t = await r.text(); console.error('portal-credentials-write create failed:', r.status, t); return res.status(500).json({ error: t }); }
+      return res.json({ ok: true });
+    }
+    if (action === 'update_password') {
+      if (!id || !record || typeof record.login_password !== 'string') return res.status(400).json({ error: 'id and record.login_password are required' });
+      const r = await fetchRetry(`${SB_URL}/rest/v1/portal_credentials?id=eq.${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { ...SB_SERVICE_HEADERS, Prefer: 'return=minimal' },
+        body: JSON.stringify({ login_password: record.login_password, updated_at: new Date().toISOString() })
+      }, 'SB-portalCredsPwdUpdate');
+      if (!r.ok) { const t = await r.text(); console.error('portal-credentials-write update_password failed:', r.status, t); return res.status(500).json({ error: t }); }
+      return res.json({ ok: true });
+    }
+    res.status(400).json({ error: 'action must be "create" or "update_password"' });
+  } catch (e) {
+    console.error('portal-credentials-write error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── HEALTH ──
 app.get('/health', (req, res) => res.json({
   status: 'ok',
@@ -3837,6 +3965,7 @@ app.get('/health', (req, res) => res.json({
   endpoints: [
     '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/website-chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
     '/notify/manual-lead', '/internal/costing-audit',
+    '/internal/roles-write', '/internal/staff-roles-write', '/internal/portal-credentials-read', '/internal/portal-credentials-write',
     '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh'
   ]
 }));

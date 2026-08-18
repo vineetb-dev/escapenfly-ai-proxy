@@ -494,11 +494,54 @@ pretended to be.
   role created and cleaned up post-RLS. `loadPermSystem()` re-verified
   live against the now-RLS-protected tables — real session, 5 roles / 16
   staff_roles entries loaded correctly.
-- **`portal_credentials`: RLS deliberately NOT enabled tonight.** CRM
-  deploy done and verified (see above), stopped there on purpose — this
-  table's read runs on every session, so per the approved plan it's
-  sitting verified-but-unlocked overnight rather than rushing the
-  lock-down late. Its existing dormant `anon_all` policy is still
-  present and must be dropped in the same change that finally enables
-  RLS on it (see the sequencing note above) — do not flip RLS on this
-  table without that drop, it would otherwise be a no-op.
+- **`portal_credentials`: RLS is now ON too** (follow-up session, still
+  18 Aug 2026). Dropped the dormant `anon_all` policy and enabled RLS in
+  the same migration — no replacement policy, full deny for anon on all
+  four operations, since the CRM no longer needs any direct access at
+  all. Verified with real anon-key requests against production: SELECT
+  now returns `[]` (not an error — RLS just filters every row out for
+  that role), INSERT returns `42501 row-level security policy`, and a
+  targeted UPDATE against one specific real row's `id` returned 200 with
+  an empty result (0 rows matched) — confirmed directly that the real
+  row's `login_password` was genuinely untouched afterward, not just
+  that the response looked right. Service-role proxy re-verified working
+  post-RLS.
+
+## SECURITY INCIDENT, found and fixed same night (18 Aug 2026)
+While re-verifying `portal_credentials` after enabling its RLS, testing
+the real production endpoint against `secret=change-me-please` (the
+literal fallback both `ADMIN_WRITE_SECRET` and `VENDOR_CREDS_SECRET`
+shipped with) returned **all 80 real `portal_credentials` rows,
+plaintext passwords included**, and separately, the same guessed secret
+successfully wrote a row to the real `roles` table. Root cause: both
+secrets copied `CRON_SECRET`/`COSTING_AUDIT_SECRET`'s
+`process.env.X || 'change-me-please'` pattern, but those two have
+always had their real Render values set *before* their gated endpoint
+ever went live — these two didn't, because the CRM-side deploy (which
+depends on the real secret existing) happened before Render's env vars
+were configured, and the endpoints themselves were reachable the whole
+time with a public, already-committed guessable default.
+
+Found via this repo's own tonight-of-the-fact re-verification, not an
+external report. Immediate response: deleted the one test row this
+investigation itself created via the guessed secret, confirmed no other
+unexpected data existed, shipped a fix within the same session rather
+than waiting — fallback changed to `''` for both secrets, so
+`SECRET && supplied===SECRET` is false with NO usable value until
+Render's real env var is actually set, genuinely failing closed.
+Verified post-fix: the same guessed secret, and an explicitly empty
+one, both now 401 against all four endpoints.
+
+**Standing lesson, not just a one-off fix**: never give a secret gating
+a service-role (RLS-bypassing) endpoint a fallback value that's
+non-empty AND already committed to this repo's own history. `''` is the
+only fallback that can't be turned into a working credential by reading
+this file. `CRON_SECRET`/`COSTING_AUDIT_SECRET` were not changed by this
+fix (their real values are confirmed already set in Render — checked
+`COSTING_AUDIT_SECRET` directly the same way, `change-me-please`
+correctly 401s against `/internal/costing-audit`; `CRON_SECRET` was
+deliberately NOT tested this way since a successful guess would trigger
+a real mass WhatsApp send, too risky to probe) — but if either is ever
+re-deployed to a fresh environment before its Render var is set, the
+same exposure window would reopen. Worth migrating both to the `''`
+pattern proactively rather than waiting for that to happen for real.

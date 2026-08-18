@@ -230,6 +230,91 @@ said 31 live leads, actual was 5):
   once-daily cadence). Verify the current setting in Render before
   assuming this behaves as "once daily" in production.
 
+## Prompt caching (18 Aug 2026)
+`cache_control` breakpoints added to the two genuinely-large, genuinely-
+static system prompts in this file. **Correction to how this was first
+asked**: "server.js" was named as containing `genClientUpdate`/`sendAI`/
+`aiWA`/`sendCommonAI` — those four actually live in `escapenfly-crm/
+index.html`, not here. What IS here is `/ai`, the generic passthrough
+those four all call, which forwards whatever `system` string it's given
+straight to Anthropic with no structure at all.
+
+- **`callMayaJSON`'s system prompt** (`buildChatSystem(channel, intent) +
+  currentDateLine + knownLine + founderLine + visaLine + liveDataLine +
+  statusLine + pastDestinationsLine + returningProfileLine`) was ONE
+  concatenated string mixing a static part with several genuinely
+  per-conversation parts (known lead info, founder notes, visa intel,
+  live weather/forex, enquiry status, past destinations, returning-
+  customer profile all vary call to call; only `buildChatSystem`'s output
+  — one of a small fixed set keyed by channel × intent, not by customer —
+  is actually static). Split into a 2-block `system` array: static block
+  first with `cache_control: {type:'ephemeral'}`, dynamic tail second,
+  unmarked. Order matters — caching only covers an unbroken prefix, so
+  the static block MUST come first, exactly as it already did before this
+  change (nothing to restructure there, just had to stop concatenating
+  into one string). `tools: [MAYA_REPLY_TOOL]` needs no separate marker —
+  it structurally precedes `system` in Anthropic's fixed prefix order, so
+  it rides along in the same cached prefix for free.
+- **`/ai`'s `system` field** is now wrapped in the same array+cache_control
+  shape whenever non-empty. Confirmed safe to do unconditionally: every
+  current caller (`sendAI`, `genClientUpdate`, `aiWA`, `sendCommonAI` —
+  the only 4 things that hit `/ai`, confirmed by reading every fetch to
+  this endpoint in `escapenfly-crm/index.html`) sends a hardcoded,
+  zero-interpolation system string; all per-request content already goes
+  into `messages`. If a future caller ever needs to send a system prompt
+  with per-request content through this endpoint, it must not rely on
+  this blanket cache_control as-is.
+
+**Verified with real Anthropic API calls, not just code review** (via
+`callMayaJSON`, the actual exported function `mayaTurn` calls — bypassed
+`mayaTurn` itself so the test made zero Supabase writes and zero WhatsApp
+sends):
+- Call 1 (holiday intent): `cache_creation_input_tokens: 12118`,
+  `cache_read: 0` — first-time write.
+- Call 2 (identical call): `cache_read_input_tokens: 12118`,
+  `cache_creation: 0` — real cache hit, exact size match.
+- Call 3 (same intent — same static prefix — but different message/known
+  lead info): still `cache_read_input_tokens: 12118`, while
+  non-cached `input_tokens` differed from call 2 (348 vs 405) — proves
+  the cache boundary is genuinely at the static/dynamic split, not just
+  "identical whole request happened to repeat."
+- Call 4 (different intent → different static prefix): fresh
+  `cache_creation_input_tokens: 11239`, `cache_read: 0` — confirms
+  different intents get independently cached, not incorrectly merged.
+- Reply content/quality spot-checked on a 5th call (cache hit,
+  `cache_read_input_tokens: 12118`) — coherent, on-brand, correctly
+  followed STAGE_LOGIC's qualify-first holiday flow. Restructuring
+  `system` from one string into a 2-block array produces a byte-identical
+  effective prompt to Anthropic (blocks concatenate with no added
+  separator) — confirmed by reply behavior, not just by reading the docs.
+
+**Cost math from those real numbers** (Sonnet 5 intro pricing per the
+model-split section above, $2/MTok input; cache write is 1.25× base,
+cache read is 0.1× base, standard Anthropic pricing): the static prefix
+alone (~12,118 tokens) costs $0.0242 as a plain uncached input every
+single call under the old code. Under the new code: $0.0303 the first
+time (write), then $0.0024 every subsequent call sharing that (channel,
+intent) pair within the 5-min TTL — roughly 90% cheaper than uncached on
+every reuse, ~32% cheaper already by the 2nd call, more with volume.
+WhatsApp conversations routinely have several turns within minutes, and
+concurrent customers in the same intent bucket share the same window —
+real savings should be meaningfully higher than a single-conversation
+number suggests.
+
+**Explicitly checked and found NOT to work — don't assume this "just
+works" for short prompts**: tested the same array+cache_control shape
+directly against a real ~80-token system string (sendCommonAI's exact
+text) with two back-to-back real calls. Both came back
+`cache_creation_input_tokens: 0` and `cache_read_input_tokens: 0` —
+**no caching occurred at all**. Anthropic requires a minimum cacheable
+block size (1024 tokens for Sonnet models) and all four CRM-side system
+prompts (`sendAI`/`genClientUpdate`/`aiWA`/`sendCommonAI`, ~30-70 tokens
+each) are well under it. The `/ai` endpoint change is still correct to
+keep — it's harmless, and correctly positioned if any of those prompts
+ever grow past the threshold or get combined with enough static context
+to clear it — but as of today it produces zero measurable savings. Don't
+report this as "fixed" without that caveat.
+
 ## Debug endpoints (all `CRON_SECRET`-gated, none hardcode the secret)
 `/debug/webhook-sig-log`, `/debug/stacked-question-log`,
 `/debug/visa-safety-block-log`, `/debug/visa-refresh-log`,

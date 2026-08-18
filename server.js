@@ -2614,10 +2614,30 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
           'x-api-key': ANTHROPIC_KEY,
           'anthropic-version': '2023-06-01'
         },
+        // v-fix (18 Aug 2026, prompt caching): buildChatSystem(channel, intent)
+        // is static per (channel, intent) pair — one of a small fixed set (2
+        // channels × ~6 intents), not per-customer — while everything appended
+        // after it (today's date, known lead info, founder notes, visa intel,
+        // live weather/forex, enquiry status, past destinations, returning-
+        // customer profile) is genuinely per-conversation and changes call to
+        // call. Split into two system blocks so the static part alone gets
+        // marked cacheable; the dynamic tail is a second, unmarked block.
+        // MUST stay in this order — cache_control only caches an unbroken
+        // PREFIX, so the static block has to come first or this does nothing.
+        // Anthropic concatenates system array blocks in order with no added
+        // separator, so the effective prompt Maya sees is byte-identical to
+        // the old single concatenated string; only the caching structure
+        // changed. tools (MAYA_REPLY_TOOL, also static/unchanging) needs no
+        // separate cache_control marker — it structurally precedes `system`
+        // in Anthropic's fixed prefix order, so it's folded into the same
+        // cached prefix automatically as long as this system breakpoint holds.
         body: JSON.stringify({
           model,
           max_tokens: 600,
-          system: buildChatSystem(channel, intent) + currentDateLine + knownLine + founderLine + visaLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine,
+          system: [
+            { type: 'text', text: buildChatSystem(channel, intent), cache_control: { type: 'ephemeral' } },
+            { type: 'text', text: currentDateLine + knownLine + founderLine + visaLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine }
+          ],
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
           tool_choice: { type: 'tool', name: 'maya_reply' }
@@ -2994,6 +3014,18 @@ async function sendSessionMessage(phone, text) {
 // ═══════════════════ ENDPOINTS ═══════════════════
 
 // ── MAIN AI ENDPOINT (website, CRM AI tab) ──
+// v-fix (18 Aug 2026, prompt caching): this is a generic passthrough — the
+// ONLY callers today are escapenfly-crm's sendAI/genClientUpdate/aiWA/
+// sendCommonAI (confirmed by reading every fetch() to this endpoint in that
+// file), and every one of them sends a hardcoded, unparameterized system
+// string with zero per-request interpolation — all per-customer content
+// goes into `messages` instead. That's what makes it safe to always wrap
+// `system` in a cache_control breakpoint here unconditionally: nothing
+// currently sent here varies call-to-call. If a future caller ever needs a
+// system prompt that mixes in per-request data, it must NOT be routed
+// through this endpoint's system field as-is — either split the request so
+// only the genuinely static part lands here, or this blanket cache_control
+// needs revisiting first.
 app.post('/ai', async (req, res) => {
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'API key not set' });
   try {
@@ -3007,7 +3039,9 @@ app.post('/ai', async (req, res) => {
       body: JSON.stringify({
         model: req.body.model || CHAT_MODEL,
         max_tokens: req.body.max_tokens || 800,
-        system: req.body.system || '',
+        system: req.body.system
+          ? [{ type: 'text', text: req.body.system, cache_control: { type: 'ephemeral' } }]
+          : '',
         messages: req.body.messages || []
       })
     }, 'Claude-proxy');

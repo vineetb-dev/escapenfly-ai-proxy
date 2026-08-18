@@ -469,16 +469,36 @@ proxies: a valid secret proves the request came from the CRM app, not
 which staff member is behind it. That's not solved here and isn't
 pretended to be.
 
-### Status as of tonight
+### Status as of tonight — final
 - `/internal/roles-write`, `/internal/staff-roles-write`,
   `/internal/portal-credentials-read`, `/internal/portal-credentials-write`
-  — built and deployed. Verified locally against real Supabase with
-  disposable test data (a throwaway role, a throwaway `staff_roles` row
-  under a clearly-fake email never used by real staff), confirmed at the
-  DB level independently of the endpoints' own success response, then
-  cleaned up — zero residue in production data. Negative-tested: missing
-  secret and wrong secret both correctly return 401.
-- RLS itself: **not yet touched on either table.** Real grants/policies
-  above are the pre-rollout baseline, not the current state — check this
-  section's own "Status" line for what's actually true before assuming
-  the plan completed.
+  — built, deployed, and the CRM switched over to all four. Verified
+  twice: once locally against real Supabase with disposable test data
+  before the CRM deploy, once more via real UI actions in the live CRM
+  after (create/delete a test role, set/clear a test permission override,
+  add a test vendor + update its password) — every write confirmed at
+  the DB level independent of the endpoint's own success response, every
+  test row cleaned up after. Negative-tested: missing secret and wrong
+  secret both correctly return 401.
+- **`roles`/`staff_roles`: RLS is ON.** `ENABLE ROW LEVEL SECURITY` +
+  `anon_select_only` policy (mirrors `costing_audits` exactly) applied
+  to both tables. Verified with real, unauthenticated anon-key requests
+  against production (not assumed): a plain anon SELECT on `roles` still
+  returns real data (200); a raw anon INSERT on `roles` and a raw anon
+  UPSERT on `staff_roles` attempting to grant an arbitrary email the
+  `partner` role both now fail with `42501 row-level security policy`
+  violations (401) — zero residue from either attempt. The service-role
+  proxy endpoints above were re-tested AFTER this change specifically to
+  confirm they still write successfully (service_role bypasses RLS by
+  design — confirmed empirically, not assumed) — real disposable test
+  role created and cleaned up post-RLS. `loadPermSystem()` re-verified
+  live against the now-RLS-protected tables — real session, 5 roles / 16
+  staff_roles entries loaded correctly.
+- **`portal_credentials`: RLS deliberately NOT enabled tonight.** CRM
+  deploy done and verified (see above), stopped there on purpose — this
+  table's read runs on every session, so per the approved plan it's
+  sitting verified-but-unlocked overnight rather than rushing the
+  lock-down late. Its existing dormant `anon_all` policy is still
+  present and must be dropped in the same change that finally enables
+  RLS on it (see the sequencing note above) — do not flip RLS on this
+  table without that drop, it would otherwise be a no-op.

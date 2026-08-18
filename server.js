@@ -145,14 +145,31 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 // CRON_SECRET, and they're kept separate from EACH OTHER and from
 // COSTING_AUDIT_SECRET too — role/permission writes and vendor credential
 // access are different-sensitivity capabilities; one leaked secret should
-// not hand over both. Real values generated tonight, NOT committed here —
-// 'change-me-please' fails closed (401) until the real value is set in
-// Render's env vars AND copied into the matching CRM client JS constant,
-// same two-sided setup COSTING_AUDIT_SECRET already needed. Until that's
-// done, /internal/roles-write, /internal/staff-roles-write, and
-// /internal/portal-credentials-* all reject every request.
-const ADMIN_WRITE_SECRET = process.env.ADMIN_WRITE_SECRET || 'change-me-please';
-const VENDOR_CREDS_SECRET = process.env.VENDOR_CREDS_SECRET || 'change-me-please';
+// not hand over both.
+//
+// v-fix (18 Aug 2026, same night, found in production): DO NOT reuse
+// 'change-me-please' as the fallback here like CRON_SECRET/
+// COSTING_AUDIT_SECRET do. Those two are checked with `SECRET &&
+// supplied===SECRET`, and this file's own committed history — including
+// this exact comment — documents 'change-me-please' as their literal
+// fallback value. That's fine for CRON_SECRET/COSTING_AUDIT_SECRET
+// because Render has always had their real values set before those
+// endpoints ever shipped. It was NOT fine here: these two endpoints
+// deployed before Render's env vars were set, and a real, live test
+// against production confirmed `secret=change-me-please` returned all
+// 80 real portal_credentials rows (plaintext vendor passwords) and
+// successfully wrote to `roles` — a public, guessable, ALREADY-COMMITTED
+// placeholder was live-exploitable against real data for the gap
+// between this endpoint's deploy and this fix. Empty-string fallback
+// instead: `ADMIN_WRITE_SECRET && ...` is falsy on '', so every request
+// 401s with NO usable value at all until Render's real env var is set —
+// genuinely fails closed, not just closed-until-someone-tries-the-
+// well-known-default. If you ever add another secret gating a
+// service-role endpoint in this file, default it to '', not
+// 'change-me-please' — copy this one, not CRON_SECRET/
+// COSTING_AUDIT_SECRET's older pattern.
+const ADMIN_WRITE_SECRET = process.env.ADMIN_WRITE_SECRET || '';
+const VENDOR_CREDS_SECRET = process.env.VENDOR_CREDS_SECRET || '';
 
 const DEDUPE_MS   = 24 * 60 * 60 * 1000; // one lead per phone per 24h
 const CHAT_TTL_MS = 24 * 60 * 60 * 1000; // Maya memory window

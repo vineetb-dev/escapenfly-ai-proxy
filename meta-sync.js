@@ -36,8 +36,8 @@ function getSupabase() {
   );
 }
 
-async function graphGet(path, params = {}) {
-  const token = requireEnv('META_ACCESS_TOKEN');
+async function graphGet(path, params = {}, tokenOverride = null) {
+  const token = tokenOverride || requireEnv('META_ACCESS_TOKEN');
   const url = new URL(`${GRAPH_BASE}${path}`);
   url.searchParams.set('access_token', token);
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
@@ -48,6 +48,13 @@ async function graphGet(path, params = {}) {
     throw new Error(`Graph API error [${path}]: ${data.error.message} (code ${data.error.code})`);
   }
   return data;
+}
+
+/** Exchange the System User token for this specific Page's own Page Access Token */
+async function getPageAccessToken(pageId) {
+  const data = await graphGet(`/${pageId}`, { fields: 'access_token' });
+  if (!data.access_token) throw new Error('Could not obtain Page Access Token — check system user has admin access on the Page');
+  return data.access_token;
 }
 
 /** Ads spend/reach/engagement, yesterday, per campaign */
@@ -71,10 +78,11 @@ async function fetchAdsInsights() {
 /** Facebook Page organic insights, last 1 day */
 async function fetchPageOrganicInsights() {
   const pageId = requireEnv('META_PAGE_ID');
+  const pageToken = await getPageAccessToken(pageId);
   const data = await graphGet(`/${pageId}/insights`, {
     metric: 'page_views_total,page_post_engagements',
     period: 'day',
-  });
+  }, pageToken);
   const byMetric = {};
   (data.data || []).forEach(m => {
     const latest = m.values?.[m.values.length - 1];

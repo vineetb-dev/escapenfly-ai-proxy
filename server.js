@@ -10,6 +10,13 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const { z } = require('zod');
+// Marketing data sync (19 Aug 2026) — direct Meta/Google API sync, replacing
+// Windsor.ai connectors for marketing_performance. Requiring these here only
+// loads the module (their own requireEnv() checks don't fire until runSync()
+// is actually called), so a missing Meta/Google env var fails closed on the
+// specific /internal/sync-* request that needs it, not at server startup.
+const { runSync: runMetaSync } = require('./meta-sync');
+const { runSync: runGoogleSync } = require('./google-sync');
 const app = express();
 
 app.use(cors({ origin: '*' }));
@@ -170,6 +177,15 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 // COSTING_AUDIT_SECRET's older pattern.
 const ADMIN_WRITE_SECRET = process.env.ADMIN_WRITE_SECRET || '';
 const VENDOR_CREDS_SECRET = process.env.VENDOR_CREDS_SECRET || '';
+// Marketing data sync (19 Aug 2026) — gates /internal/sync-meta and
+// /internal/sync-google. Same fail-closed shape as ADMIN_WRITE_SECRET/
+// VENDOR_CREDS_SECRET above: empty-string fallback, never 'change-me-please'
+// — see the security incident write-up further down for why that fallback
+// is never safe for a secret gating a real endpoint. Checked via the
+// x-sync-secret header only (no query-param fallback) — these calls are
+// meant to come from a cron/scheduler, not a browser, so there's no reason
+// to also accept it in a URL where it could end up in access logs.
+const MARKETING_SYNC_SECRET = process.env.MARKETING_SYNC_SECRET || '';
 
 const DEDUPE_MS   = 24 * 60 * 60 * 1000; // one lead per phone per 24h
 const CHAT_TTL_MS = 24 * 60 * 60 * 1000; // Maya memory window
@@ -1294,6 +1310,10 @@ function adminWriteAuthOk(req) {
 function vendorCredsAuthOk(req) {
   const supplied = req.query.secret || req.headers['x-vendor-creds-secret'] || '';
   return VENDOR_CREDS_SECRET && supplied === VENDOR_CREDS_SECRET;
+}
+function marketingSyncAuthOk(req) {
+  const supplied = req.headers['x-sync-secret'] || '';
+  return MARKETING_SYNC_SECRET && supplied === MARKETING_SYNC_SECRET;
 }
 
 // ── AISENSY WEBHOOK SIGNATURE — PHASE 1: OBSERVE ONLY ──
@@ -3973,6 +3993,35 @@ app.post('/internal/portal-credentials-write', async (req, res) => {
   }
 });
 
+// ── MARKETING DATA SYNC (19 Aug 2026) — Meta/Google direct API sync ──
+// Replaces Windsor.ai's facebook/facebook_organic/instagram/google_ads/
+// googleanalytics4 connectors for marketing_performance. Each route is a
+// thin wrapper around the matching module's runSync() — all the real
+// fetch/upsert logic lives in meta-sync.js / google-sync.js, not here.
+app.post('/internal/sync-meta', async (req, res) => {
+  if (!marketingSyncAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const summary = await runMetaSync();
+    console.log('sync-meta result:', summary);
+    res.json(summary);
+  } catch (err) {
+    console.error('sync-meta failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/internal/sync-google', async (req, res) => {
+  if (!marketingSyncAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const summary = await runGoogleSync();
+    console.log('sync-google result:', summary);
+    res.json(summary);
+  } catch (err) {
+    console.error('sync-google failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── HEALTH ──
 app.get('/health', (req, res) => res.json({
   status: 'ok',
@@ -3983,6 +4032,7 @@ app.get('/health', (req, res) => res.json({
     '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/website-chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
     '/notify/manual-lead', '/internal/costing-audit',
     '/internal/roles-write', '/internal/staff-roles-write', '/internal/portal-credentials-read', '/internal/portal-credentials-write',
+    '/internal/sync-meta', '/internal/sync-google',
     '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh'
   ]
 }));

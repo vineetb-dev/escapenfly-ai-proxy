@@ -380,6 +380,58 @@ dashboard log access. Add a new one for any new fire-and-forget check rather
 than assuming Render logs will be checked (they typically aren't, in this
 workflow).
 
+## Marketing data sync — meta-sync.js / google-sync.js (19 Aug 2026)
+`/internal/sync-meta` and `/internal/sync-google` call `runSync()` in
+`meta-sync.js`/`google-sync.js` respectively — direct Meta Graph API and
+Google Ads/GA4 API integrations, replacing Windsor.ai's connectors for
+`marketing_performance` (see escapenfly-crm's Marketing Command Center
+section for that table's read side). Both files were authored outside
+this session and placed here verbatim except for one fix applied to
+both: their `getSupabase()` referenced `SUPABASE_SERVICE_KEY`, which
+doesn't exist anywhere in this repo — the real shared variable name is
+`SUPABASE_SERVICE_ROLE_KEY` (same one `SB_SERVICE_HEADERS` uses). Fixed
+in both files before ever writing them to disk, not after.
+
+Gated by `MARKETING_SYNC_SECRET` (`x-sync-secret` header only, no
+query-param fallback — these are meant to be called by a scheduler, not
+a browser, so there's no reason to risk the secret landing in an access
+log). Same empty-string fail-closed fallback as `ADMIN_WRITE_SECRET`/
+`VENDOR_CREDS_SECRET`, deliberately not `CRON_SECRET`/
+`COSTING_AUDIT_SECRET`'s older `'change-me-please'` pattern — see the
+security incident above for exactly why that fallback is unsafe for a
+secret gating a live endpoint.
+
+**`@supabase/supabase-js` was not a dependency of this repo before
+today** — every other Supabase call in `server.js` goes through raw REST
++ `fetchRetry`, never the SDK. Both new files `require()` it. Since
+`server.js` now `require()`s these two files at module load (not
+lazily), a missing SDK package would have crashed the **entire server**
+at startup, not just the sync endpoints — added `@supabase/supabase-js`
+and `google-auth-library` to `package.json` and confirmed with a real
+local `npm install` + server start before this shipped, not assumed.
+
+**Verified locally, real behavior not just code review**: server starts
+clean with both files required. Auth gate: no secret → 401, wrong
+secret → 401. Correct secret with Meta/Google env vars still unset →
+clean `500` with a real error message (`Missing required env var: ...`),
+full stack trace logged, server stays up for the next request — proven
+by hitting both endpoints back to back successfully. **This test also
+surfaced a real pending-config item**: `meta-sync.js`/`google-sync.js`
+each call `requireEnv('SUPABASE_URL')` directly with no fallback,
+unlike this file's own `SB_URL` constant which has a hardcoded default
+— so `SUPABASE_URL` needs to be an actual Render env var for these two
+endpoints specifically, not just relying on whatever makes the rest of
+`server.js` work today.
+
+**Not yet verified — genuinely can't be from here**: whether the real
+Meta/Google credentials work end-to-end (`META_ACCESS_TOKEN`,
+`META_PAGE_ID`, `META_IG_BUSINESS_ID`, `META_AD_ACCOUNT_ID`,
+`GOOGLE_ADS_*`, `GA4_PROPERTY_ID`, `GA4_SERVICE_ACCOUNT_JSON`,
+`SUPABASE_URL`, `MARKETING_SYNC_SECRET` all need to be set in Render).
+Real test with real production credentials against real Meta/Google
+APIs and a real `marketing_performance` write is the next step, done
+with Vineet once this deploys.
+
 ## Known, deliberate, NOT-yet-fixed gaps
 - RLS disabled on all Supabase tables except `costing_audits` (see above —
   same as the CRM repo for every other table) — deferred, needs a real

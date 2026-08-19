@@ -72,7 +72,7 @@ async function fetchAdsInsights() {
 async function fetchPageOrganicInsights() {
   const pageId = requireEnv('META_PAGE_ID');
   const data = await graphGet(`/${pageId}/insights`, {
-    metric: 'page_impressions_unique,page_post_engagements',
+    metric: 'page_views_total,page_post_engagements',
     period: 'day',
   });
   const byMetric = {};
@@ -81,7 +81,7 @@ async function fetchPageOrganicInsights() {
     byMetric[m.name] = latest ? latest.value : 0;
   });
   return {
-    reach: byMetric.page_impressions_unique || 0,
+    reach: byMetric.page_views_total || 0,
     engagement: byMetric.page_post_engagements || 0,
   };
 }

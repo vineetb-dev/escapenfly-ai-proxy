@@ -2790,6 +2790,25 @@ function isDuplicateMsgId(id) {
   return false;
 }
 
+// DMC vendor rate-card replies were hitting Maya's customer-qualification
+// flow instead of being recognized as B2B — dmc_vendor_numbers holds the
+// vendor phone list (populated separately, not by this code) so /webhook/
+// incoming can route those numbers away from mayaTurn(). Same read-only
+// SB_HEADERS pattern as findRecentLeadDB — this table has no RLS write
+// policy for anon either, so a lookup is all this needs.
+async function isDmcVendorNumber(phone) {
+  try {
+    const url = `${SB_URL}/rest/v1/dmc_vendor_numbers?phone=eq.${phone}&select=phone&limit=1`;
+    const r = await fetchRetry(url, { headers: SB_HEADERS }, 'SB-dmcVendorCheck');
+    if (!r.ok) { console.error('isDmcVendorNumber failed:', r.status, await r.text()); return false; }
+    const rows = await r.json();
+    return rows.length > 0;
+  } catch (e) {
+    console.error('isDmcVendorNumber error:', e.message);
+    return false;
+  }
+}
+
 // ── CORE MAYA TURN — v3.1 REPLY-FIRST ──
 // onReply(replyText) is awaited the MOMENT the reply exists — before any
 // CRM/routing/notification work. Customer latency = Claude time + send time.
@@ -3304,6 +3323,12 @@ app.post('/webhook/incoming', async (req, res) => {
     if (knownSpamPhones.has(phone) || looksLikeSpam(text)) {
       knownSpamPhones.add(phone);
       console.log(`🚫 [${phone}] vendor/spam pitch detected — skipping Maya, no lead created. Message: "${short(text)}"`);
+      return;
+    }
+
+    if (await isDmcVendorNumber(phone)) {
+      console.log(`🤝 [${phone}] DMC vendor number — skipping Maya customer flow, sending ack instead.`);
+      await sendSessionMessage(phone, "Thanks for the response — forwarding to our team.");
       return;
     }
 

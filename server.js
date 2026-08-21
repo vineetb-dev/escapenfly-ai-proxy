@@ -111,6 +111,10 @@ const AISENSY_WEBHOOK_SECRET = process.env.AISENSY_WEBHOOK_SECRET || '';
 const WA_NUM        = (process.env.WA_NUM || '919851739851').replace(/\D/g, '');
 const MAYA_CAMPAIGN = process.env.MAYA_CAMPAIGN || 'maya_session';
 const CRM_URL       = process.env.CRM_URL || 'https://escapenfly-crm.netlify.app';
+// Viator integration scaffolding — see the searchViatorProducts/
+// checkViatorAvailability section below for current status.
+const VIATOR_API_KEY = process.env.VIATOR_API_KEY;
+const VIATOR_BASE_URL = 'https://api.viator.com/partner';
 const CHAT_MODEL    = process.env.CHAT_MODEL || 'claude-sonnet-5';
 // Deliberately independent of CHAT_MODEL — the visa-safety and stacked-
 // question Tier 2 checks are narrow, cheap yes/no classifiers, not Maya's
@@ -234,6 +238,72 @@ async function fetchRetry(url, opts, label) {
       if (i === 1) throw e;
       console.error(`⟳ ${label}: network error (${e.message}), retrying once...`);
     }
+  }
+}
+
+// ── VIATOR INTEGRATION SCAFFOLDING (21 Aug 2026) ──
+// Deliberately inert: not wired into mayaTurn(), the CRM, or any route —
+// nothing in this file calls either function (see module.exports below,
+// which exists only so a future module can require() them).
+//
+// NOTE ON LICENSING SCOPE — NOT YET RESOLVED: the request that produced
+// this scaffolding stated the intended use as "internal-costing-only,
+// per a licensing constraint already discussed" (rate_cards/Quotation
+// System). A follow-up request asked for a comment here stating the
+// OPPOSITE — that Viator's Basic Access tier restricts use to driving
+// affiliate traffic to viator.com and specifically PROHIBITS internal-
+// only data indexing for costing. A live check against Viator's own
+// partner-API docs (docs.viator.com, partnerresources.viator.com)
+// didn't cleanly confirm either framing, and the second framing's own
+// wording was internally inconsistent (says use is "restricted to
+// driving affiliate traffic to viator.com" in one sentence, then says
+// "never a customer-facing link/redirect to viator.com" in the next —
+// affiliate traffic requires exactly that kind of link). Not asserting
+// either claim as fact here until this is actually resolved — see chat
+// history around 21 Aug 2026 for the full exchange. Whichever use case
+// is confirmed correct determines whether this ever gets wired into the
+// Quotation System (internal) or into Maya's conversational replies
+// (customer-facing) — those are different integration points, not a
+// detail to guess at.
+async function searchViatorProducts(destination, searchTerm) {
+  try {
+    const r = await fetchRetry(`${VIATOR_BASE_URL}/products/search`, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json;version=2.0',
+        'Content-Type': 'application/json',
+        'exp-api-key': VIATOR_API_KEY,
+        'Accept-Language': 'en-US'
+      },
+      body: JSON.stringify({
+        filtering: { destination, searchTerm }
+      })
+    }, 'Viator-productSearch');
+    if (!r.ok) { console.error('searchViatorProducts failed:', r.status, await r.text()); return null; }
+    return await r.json();
+  } catch (e) {
+    console.error('searchViatorProducts error:', e.message);
+    return null;
+  }
+}
+
+async function checkViatorAvailability(productCode, date) {
+  try {
+    const r = await fetchRetry(`${VIATOR_BASE_URL}/availability/check`, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json;version=2.0',
+        'Content-Type': 'application/json',
+        'exp-api-key': VIATOR_API_KEY,
+        'Accept-Language': 'en-US'
+      },
+      body: JSON.stringify({ productCode, date })
+    }, 'Viator-availabilityCheck');
+    if (!r.ok) { console.error('checkViatorAvailability failed:', r.status, await r.text()); return null; }
+    return await r.json();
+  } catch (e) {
+    console.error('checkViatorAvailability error:', e.message);
+    return null;
   }
 }
 
@@ -4079,6 +4149,11 @@ if (require.main === module) {
 // are the exact functions mayaTurn's context-resolution block calls, exported
 // so the harness can mirror that sequencing with the SAME underlying lookups
 // rather than reimplementing the Supabase queries themselves.
+//
+// searchViatorProducts/checkViatorAvailability are exported for a different
+// reason — not the test harness, nothing calls them yet at all. Exported so
+// a future module has something real to require() once the licensing-scope
+// question above is resolved and wiring actually happens.
 module.exports = {
   callMayaJSON,
   mayaTurn,
@@ -4094,5 +4169,7 @@ module.exports = {
   validPhone,
   loadEnquiryStatus,
   loadPastDestinations,
-  loadCustomerProfile
+  loadCustomerProfile,
+  searchViatorProducts,
+  checkViatorAvailability
 };

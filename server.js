@@ -244,6 +244,12 @@ const TEAM = {
   lalit:    { name: 'Lalit Mehta',     email: 'sales6@escapenfly.com',   wa: '916283285244', dept: 'Domestic & Short Haul' },
   divya:    { name: 'Divya Nigam',     email: 'sales1@escapenfly.com',   wa: '917888871148', dept: 'Short Haul & Island' },
   anjan:    { name: 'Anjan Pramanick', email: 'sales3@escapenfly.com',   wa: '919875903349', dept: 'Long Haul' },
+  shreya:   { name: 'Shreya Deshmukh', email: 'sales4@escapenfly.com',   wa: '917973316887', dept: 'Long Haul' },
+  // sales4@escapenfly.com seat history: Shagun Sharma (departed 21 Aug 2026,
+  // renamed to shagun.departed.sales4@escapenfly.com in team_members) →
+  // Shreya Deshmukh, joining 25 Aug 2026. New key added same change as the
+  // Supabase update — don't repeat the ~2-month stale-seat gap noted below
+  // for sales7.
   // sales7@escapenfly.com seat history: Shubham → Anurag (never updated here,
   // which is exactly why this key sat stale and departed for ~2 months while
   // Anurag was actually active — see CLAUDE.md, 14 Aug 2026) → Riya Negi now.
@@ -256,7 +262,7 @@ const TEAM = {
 };
 
 // v3.2 — recipient rosters for the new notification jobs
-const REP_KEYS = ['lalit', 'divya', 'anjan', 'riya', 'prabhjot']; // individual digest, non-visa
+const REP_KEYS = ['lalit', 'divya', 'anjan', 'shreya', 'riya', 'prabhjot']; // individual digest, non-visa
 const VISA_REP_KEYS = ['damini', 'prabhjot'];                        // visa-specific individual + appt reminder
 const FOUNDER_KEYS = ['admin', 'vivek', 'abhishek', 'prabhjot'];      // team digest, booking alert, EOD summary
 const STALE_CC_KEY = 'admin';                                        // stale alert CC
@@ -281,7 +287,7 @@ const DOMESTIC   = ['india','kashmir','goa','rajasthan','himachal','kerala','lad
 
 let rrShortHaul = 0, rrLongHaul = 0;
 const shortHaulPool = ['lalit', 'divya'];
-const longHaulPool  = ['anjan'];
+const longHaulPool  = ['anjan', 'shreya'];
 
 const VALID_INTENTS = ['holiday','visa','flights','hotel','cruise','corporate','mice','existing_booking','complaint','human_support','other_travel','off_topic'];
 

@@ -1364,6 +1364,50 @@ async function notifyTeam(assigned, leadData) {
   return ok;
 }
 
+// ── EXCHANGE RATE REFRESH (21 Aug 2026) — feeds exchange_rates.base_rate_inr ──
+// Fixes each currency's real ECB rate against INR; markup_pct and the
+// generated effective_rate_inr column (base_rate_inr * (1 + markup_pct/100))
+// are untouched here — this only refreshes the base rate, same division of
+// concerns as the table's own schema already encodes.
+// v-fix vs the original draft: that draft called `supabase.from(...)` — this
+// file has no Supabase JS client anywhere; every DB access in this file goes
+// through SB_URL/SB_HEADERS via fetchRetry (see loadForexRate, saveChat,
+// etc. above), so this follows that exact pattern instead. Frankfurter's
+// real response shape was verified directly (curl) before writing this —
+// confirmed `{date, base, quote, rate}` for USD/CHF/EUR/GBP against INR, not
+// assumed from the snippet.
+const EXCHANGE_RATE_CURRENCIES = ['USD', 'CHF', 'EUR', 'GBP'];
+async function refreshExchangeRates() {
+  const results = [];
+  for (const code of EXCHANGE_RATE_CURRENCIES) {
+    try {
+      const r = await fetchRetry(`https://api.frankfurter.dev/v2/rate/${code}/INR`, {}, `Frankfurter-${code}`);
+      if (!r.ok) { console.error(`refreshExchangeRates [${code}] fetch failed:`, r.status, await r.text()); results.push({ code, ok: false }); continue; }
+      const data = await r.json();
+      if (!Number.isFinite(data.rate)) { console.error(`refreshExchangeRates [${code}] no numeric rate in response:`, JSON.stringify(data)); results.push({ code, ok: false }); continue; }
+
+      const patchR = await fetchRetry(`${SB_URL}/rest/v1/exchange_rates?currency_code=eq.${code}`, {
+        method: 'PATCH',
+        headers: { ...SB_HEADERS, Prefer: 'return=minimal' },
+        body: JSON.stringify({
+          base_rate_inr: data.rate,
+          source: 'frankfurter_ecb',
+          last_fetched: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+      }, `SB-exchangeRate-${code}`);
+      if (!patchR.ok) { console.error(`refreshExchangeRates [${code}] DB write failed:`, patchR.status, await patchR.text()); results.push({ code, ok: false }); continue; }
+
+      console.log(`💱 [exchange-rates] ${code}/INR = ${data.rate}`);
+      results.push({ code, ok: true, rate: data.rate });
+    } catch (e) {
+      console.error(`refreshExchangeRates [${code}] error:`, e.message);
+      results.push({ code, ok: false, error: e.message });
+    }
+  }
+  return results;
+}
+
 // ═══════════════════ v3.2 — CRON JOBS ═══════════════════
 
 // Shared secret check — all /cron/* routes require ?secret=... or header
@@ -2393,6 +2437,19 @@ app.post('/cron/eod-summary', async (req, res) => {
     console.log(`🌆 [eod-summary] booked:${bookedToday} lost:${lostToday} new:${newToday} value:₹${totalValue}`);
   } catch (e) {
     console.error('eod-summary error:', e);
+  }
+});
+
+// ── /cron/refresh-exchange-rates — daily: base_rate_inr for USD/CHF/EUR/GBP ──
+app.post('/cron/refresh-exchange-rates', async (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json({ status: 'started' });
+
+  try {
+    const results = await refreshExchangeRates();
+    console.log('💱 [refresh-exchange-rates] done:', JSON.stringify(results));
+  } catch (e) {
+    console.error('refresh-exchange-rates error:', e);
   }
 });
 
@@ -4134,7 +4191,7 @@ app.get('/health', (req, res) => res.json({
     '/notify/manual-lead', '/internal/costing-audit',
     '/internal/roles-write', '/internal/staff-roles-write', '/internal/portal-credentials-read', '/internal/portal-credentials-write',
     '/internal/sync-meta', '/internal/sync-google',
-    '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh'
+    '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh', '/cron/refresh-exchange-rates'
   ]
 }));
 

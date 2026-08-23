@@ -246,25 +246,29 @@ async function fetchRetry(url, opts, label) {
 // nothing in this file calls either function (see module.exports below,
 // which exists only so a future module can require() them).
 //
-// NOTE ON LICENSING SCOPE — NOT YET RESOLVED: the request that produced
-// this scaffolding stated the intended use as "internal-costing-only,
-// per a licensing constraint already discussed" (rate_cards/Quotation
-// System). A follow-up request asked for a comment here stating the
-// OPPOSITE — that Viator's Basic Access tier restricts use to driving
-// affiliate traffic to viator.com and specifically PROHIBITS internal-
-// only data indexing for costing. A live check against Viator's own
-// partner-API docs (docs.viator.com, partnerresources.viator.com)
-// didn't cleanly confirm either framing, and the second framing's own
-// wording was internally inconsistent (says use is "restricted to
-// driving affiliate traffic to viator.com" in one sentence, then says
-// "never a customer-facing link/redirect to viator.com" in the next —
-// affiliate traffic requires exactly that kind of link). Not asserting
-// either claim as fact here until this is actually resolved — see chat
-// history around 21 Aug 2026 for the full exchange. Whichever use case
-// is confirmed correct determines whether this ever gets wired into the
-// Quotation System (internal) or into Maya's conversational replies
-// (customer-facing) — those are different integration points, not a
-// detail to guess at.
+// VIATOR LICENSING — RESOLVED, confirmed directly with Viator Partner
+// Support, 22 Aug 2026. Internal costing storage (pulling prices into
+// rate_cards) is NOT permitted on Basic/Full Affiliate Access — real
+// audit risk, Viator deactivates internal-only integrations. Bundling
+// a Viator activity into a package we invoice ourselves is a Merchant
+// of Record violation, also prohibited.
+//
+// Only compliant use: Affiliate "Option B" — Maya may mention a real
+// activity + price in conversation, alongside the genuine unmodified
+// productUrl (tracking params intact) as an outbound booking link.
+// HARD RULES if these functions are ever wired up:
+//   - Never store the result (no rate_cards, no caching beyond the
+//     single reply)
+//   - Never modify or strip the productUrl
+//   - Never add the price to any internal quote total — activities
+//     under this model are never part of costing_lines
+// Wiring target is Maya's reply flow (mayaTurn()), NOT the Quotation
+// System — these functions are not for rate_cards ingestion.
+//
+// Merchant API (real booking endpoints, becomes the merchant of
+// record) was evaluated as the alternative — requires a deposit sized
+// to sales volume + certification; not pursued for cost reasons as of
+// 22 Aug 2026.
 async function searchViatorProducts(destination, searchTerm) {
   try {
     const r = await fetchRetry(`${VIATOR_BASE_URL}/products/search`, {

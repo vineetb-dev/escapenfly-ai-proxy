@@ -566,6 +566,90 @@ codes exactly as it does for the other `ATTRIBUTION_KEYS` fields); a normal
 bracket-free message left the field null; `campaign_code` stayed null
 throughout; test rows deleted after.
 
+## Graph API version bump — v18.0/v21.0 → v25.0 (3 Sep 2026)
+The v18.0-vs-v21.0 discrepancy flagged in the attribution-persistence section
+above turned out worse than it looked: **both were expired**. "Bump
+`/webhook/meta` to match `meta-sync.js`'s v21.0" — the advice given when this
+was first flagged — was wrong, because v21.0 was itself past Meta's ~2-year
+version lifetime. As of Q2 2026: **v25.0 is current** (released 18 Feb 2026),
+**v24.0 is the oldest supported** (v23.0 reached end of life 9 Jun 2026). Both
+`server.js` and `meta-sync.js` now pin `v25.0`.
+
+**Why this is not cosmetic.** A Graph API call to an expired version does
+**not error** — it silently reroutes to the next oldest supported version,
+with no 4xx, no warning, nothing in the logs. The response shape can change
+underneath you with zero signal. Two live consequences were riding on this:
+`/webhook/meta`'s `campaign_id`/`adset_id`/`ad_id` fields (BRIEF-2's
+attribution fix) were being requested against a rerouted, unspecified
+version; and `meta-sync.js` writes to `marketing_performance`, where a
+silently reshaped response means quietly wrong marketing numbers — worse
+than an outage, because nothing looks broken.
+
+**Named constants, not inline literals — that's how this drifted.** The
+inline `v18.0` string in `/webhook/meta`'s fetch URL is what let it drift
+three versions behind `meta-sync.js` without anyone noticing. `server.js` now
+defines `META_GRAPH_VERSION` (in the CONFIG block, near the top of the file);
+`meta-sync.js` keeps its own `GRAPH_VERSION`. **These two must move together**
+— there's no shared import between the two files (`meta-sync.js` is required
+by `server.js` but nothing here re-exports its `GRAPH_VERSION`), so bumping
+one without the other reintroduces the exact discrepancy this fix closes.
+Check Meta's changelog before the next bump, and update the version comment
+in both places.
+
+**Metric-name check, not just a version-string bump.** Before assuming the
+version bump alone was sufficient, checked Meta's live docs for every metric
+`meta-sync.js` requests, since retired/renamed metrics fail silently (return
+nothing, not an error) — same silent-failure shape as the version drift
+itself. Checked directly against Meta's official docs (Graph API Page
+Insights reference, Instagram Media Insights reference, Marketing API
+breakdowns reference), not from memory:
+- `page_views_total`, `page_post_engagements` (`fetchPageOrganicInsights`) —
+  both confirmed **current, not deprecated**. Meta deprecated ~85 legacy
+  Page Insights metrics effective 15 Jun 2026 (Page/Paid/Viral/Nonviral
+  Reach, Page Posts Impressions, Page/Post Video Views Unique, Reels Unique
+  Impressions — replaced by new Views/Viewers metrics), but neither of these
+  two is in that list.
+- `reach`, `likes`, `comments`, `saved`, `shares`, `total_interactions`
+  (`fetchInstagramMediaInsights`) — all confirmed **current**. The
+  `impressions`/`plays` family was deprecated (Apr 2025 onward, views
+  replacing impressions everywhere), but this file never requested those.
+  One caveat worth knowing, not a deprecation: `total_interactions` is
+  marked "Currently in development status" in Meta's own docs — usable, but
+  less stable than a GA metric. Separately (not version-related, pre-existing
+  either way): `likes` and `saved` are documented as FEED-post-and-REELS-only,
+  not valid for STORY — `fetchInstagramMediaInsights` only branches its
+  metric string on `isReel` vs not, so if the `/media` edge it queries ever
+  returned a STORY item, requesting `likes`/`saved` for it could fail. Not
+  fixed here since it's outside what this bump touched and Instagram Stories
+  don't normally appear on the regular `/media` edge — flagged for whoever
+  looks at this function next.
+- `post_engagement`/`page_engagement` action types on the plain `actions`
+  field (`fetchAdsInsights`) — confirmed **current**. Meta deprecated 100+
+  metrics from Ads Insights on 30 Oct 2024, but that hit `unique_actions`/
+  `cost_per_unique_action_type` specifically; the plain `actions`/
+  `cost_per_action_type` fields this file actually uses were explicitly
+  unaffected.
+
+**Verification — what could and couldn't be done from here.** Confirmed
+locally: both files syntax-check clean; the server starts clean with the
+edited `meta-sync.js` still required non-lazily (a break there would crash
+the whole server at startup, not just the sync endpoint — see the Marketing
+data sync section above); `/internal/sync-meta` still 401s with no/wrong
+secret and, with a local-only test secret, reaches the same pre-existing
+`Missing required env var: SUPABASE_URL` 500 already documented above —
+confirming the `GRAPH_VERSION` edit didn't break module load or execution.
+**Not verified from here, genuinely can't be**: the brief's own two real
+tests — firing Meta's Lead Ads Testing Tool against the real form/webhook,
+and calling `/internal/sync-meta` with the real `MARKETING_SYNC_SECRET`
+against real Meta credentials — both need real Meta Developer account access
+and real Render-configured secrets, neither available in this environment
+(same gap already noted in the Marketing data sync section: no real
+`META_ACCESS_TOKEN`/`MARKETING_SYNC_SECRET` locally, no Render access). Real
+verification of the actual v25.0 Graph API responses is the next step, done
+with Vineet once this deploys — check whether `campaign_id`/`adset_id`/
+`ad_id` come back populated on a real test lead, and diff `/internal/sync-meta`'s
+summary against a pre-bump run for any metric that drops to 0.
+
 ## Known, deliberate, NOT-yet-fixed gaps
 - RLS disabled on all Supabase tables except `costing_audits` (see above —
   same as the CRM repo for every other table) — deferred, needs a real

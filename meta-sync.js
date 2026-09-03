@@ -20,7 +20,12 @@
 
 const { createClient } = require('@supabase/supabase-js');
 
-const GRAPH_VERSION = 'v21.0';
+// Expired versions do NOT error — they silently reroute to the next oldest
+// supported version and can change response shape with no signal. Keep this
+// in step with server.js's META_GRAPH_VERSION, and check Meta's changelog
+// before bumping. v25.0 current as of Feb 2026; v24.0 is the oldest
+// supported.
+const GRAPH_VERSION = 'v25.0';
 const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_VERSION}`;
 
 function requireEnv(name) {

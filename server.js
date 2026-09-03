@@ -111,6 +111,12 @@ const AISENSY_WEBHOOK_SECRET = process.env.AISENSY_WEBHOOK_SECRET || '';
 const WA_NUM        = (process.env.WA_NUM || '919851739851').replace(/\D/g, '');
 const MAYA_CAMPAIGN = process.env.MAYA_CAMPAIGN || 'maya_session';
 const CRM_URL       = process.env.CRM_URL || 'https://escapenfly-crm.netlify.app';
+// Meta Graph API version. Expired versions do NOT error — they silently
+// reroute to the next oldest supported version and can change response shape
+// with no signal. Keep this in step with meta-sync.js's GRAPH_VERSION, and
+// check Meta's changelog before bumping. v25.0 current as of Feb 2026;
+// v24.0 is the oldest supported.
+const META_GRAPH_VERSION = 'v25.0';
 // Viator integration scaffolding — see the searchViatorProducts/
 // checkViatorAvailability section below for current status.
 const VIATOR_API_KEY = process.env.VIATOR_API_KEY;
@@ -3687,16 +3693,19 @@ app.post('/webhook/meta', async (req, res) => {
           // v-fix (attribution): request fields explicitly — this call used
           // to take Meta's defaults, which never included ad_id/adset_id/
           // campaign_id, so that data was silently discarded before it ever
-          // reached mergeLeadData. FLAGGED, NOT CHANGED: this URL is pinned
-          // to Graph API v18.0, while meta-sync.js in this repo uses v21.0.
-          // v18.0 is past Meta's ~2-year version lifetime — Meta auto-
-          // upgrades calls to expired versions, so this may be working by
-          // accident rather than by design. Bumping to v21.0 is almost
-          // certainly right, but it changes a live lead-capture path — see
-          // CLAUDE.md's attribution section, left for an explicit decision
-          // rather than changed here.
+          // reached mergeLeadData.
+          //
+          // v-fix (Graph API version, 3 Sep 2026): this URL was pinned to
+          // v18.0 while meta-sync.js used v21.0 — BOTH were expired (Graph
+          // API versions live ~2 years; a call to an expired version does
+          // NOT error, it silently reroutes to the next oldest supported
+          // version with no signal, so the campaign_id/adset_id/ad_id fields
+          // requested above may not have been behaving as designed). Now
+          // META_GRAPH_VERSION, kept in step with meta-sync.js's
+          // GRAPH_VERSION — see CLAUDE.md's attribution section for the full
+          // finding and why this was invisible.
           const metaR = await fetchRetry(
-            `https://graph.facebook.com/v18.0/${leadId_meta}?fields=id,created_time,field_data,ad_id,adset_id,campaign_id,form_id&access_token=${process.env.META_ACCESS_TOKEN}`,
+            `https://graph.facebook.com/${META_GRAPH_VERSION}/${leadId_meta}?fields=id,created_time,field_data,ad_id,adset_id,campaign_id,form_id&access_token=${process.env.META_ACCESS_TOKEN}`,
             {}, 'Meta-lead'
           );
           const metaLead = await metaR.json();

@@ -1380,7 +1380,22 @@ async function notifyTeam(assigned, leadData) {
 // real response shape was verified directly (curl) before writing this —
 // confirmed `{date, base, quote, rate}` for USD/CHF/EUR/GBP against INR, not
 // assumed from the snippet.
-const EXCHANGE_RATE_CURRENCIES = ['USD', 'CHF', 'EUR', 'GBP'];
+//
+// v-fix (24 Aug 2026, real quote-audit bug, not hypothetical): this list
+// silently excluded SGD and AED. SGD sat on a stale 'manual_seed' rate
+// (understating it ~9.5%) since it was never in this loop for the cron to
+// touch; AED had NO row in exchange_rates at all — quote-staging's
+// calcLine() computes a line's INR contribution as 0 (not an error) when
+// `D.fx[currency]` is undefined, so every Dubai line item was silently
+// contributing ₹0 to quote totals with nothing visibly wrong on screen.
+// Both found via a manual quote audit, corrected by hand as an interim fix,
+// then root-caused here. 241 real Dubai + Singapore vendor items were
+// loaded into rate_cards that same night — these are now active daily-use
+// currencies, not incidental, hence the code fix rather than leaving it
+// manual. Checked directly (not assumed) whether any other currency used in
+// rate_cards/packages is still missing from exchange_rates — none are,
+// as of this fix.
+const EXCHANGE_RATE_CURRENCIES = ['USD', 'CHF', 'EUR', 'GBP', 'SGD', 'AED'];
 async function refreshExchangeRates() {
   const results = [];
   for (const code of EXCHANGE_RATE_CURRENCIES) {

@@ -1093,6 +1093,18 @@ async function findRecentLeadDB(phone) {
   }
 }
 
+// Attribution fields carried end-to-end: website query params (utm_*, gclid,
+// fbclid, landing_page, referrer) and Meta Lead Form platform IDs. These are
+// FIRST-TOUCH: once set on a lead they are never overwritten, so a customer
+// who first arrives via a Google ad and later returns direct still reads as
+// the Google ad's lead. Deliberately excludes campaign_code — that mapping is
+// a human decision per campaign, never derived from utm_campaign.
+const ATTRIBUTION_KEYS = [
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
+  'gclid', 'fbclid', 'landing_page', 'referrer',
+  'platform_campaign_id', 'platform_adset_id', 'platform_ad_id'
+];
+
 // ── NON-EMPTY-ONLY MERGE: fresh values win only when they carry information ──
 function mergeLeadData(existing, fresh) {
   const pick = (a, b) => {
@@ -1100,7 +1112,7 @@ function mergeLeadData(existing, fresh) {
     if (!bv || bv.toLowerCase() === 'unknown' || bv === 'Unknown (WhatsApp)' || bv === 'Unknown (Website Chat)') return a || b || '';
     return bv;
   };
-  return {
+  const merged = {
     name:        cap(pick(existing.name, fresh.name), 80),
     phone:       fresh.phone || existing.phone || '',
     email:       cap(pick(existing.email, fresh.email), 120),
@@ -1124,11 +1136,22 @@ function mergeLeadData(existing, fresh) {
     query:       cap(fresh.query || existing.query || '', 500),
     source:      fresh.source || existing.source || 'whatsapp'
   };
+  // FIRST-TOUCH, opposite of pick(): existing wins. A later turn (or a later
+  // visit inside the dedupe window) must never rewrite where this lead
+  // originally came from — that is the whole point of the field.
+  for (const k of ATTRIBUTION_KEYS) {
+    const v = String(existing[k] || fresh[k] || '').trim();
+    if (v) merged[k] = cap(v, 500);
+  }
+  return merged;
 }
 
 // ── FIELD BUILDER (CRM-compatible: NO top-level name/dest columns; they
 //    live in original_message_text JSON that CRM mapLead() reads) ──
-function buildLeadFields(data) {
+// isNew: true only from saveLead()'s insert call site. Gates first_touch_source
+// so an UPDATE (updateLead(), one-arg call) can never relabel an existing
+// lead's origin.
+function buildLeadFields(data, isNew = false) {
   const paxNum = parseInt(String(data.pax || '').match(/\d+/)?.[0], 10);
   // Indian budget notation: "2 lakh"/"2L" → 200000, "50k" → 50000, "1.5 cr" → 15000000
   const bStr = String(data.budget || '').toLowerCase();
@@ -1190,6 +1213,27 @@ function buildLeadFields(data) {
     categoryLines +
     `\nQuery: ${data.query || '-'}`;
 
+  // Attribution — see ATTRIBUTION_KEYS above mergeLeadData for the full
+  // first-touch design. THE TRAP: findRecentLeadDB() rebuilds `existing` by
+  // parsing original_message_text, NOT these top-level columns — so every
+  // key here must ALSO land inside the JSON blob below, or it looks correct
+  // on insert and then gets silently wiped the moment a follow-up message
+  // lands inside the dedupe window (merge reads `existing` from the blob,
+  // sees nothing, buildLeadFields blanks the column on the resulting UPDATE).
+  const attributionFields = {};
+  for (const k of ATTRIBUTION_KEYS) {
+    if (data[k]) attributionFields[k] = cap(data[k], 500);
+  }
+
+  // first_touch_source: derived once, at creation only (isNew) — an UPDATE
+  // must never relabel where this lead originally came from.
+  const firstTouchFields = {};
+  if (isNew) {
+    let referrerHost = '';
+    try { referrerHost = data.referrer ? new URL(data.referrer).hostname : ''; } catch (e) {}
+    firstTouchFields.first_touch_source = cap(data.utm_source || referrerHost || 'direct', 120);
+  }
+
   return {
     enquiry_type: intentToEnquiryType(data.intent || data.type, data.destination),
     pax_adults: paxSafe,
@@ -1197,6 +1241,8 @@ function buildLeadFields(data) {
     notes: notesText,
     internal_notes: notesText,
     phone: data.phone || '',
+    ...attributionFields,
+    ...firstTouchFields,
     original_message_text: JSON.stringify({
       name: data.name || 'Unknown (WhatsApp)',
       phone: data.phone || '',
@@ -1216,7 +1262,8 @@ function buildLeadFields(data) {
       intent: data.intent || '',
       leadSummary: data.leadSummary || '',
       nextAction: data.nextAction || '',
-      handover: !!data.handover
+      handover: !!data.handover,
+      ...attributionFields
     }),
     updated_at: new Date().toISOString(),
     last_activity_at: new Date().toISOString()
@@ -1244,7 +1291,7 @@ async function saveLead(data, assigned) {
   try {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
-    const fields = buildLeadFields(data);
+    const fields = buildLeadFields(data, true);
 
     const body = {
       id,
@@ -2967,7 +3014,7 @@ async function isDmcVendorNumber(phone) {
 const FALLBACK_REPLY = 'Thanks for your message! Our travel expert will call you shortly. You can also reach us directly at +91 98517 39851. 😊';
 const UNSUPPORTED_MEDIA_REPLY = "Thanks for sharing that! I work best with text messages right now, so I can't open images, documents, or links yet. For general enquiries, please call us at +91 98517 39851. For partner & DMC queries, contact Vivek Bansal at 9988740145. For complaints or urgent issues, contact Vineet Bansal at 9216320050. Just type your travel query in words and I'll help right away!";
 
-async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef = null) {
+async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef = null, attribution = null) {
   const t0 = Date.now();
   const log = { intent: '-', crm: 'none', notify: '-' };
   let tAI = t0, tSent = t0;
@@ -3112,6 +3159,15 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       query: message,
       source: channel === 'website' ? 'website-ai-chat' : 'whatsapp-ai-chat'
     };
+    // Whitelist only — never spread the request body, so a crafted POST
+    // cannot inject arbitrary columns. See ATTRIBUTION_KEYS above
+    // mergeLeadData.
+    if (attribution && typeof attribution === 'object') {
+      for (const k of ATTRIBUTION_KEYS) {
+        const v = String(attribution[k] || '').trim();
+        if (v) freshData[k] = cap(v, 500);
+      }
+    }
     chat.known = mergeLeadData(chat.known || {}, freshData);
 
     // ── WEBSITE SESSION → PHONE GRADUATION (§11) ──
@@ -3355,8 +3411,14 @@ function buildWorkspaceCategories(fn) {
 app.post('/webhook/website-chat', async (req, res) => {
   const sessionKey = String(cleanAttr(req.body.phone || req.body.sessionId || '') || '').replace(/[^a-zA-Z0-9]/g, '') || 'unknown';
   const message = cleanAttr(req.body.message || req.body.text || '') || 'Hi';
+  const attribution = {};
+  for (const k of ATTRIBUTION_KEYS) {
+    const v = cleanAttr(req.body[k] || '');
+    if (v) attribution[k] = v;
+  }
   const out = {};
-  const reply = await withPhoneLock(sessionKey, () => mayaTurn(sessionKey, message, null, 'website', out));
+  const reply = await withPhoneLock(sessionKey,
+    () => mayaTurn(sessionKey, message, null, 'website', out, attribution));
   const founderNotesList = out.founderNotesList || [];
   // Option C (additive hybrid): visa/flights/hotels/budget/tips below stay
   // exactly as they've always behaved for the single-destination case (the
@@ -3583,8 +3645,19 @@ app.post('/webhook/meta', async (req, res) => {
         const leadId_meta = formData.leadgen_id;
 
         if (process.env.META_ACCESS_TOKEN) {
+          // v-fix (attribution): request fields explicitly — this call used
+          // to take Meta's defaults, which never included ad_id/adset_id/
+          // campaign_id, so that data was silently discarded before it ever
+          // reached mergeLeadData. FLAGGED, NOT CHANGED: this URL is pinned
+          // to Graph API v18.0, while meta-sync.js in this repo uses v21.0.
+          // v18.0 is past Meta's ~2-year version lifetime — Meta auto-
+          // upgrades calls to expired versions, so this may be working by
+          // accident rather than by design. Bumping to v21.0 is almost
+          // certainly right, but it changes a live lead-capture path — see
+          // CLAUDE.md's attribution section, left for an explicit decision
+          // rather than changed here.
           const metaR = await fetchRetry(
-            `https://graph.facebook.com/v18.0/${leadId_meta}?access_token=${process.env.META_ACCESS_TOKEN}`,
+            `https://graph.facebook.com/v18.0/${leadId_meta}?fields=id,created_time,field_data,ad_id,adset_id,campaign_id,form_id&access_token=${process.env.META_ACCESS_TOKEN}`,
             {}, 'Meta-lead'
           );
           const metaLead = await metaR.json();
@@ -3599,7 +3672,13 @@ app.post('/webhook/meta', async (req, res) => {
             destination: fields.destination || fields.travel_destination || '',
             budget: fields.budget || '',
             query: fields.message || '',
-            source: 'meta-ads'
+            source: 'meta-ads',
+            // Prefer the Graph response; fall back to the webhook payload
+            // (formData = change.value, already in scope), which carries
+            // ad_id/adgroup_id even when the Graph call returns partial data.
+            platform_campaign_id: String(metaLead.campaign_id || ''),
+            platform_adset_id:    String(metaLead.adset_id || formData.adgroup_id || ''),
+            platform_ad_id:       String(metaLead.ad_id || formData.ad_id || ''),
           });
           if (!leadData.name) leadData.name = 'Unknown (Meta)';
 

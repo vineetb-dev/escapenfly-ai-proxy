@@ -432,6 +432,85 @@ Real test with real production credentials against real Meta/Google
 APIs and a real `marketing_performance` write is the next step, done
 with Vineet once this deploys.
 
+## Attribution persistence + Meta campaign capture (3 Sep 2026)
+`enquiries` has 17 nullable attribution columns (`medium`, `campaign_code`,
+`platform_campaign_id`, `platform_adset_id`, `platform_ad_id`,
+`utm_source/medium/campaign/content/term`, `gclid`, `fbclid`,
+`landing_page`, `referrer`, `first_touch_source`,
+`first_touch_campaign_code`, `whatsapp_broadcast_code`) that nothing wrote
+to before this. `ATTRIBUTION_KEYS` (defined just above `mergeLeadData`) is
+the whitelist of the 12 that this code path actually carries: website query
+params (`utm_*`, `gclid`, `fbclid`, `landing_page`, `referrer`) and Meta
+Lead Form platform IDs. `medium`, `campaign_code`, `first_touch_campaign_code`,
+and `whatsapp_broadcast_code` are deliberately NOT written here — they stay
+for a human or a later feature. `campaign_code` in particular is never
+derived from `utm_campaign` — that mapping is a human decision per campaign.
+
+**First-touch, existing wins — the opposite of every other field.**
+`mergeLeadData()` merges most fields fresh-wins (a later, more specific
+answer overwrites an earlier vague one). Attribution is the opposite: once
+an `ATTRIBUTION_KEYS` field is set on a lead, it is never overwritten by a
+later turn or a later visit inside the dedupe window — a customer who first
+arrived via a Google ad and later returns direct still reads as the Google
+ad's lead. Implemented as a second pass after the normal fresh-wins merge:
+`existing[k] || fresh[k]`, existing first.
+
+**THE TRAP — column AND blob, both, always.** `findRecentLeadDB()` rebuilds
+a lead's `existing` state by parsing the `original_message_text` JSON blob,
+**not** the real table columns. `buildLeadFields()` therefore writes every
+`ATTRIBUTION_KEYS` field to BOTH the real column (top-level, spread into the
+returned object) AND inside the `original_message_text` JSON. Miss the blob
+half and it looks correct on the insert, then gets silently wiped the moment
+the customer sends a second message inside the dedupe window — the merge
+that produces the UPDATE reads `existing` from the blob, sees nothing there,
+and the subsequent `buildLeadFields()` call blanks the column. Any test that
+only checks the insert will pass while this is broken; the real verification
+must include a follow-up message.
+
+**`first_touch_source` is `isNew`-gated.** `buildLeadFields(data, isNew)` —
+`isNew` defaults `false` and is passed `true` only from `saveLead()`'s insert
+call site; `updateLead()` still calls it with one argument. Only on `isNew`
+does it derive `first_touch_source` (`utm_source` if present, else the
+referrer's hostname, else `'direct'`) and set it. This gates it so an
+enrich-pass UPDATE can never relabel where an existing lead originally came
+from — the same reasoning as the first-touch merge above, enforced a second
+way at the point where the row is actually written.
+
+**Threading through `mayaTurn` / website chat.** `mayaTurn()` takes a sixth
+parameter, `attribution` — a plain object, whitelist-filtered against
+`ATTRIBUTION_KEYS` before it's folded into `freshData` (never the raw
+request body spread directly — a crafted POST must not be able to inject
+arbitrary columns). `/webhook/website-chat` builds that object off
+`req.body` through the existing `cleanAttr()` sanitizer and passes it as the
+sixth argument. Because `chat.known` is persisted by `saveChat()` and merged
+every turn, attribution captured on turn 1 survives to whichever later turn
+actually creates the lead (usually several turns later, once a phone number
+appears) — confirmed `graduateSessionToPhone()` does NOT rebuild `chat.known`
+from scratch on the session-key → phone handoff, it only reassigns
+`chat.phone` and re-saves the same chat object, so nothing extra was needed
+there.
+
+**`/webhook/meta` — Graph API version, flagged not changed.** The Graph
+lead-detail call now requests `fields=id,created_time,field_data,ad_id,
+adset_id,campaign_id,form_id` explicitly (it previously took Meta's
+defaults, which never included the ad/adset/campaign IDs, so that data was
+silently discarded before it ever reached `mergeLeadData`). IDs are read
+preferring the Graph response, falling back to the webhook payload
+(`change.value`, i.e. `formData.adgroup_id`/`formData.ad_id`) which carries
+them even when the Graph call returns partial data. Separately, and
+deliberately NOT changed here: this URL is pinned to Graph API `v18.0`,
+while `meta-sync.js` in this repo uses `v21.0`. `v18.0` is past Meta's
+~2-year version lifetime — Meta auto-upgrades calls to expired versions, so
+this may be working by accident rather than by design. Bumping to `v21.0`
+is almost certainly right, but it touches a live lead-capture path, so this
+was surfaced for an explicit decision rather than changed unilaterally.
+
+**Verified against real Supabase, not mocks** — see the verification log
+kept alongside this change; a synthetic website-chat conversation was run
+end-to-end (insert → same-window follow-up → different-attribution
+follow-up → cleanup), not just a single insert check, specifically because
+THE TRAP above only shows up on the second message.
+
 ## Known, deliberate, NOT-yet-fixed gaps
 - RLS disabled on all Supabase tables except `costing_audits` (see above —
   same as the CRM repo for every other table) — deferred, needs a real

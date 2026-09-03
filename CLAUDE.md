@@ -511,6 +511,61 @@ end-to-end (insert → same-window follow-up → different-attribution
 follow-up → cleanup), not just a single insert check, specifically because
 THE TRAP above only shows up on the second message.
 
+## WhatsApp broadcast attribution (3 Sep 2026)
+Closes the last attribution gap — website and Meta were handled by the
+section above, WhatsApp broadcasts previously produced leads
+indistinguishable from walk-ins. `whatsapp_broadcast_code` is now the 13th
+entry in `ATTRIBUTION_KEYS`, so it gets the same first-touch merge and the
+same column-AND-blob persistence as every other attribution field, with no
+second code path — `mergeLeadData()`/`buildLeadFields()` needed zero changes
+beyond the one array entry.
+
+**Link format.** A broadcast links to `https://wa.me/919851739851?text=Hi%20%5BBALI25%5D`
+— the customer taps it, WhatsApp opens with `Hi [BALI25]` already typed in
+the compose box, they hit send. That literal bracketed code is what arrives
+as the first inbound message.
+
+**Stripped before Maya ever sees it, deliberately.** `extractBroadcastCode()`
+(next to `deepExtract`, just above `/webhook/incoming`) pulls the code via
+`BROADCAST_CODE_RE` and returns the text with it removed. `/webhook/incoming`
+overwrites `text` with the stripped version before Maya is called — Maya
+receives `Hi`, never `Hi [BALI25]`. This isn't just cosmetic: if she saw the
+raw code she could echo it back, ask the customer what it means, or treat it
+as part of their actual travel question, none of which a customer expects
+from a marketing tag they never consciously typed.
+
+**Runs after the spam guard, on purpose.** The extraction happens after the
+`validPhone`/self-number/`looksLikeSpam`/DMC-vendor guards, but before the
+empty-text check and before `mayaTurn()` is called. Specifically AFTER
+`looksLikeSpam`, not before — so the spam classifier still sees the original
+bracketed text. Stripping first would let a spam message launder itself into
+something cleaner-looking before the spam check ever ran.
+
+**Never mapped to `campaign_code`**, same rule as `utm_campaign`: a broadcast
+code is a raw tag marketing chose, and turning it into a `campaign_code` is a
+human decision made once per campaign, not something this code path decides
+for them. Stored raw, as typed on the broadcast link (uppercased for
+consistency).
+
+**Empty-after-strip case.** A message that was ONLY the code (`Hi [BALI25]`
+strips to nothing once "Hi" is also absent from some link variants) would
+otherwise reach Maya empty and trip the media-only fallback path incorrectly
+— `extractBroadcastCode()` substitutes a plain `'Hi'` opener in that case so
+the conversation starts normally.
+
+**Verified against real Supabase, not unit tests** — see the verification log
+kept alongside this change: a synthetic AiSensy-shaped `/webhook/incoming`
+payload carrying `Hi [TESTCODE1]` was posted to a local server instance
+against real production Supabase. Confirmed via logs that the code was
+extracted and Maya received the stripped `Hi`; confirmed her reply never
+mentioned the code; confirmed the resulting lead held `TESTCODE1` in both the
+`whatsapp_broadcast_code` column and inside `original_message_text`; a
+same-window follow-up with no code left it unchanged; a same-window message
+carrying `[TESTCODE2]` did NOT overwrite it (first-touch holds for broadcast
+codes exactly as it does for the other `ATTRIBUTION_KEYS` fields); a normal
+bracket-free message left the field null; `campaign_code` stayed null
+throughout; test rows deleted after.
+
 ## Known, deliberate, NOT-yet-fixed gaps
 - RLS disabled on all Supabase tables except `costing_audits` (see above —
   same as the CRM repo for every other table) — deferred, needs a real

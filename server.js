@@ -1102,7 +1102,8 @@ async function findRecentLeadDB(phone) {
 const ATTRIBUTION_KEYS = [
   'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
   'gclid', 'fbclid', 'landing_page', 'referrer',
-  'platform_campaign_id', 'platform_adset_id', 'platform_ad_id'
+  'platform_campaign_id', 'platform_adset_id', 'platform_ad_id',
+  'whatsapp_broadcast_code'
 ];
 
 // ── NON-EMPTY-ONLY MERGE: fresh values win only when they carry information ──
@@ -3494,6 +3495,30 @@ function deepExtract(obj) {
   return { phones, texts };
 }
 
+// ── WHATSAPP BROADCAST CODE (3 Sep 2026) ──
+// Broadcasts link to wa.me/<number>?text=Hi%20%5BBALI25%5D, so the customer's
+// first message arrives as "Hi [BALI25]". We pull the code out and strip it
+// before the text reaches Maya — she must never see it, or she'll respond to
+// it as though it were part of the customer's actual question.
+//
+// Deliberately NOT mapped to campaign_code. A broadcast code is a raw tag the
+// marketing side chose; turning it into a campaign_code is a human decision
+// made once per campaign, same rule as utm_campaign. Store it raw.
+const BROADCAST_CODE_RE = /\[([A-Za-z0-9][A-Za-z0-9_-]{1,23})\]/;
+
+function extractBroadcastCode(text) {
+  const raw = String(text || '');
+  const m = raw.match(BROADCAST_CODE_RE);
+  if (!m) return { code: '', text: raw };
+  const cleaned = raw.replace(BROADCAST_CODE_RE, ' ').replace(/\s+/g, ' ').trim();
+  return {
+    code: m[1].toUpperCase(),
+    // A message that was ONLY the code would otherwise reach Maya empty and
+    // trip the media-only fallback path. Give her a normal opener instead.
+    text: cleaned || 'Hi'
+  };
+}
+
 // ── PRIMARY: AISENSY INCOMING-MESSAGE WEBHOOK ──
 // Confirmed payload shape (v3.0.1 full logging, 5 Jul 2026):
 // { id, created_at, topic:"message.sender.user", project_id, delivery_attempt,
@@ -3554,6 +3579,11 @@ app.post('/webhook/incoming', async (req, res) => {
       return;
     }
 
+    const bc = extractBroadcastCode(text);
+    const broadcastCode = bc.code;
+    text = bc.text;
+    if (broadcastCode) console.log(`📣 [${phone}] broadcast code: ${broadcastCode}`);
+
     if (!text) {
       console.log(`Incoming from ${phone}: empty/media-only (${msgType || 'unknown type'}) — sending fallback reply.`);
       const lastSent = mediaFallbackSentAt.get(phone) || 0;
@@ -3570,7 +3600,8 @@ app.post('/webhook/incoming', async (req, res) => {
     // ALWAYS-REPLY policy; muted phones handled inside mayaTurn.
     // REPLY-FIRST: the send happens via onReply the moment Claude answers.
     await withPhoneLock(phone, () =>
-      mayaTurn(phone, text, reply => sendSessionMessage(phone, reply))
+      mayaTurn(phone, text, reply => sendSessionMessage(phone, reply), 'whatsapp', null,
+        broadcastCode ? { whatsapp_broadcast_code: broadcastCode } : null)
     );
   } catch (e) {
     console.error('Incoming webhook error:', e);

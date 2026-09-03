@@ -1394,25 +1394,33 @@ async function sendWA(phone, templateName, params) {
 
 // ── NOTIFY TEAM (instant new-lead alert) ──
 async function notifyTeam(assigned, leadData) {
-  let ok = true;
-  // Slot 4 in the approved team_lead_notification template is fixed as
-  // "...assigned to {{4}} in the CRM" — it can only ever grammatically hold
-  // a NAME, since the template itself can't be edited post-approval. The
-  // rep's own copy was previously sending CRM_URL into this slot, which
-  // rendered as a raw link where a name belongs — a real bug, not a
-  // stylistic choice. The CRM link itself belongs on the template's
-  // separate "EscapeNFly CRM" button, not the body text.
-  if (assigned.wa && assigned.wa !== '919XXXXXXXXX') {
-    ok = await sendWA(assigned.wa, 'team_lead_notification',
-      [assigned.name, leadData.name || 'Unknown', leadData.destination || 'TBD', assigned.name]) && ok;
+  // Changed 3 Sept 2026: internal team notifications move to the CRM
+  // dashboard (internal_notifications table) instead of WhatsApp — real
+  // WhatsApp fatigue was the reason ("most people just don't see" it).
+  // Client-facing WhatsApp templates (lead-received confirmation,
+  // Instagram tag, Google review requests) are UNCHANGED and untouched —
+  // this function only ever handled internal team pings, never client
+  // messaging, so the split is clean; nothing else in this file needs to
+  // change for that boundary to hold.
+  //
+  // Function name/signature kept identical on purpose — 6 call sites
+  // elsewhere in this file check its boolean return; only the internal
+  // implementation changes here.
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/internal_notifications`, {
+      method: 'POST',
+      headers: { ...SB_HEADERS, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({
+        notification_type: 'lead_assigned',
+        summary: `New lead: ${leadData.name || 'Unknown'} → ${leadData.destination || 'TBD'} — assigned to ${assigned.name}`,
+        assigned_to_email: assigned.email || null
+      })
+    }, 'notifyTeam-dashboard');
+    return r.ok;
+  } catch (e) {
+    console.error('notifyTeam (dashboard insert) error:', e.message);
+    return false;
   }
-  // v-fix (17 Aug 2026): Vineet's unconditional real-time CC on this
-  // template removed — pure duplication for him specifically, he already
-  // gets the same new-lead information via the 10am individual_lead_digest
-  // + team_lead_digest. Rep's own send above is unchanged. If this
-  // function is ever asked to notify someone else too, add them
-  // explicitly rather than reviving a blanket founder-tier CC here.
-  return ok;
 }
 
 // ── EXCHANGE RATE REFRESH (21 Aug 2026) — feeds exchange_rates.base_rate_inr ──

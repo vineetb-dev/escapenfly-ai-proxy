@@ -219,10 +219,11 @@ const DOCUMENTS_STORE_SECRET = process.env.DOCUMENTS_STORE_SECRET || '';
 const GDRIVE_SERVICE_ACCOUNT_KEY = process.env.GDRIVE_SERVICE_ACCOUNT_KEY || '';
 // The fixed mailbox the service account impersonates for every document
 // operation, via domain-wide delegation (confirmed granted in Google Admin
-// Console, 3 Sept 2026 — client ID 106799478821328049357, scopes
-// drive.file + drive.metadata). Confirmed idle in the CRM before
-// repurposing (zero leads/bookings/marketing assets tied to it) — not
-// assumed. Not a secret itself (just an address), so a plain constant
+// Console, client ID 106799478821328049357 — see DRIVE_SCOPES further
+// down for the actual authorized scope and its own history). Confirmed
+// idle in the CRM before repurposing (zero leads/bookings/marketing
+// assets tied to it) — not assumed. Not a secret itself (just an
+// address), so a plain constant
 // here, not an env var — same idiom as STALE_CC_KEY/FOUNDER_KEYS above.
 const GDRIVE_IMPERSONATE_EMAIL = 'crm@escapenfly.com';
 
@@ -4346,31 +4347,37 @@ app.post('/internal/portal-credentials-write', async (req, res) => {
 // This is the actual architectural fix: route uploads through THIS
 // server instead, authenticated as a single fixed mailbox
 // (GDRIVE_IMPERSONATE_EMAIL) via a service account granted domain-wide
-// delegation — confirmed granted in Google Admin Console, 3 Sept 2026
-// (client ID 106799478821328049357, scopes drive.file + drive.metadata).
+// delegation — confirmed granted in Google Admin Console, client ID
+// 106799478821328049357.
 //
-// Scope choice, deliberately narrower than full `drive`:
-//   - drive.file    — everything /internal/documents-upload creates. Full
-//     read/write on files this identity itself created, nothing else.
-//   - drive.metadata — everything /internal/documents-bulk-fix-sharing
-//     touches. Lets it add a sharing permission to a file it did NOT
-//     create (impersonating that file's real original uploader, found via
-//     team_members), without ever being able to read that file's content
-//     — a metadata-only operation is enough to fix sharing, and this
-//     keeps the service account from being able to open every document at
-//     every company Google account it can impersonate.
-//   - Consequence, stated plainly rather than glossed over:
-//     /internal/documents-download's content-streaming path only works for
-//     documents actually uploaded through THIS system (drive.file covers
-//     files the service account itself created). For the 125 pre-existing
-//     documents — bulk-fixed via drive.metadata, never created by this
-//     identity — content-level read genuinely needs a THIRD scope
-//     (drive.readonly) that isn't granted yet. Rather than block on that,
-//     the download endpoint falls back to just handing back the (now
-//     domain-shared, once bulk-fixed) Drive link for the browser to open
-//     directly — still solves "can't download", just via a slightly
-//     different path for old vs. new documents until/unless that scope is
-//     added.
+// v-fix (3 Sept 2026, real production failure): originally built and
+// deployed against two narrow, split scopes (drive.file for uploads,
+// drive.metadata for the sharing-only bulk-fix), matching what Admin
+// Console showed granted at the time. A real single-document test against
+// the live deploy then failed with `unauthorized_client` — a token-
+// EXCHANGE rejection, earlier in the flow than any Drive API call, and
+// the actual cause once checked: Google's domain-wide delegation requires
+// the scope(s) a token request asks for to match what's configured for
+// that client ID — no partial/subset grant. Admin Console had since been
+// reconfigured to a single, broader authorization
+// (https://www.googleapis.com/auth/drive) instead of the original two —
+// confirmed directly by Vineet via a fresh Admin Console screenshot
+// (active, no pending approval), not assumed — so a request for
+// drive.file/drive.metadata specifically no longer matched anything
+// actually granted, regardless of whether either would have been a valid
+// subset in principle. Every getDriveAccessToken() call below now
+// requests DRIVE_SCOPES (the one broad scope) to match.
+//
+// Real consequence of the broader scope, worth stating rather than
+// glossing over: the service account can now read/write full CONTENT of
+// any file any impersonated user can access, not just files it created
+// itself or bare permission metadata — a bigger footprint than the
+// original split-scope design intended. It does remove one real
+// limitation that design had: /internal/documents-download's content-
+// streaming path can now read the 125 pre-existing (bulk-fixed) documents
+// too, not just ones uploaded through this system — the earlier
+// drive.readonly gap this file used to flag no longer applies, since full
+// `drive` already covers it.
 //
 // Same honest limit as every other /internal/* proxy in this file: a
 // valid DOCUMENTS_STORE_SECRET proves the request came from the CRM app,
@@ -4379,8 +4386,7 @@ app.post('/internal/portal-credentials-write', async (req, res) => {
 // before ever calling this), same as everywhere else in this system —
 // not solved here, not pretended to be.
 
-const DRIVE_UPLOAD_SCOPES = ['https://www.googleapis.com/auth/drive.file'];
-const DRIVE_SHARE_SCOPES  = ['https://www.googleapis.com/auth/drive.metadata'];
+const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive'];
 
 // Returns a bearer access token for the service account impersonating
 // `subject` (domain-wide delegation — genuinely acting AS that real
@@ -4481,15 +4487,17 @@ app.post('/internal/documents-upload', documentsUpload.single('file'), async (re
 
     let folderLink = entRows[0].google_drive_link || '';
     let folderId = driveFileIdFromLink(folderLink);
-    const uploadToken = await getDriveAccessToken(GDRIVE_IMPERSONATE_EMAIL, DRIVE_UPLOAD_SCOPES);
+    // One token for this whole request — upload and share both request the
+    // same DRIVE_SCOPES now (see the scope comment above), so there's no
+    // reason to fetch a second one separately.
+    const driveToken = await getDriveAccessToken(GDRIVE_IMPERSONATE_EMAIL, DRIVE_SCOPES);
 
     if (!folderId) {
-      const folder = await driveCreateFolder(`${entity_name || 'Booking'} - ${entity_id.slice(0, 8)}`, uploadToken);
+      const folder = await driveCreateFolder(`${entity_name || 'Booking'} - ${entity_id.slice(0, 8)}`, driveToken);
       folderId = folder.id;
       folderLink = folder.webViewLink || '';
       try {
-        const shareToken = await getDriveAccessToken(GDRIVE_IMPERSONATE_EMAIL, DRIVE_SHARE_SCOPES);
-        await driveSharePermission(folderId, shareToken);
+        await driveSharePermission(folderId, driveToken);
       } catch (shareErr) {
         console.error('documents-upload: folder sharing failed (upload continues):', shareErr.message);
       }
@@ -4500,7 +4508,7 @@ app.post('/internal/documents-upload', documentsUpload.single('file'), async (re
       if (!patchRes.ok) console.error('documents-upload: saving folder link on entity failed:', patchRes.status, await patchRes.text());
     }
 
-    const uploaded = await driveUploadFile(req.file.buffer, req.file.originalname, req.file.mimetype, folderId, uploadToken);
+    const uploaded = await driveUploadFile(req.file.buffer, req.file.originalname, req.file.mimetype, folderId, driveToken);
 
     const docRow = {
       id: crypto.randomUUID(),
@@ -4543,7 +4551,7 @@ app.post('/internal/documents-download', async (req, res) => {
     if (!fileId) return res.status(404).json({ error: 'no drive link on this document' });
 
     try {
-      const token = await getDriveAccessToken(GDRIVE_IMPERSONATE_EMAIL, DRIVE_UPLOAD_SCOPES);
+      const token = await getDriveAccessToken(GDRIVE_IMPERSONATE_EMAIL, DRIVE_SCOPES);
       const fileRes = await fetchRetry(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
         headers: { Authorization: `Bearer ${token}` }
       }, 'Drive-download');
@@ -4567,12 +4575,13 @@ app.post('/internal/documents-download', async (req, res) => {
 // via team_members.name matching documents.uploaded_by — never a
 // hardcoded mapping, same "team_members is the source of truth" principle
 // escapenfly-crm's own CLAUDE.md establishes) to share THEIR existing file
-// with the whole domain. drive.metadata scope only — this never reads a
-// single byte of file content, just adds a permission, so it works
-// regardless of who originally created the file. No implicit "fix
-// everything" default — the caller must pass the exact doc_ids to
-// process, precisely so a single real document can be verified fixed
-// before running this against the rest. ──
+// with the whole domain. Uses DRIVE_SCOPES (see the scope comment above —
+// broader than this specific operation strictly needs, since it's the one
+// scope actually authorized for this client ID), so it works regardless
+// of who originally created the file. No implicit "fix everything"
+// default — the caller must pass the exact doc_ids to process, precisely
+// so a single real document can be verified fixed before running this
+// against the rest. ──
 app.post('/internal/documents-bulk-fix-sharing', async (req, res) => {
   if (!documentsStoreAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
   const { doc_ids } = req.body || {};
@@ -4606,7 +4615,7 @@ app.post('/internal/documents-bulk-fix-sharing', async (req, res) => {
       if (!impersonateEmail) { results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, ok: false, error: 'no matching team_members email for this uploaded_by name' }); continue; }
       if (!fileId) { results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, ok: false, error: 'could not parse a Drive file id from google_drive_link' }); continue; }
       try {
-        const token = await getDriveAccessToken(impersonateEmail, DRIVE_SHARE_SCOPES);
+        const token = await getDriveAccessToken(impersonateEmail, DRIVE_SCOPES);
         await driveSharePermission(fileId, token);
         results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, impersonated_as: impersonateEmail, ok: true });
       } catch (e) {

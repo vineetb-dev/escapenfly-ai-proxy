@@ -17,6 +17,13 @@ const { z } = require('zod');
 // specific /internal/sync-* request that needs it, not at server startup.
 const { runSync: runMetaSync } = require('./meta-sync');
 const { runSync: runGoogleSync } = require('./google-sync');
+// Document store (3 Sept 2026) — JWT for domain-wide-delegation impersonation
+// (already a dependency, google-sync.js uses the same package's GoogleAuth
+// class for GA4's service account), multer for multipart file uploads (new
+// dependency — Express has no built-in multipart parser, and every other
+// route here only ever receives JSON).
+const { JWT } = require('google-auth-library');
+const multer = require('multer');
 const app = express();
 
 app.use(cors({ origin: '*' }));
@@ -196,6 +203,28 @@ const VENDOR_CREDS_SECRET = process.env.VENDOR_CREDS_SECRET || '';
 // meant to come from a cron/scheduler, not a browser, so there's no reason
 // to also accept it in a URL where it could end up in access logs.
 const MARKETING_SYNC_SECRET = process.env.MARKETING_SYNC_SECRET || '';
+
+// Document store (3 Sept 2026) — see the DOCUMENT STORE section further
+// down for the full design. Same secret-handling discipline as every other
+// secret above: own name, never CRON_SECRET, never reused across a
+// different capability, empty-string fail-closed default — never
+// 'change-me-please' (see the security incident write-up further down for
+// exactly why that fallback is unsafe).
+const DOCUMENTS_STORE_SECRET = process.env.DOCUMENTS_STORE_SECRET || '';
+// The service account's own JSON key — Render env var only, never
+// committed, never logged, never returned in any response. Real value set
+// directly in Render by Vineet (see escapenfly-crm's CLAUDE.md / this
+// file's ADMIN_WRITE_SECRET comment above for the established handling of
+// every credential like this one).
+const GDRIVE_SERVICE_ACCOUNT_KEY = process.env.GDRIVE_SERVICE_ACCOUNT_KEY || '';
+// The fixed mailbox the service account impersonates for every document
+// operation, via domain-wide delegation (confirmed granted in Google Admin
+// Console, 3 Sept 2026 — client ID 106799478821328049357, scopes
+// drive.file + drive.metadata). Confirmed idle in the CRM before
+// repurposing (zero leads/bookings/marketing assets tied to it) — not
+// assumed. Not a secret itself (just an address), so a plain constant
+// here, not an env var — same idiom as STALE_CC_KEY/FOUNDER_KEYS above.
+const GDRIVE_IMPERSONATE_EMAIL = 'crm@escapenfly.com';
 
 const DEDUPE_MS   = 24 * 60 * 60 * 1000; // one lead per phone per 24h
 const CHAT_TTL_MS = 24 * 60 * 60 * 1000; // Maya memory window
@@ -1515,6 +1544,10 @@ function vendorCredsAuthOk(req) {
 function marketingSyncAuthOk(req) {
   const supplied = req.headers['x-sync-secret'] || '';
   return MARKETING_SYNC_SECRET && supplied === MARKETING_SYNC_SECRET;
+}
+function documentsStoreAuthOk(req) {
+  const supplied = req.query.secret || req.headers['x-documents-store-secret'] || '';
+  return DOCUMENTS_STORE_SECRET && supplied === DOCUMENTS_STORE_SECRET;
 }
 
 // ── AISENSY WEBHOOK SIGNATURE — PHASE 1: OBSERVE ONLY ──
@@ -4297,6 +4330,296 @@ app.post('/internal/portal-credentials-write', async (req, res) => {
   }
 });
 
+// ═══════════════════ DOCUMENT STORE (3 Sept 2026) ═══════════════════════
+// Real bug found and partly fixed directly in escapenfly-crm: every
+// document upload (passport/PAN scans, attached converting a lead to a
+// booking) authenticated via an interactive Google OAuth popup — the
+// individual staff member's OWN personal Google account, not a shared
+// company identity. The resulting file lived in THEIR Drive, private by
+// default (uploaded but not downloadable by anyone else — confirmed
+// against 125 real documents already uploaded, zero of them ever shared).
+// escapenfly-crm's own fix (see that repo's PR fixing driveCreateFolder/
+// driveUploadFile) adds domain-sharing on every NEW upload through that
+// same personal-OAuth flow — a real, deployed, working fix, but it
+// doesn't change WHO owns the file, just who can additionally view it.
+//
+// This is the actual architectural fix: route uploads through THIS
+// server instead, authenticated as a single fixed mailbox
+// (GDRIVE_IMPERSONATE_EMAIL) via a service account granted domain-wide
+// delegation — confirmed granted in Google Admin Console, 3 Sept 2026
+// (client ID 106799478821328049357, scopes drive.file + drive.metadata).
+//
+// Scope choice, deliberately narrower than full `drive`:
+//   - drive.file    — everything /internal/documents-upload creates. Full
+//     read/write on files this identity itself created, nothing else.
+//   - drive.metadata — everything /internal/documents-bulk-fix-sharing
+//     touches. Lets it add a sharing permission to a file it did NOT
+//     create (impersonating that file's real original uploader, found via
+//     team_members), without ever being able to read that file's content
+//     — a metadata-only operation is enough to fix sharing, and this
+//     keeps the service account from being able to open every document at
+//     every company Google account it can impersonate.
+//   - Consequence, stated plainly rather than glossed over:
+//     /internal/documents-download's content-streaming path only works for
+//     documents actually uploaded through THIS system (drive.file covers
+//     files the service account itself created). For the 125 pre-existing
+//     documents — bulk-fixed via drive.metadata, never created by this
+//     identity — content-level read genuinely needs a THIRD scope
+//     (drive.readonly) that isn't granted yet. Rather than block on that,
+//     the download endpoint falls back to just handing back the (now
+//     domain-shared, once bulk-fixed) Drive link for the browser to open
+//     directly — still solves "can't download", just via a slightly
+//     different path for old vs. new documents until/unless that scope is
+//     added.
+//
+// Same honest limit as every other /internal/* proxy in this file: a
+// valid DOCUMENTS_STORE_SECRET proves the request came from the CRM app,
+// not which staff member is behind it. Per-person "your own bookings
+// only" access control is the CRM's own job (perm()/bk.aEmail checks
+// before ever calling this), same as everywhere else in this system —
+// not solved here, not pretended to be.
+
+const DRIVE_UPLOAD_SCOPES = ['https://www.googleapis.com/auth/drive.file'];
+const DRIVE_SHARE_SCOPES  = ['https://www.googleapis.com/auth/drive.metadata'];
+
+// Returns a bearer access token for the service account impersonating
+// `subject` (domain-wide delegation — genuinely acting AS that real
+// Workspace user, not just "on behalf of"), scoped to `scopes`. Every
+// caller below is already inside a try/catch, so a missing/invalid key
+// here becomes a clean 500 with a real error message, not a crash — same
+// shape as meta-sync.js/google-sync.js's requireEnv() pattern.
+async function getDriveAccessToken(subject, scopes) {
+  if (!GDRIVE_SERVICE_ACCOUNT_KEY) throw new Error('GDRIVE_SERVICE_ACCOUNT_KEY not configured');
+  let key;
+  try { key = JSON.parse(GDRIVE_SERVICE_ACCOUNT_KEY); }
+  catch (e) { throw new Error('GDRIVE_SERVICE_ACCOUNT_KEY is not valid JSON'); }
+  const client = new JWT({
+    email: key.client_email,
+    key: key.private_key,
+    scopes,
+    subject // domain-wide delegation — impersonate this real Workspace user
+  });
+  const { token } = await client.getAccessToken();
+  if (!token) throw new Error('Drive auth succeeded but returned no access token');
+  return token;
+}
+
+// Best-effort extraction of a Drive file/folder id out of any of the link
+// shapes this app has ever stored: .../file/d/<id>/view, .../folders/<id>,
+// or a bare ?id=<id> query param.
+function driveFileIdFromLink(link) {
+  const s = String(link || '');
+  const m = s.match(/\/(?:file\/d|folders)\/([a-zA-Z0-9_-]+)/) || s.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+async function driveCreateFolder(name, token) {
+  const r = await fetchRetry('https://www.googleapis.com/drive/v3/files?fields=id,webViewLink', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder' })
+  }, 'Drive-createFolder');
+  if (!r.ok) throw new Error(`Drive folder create failed: HTTP ${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+// Domain-restricted, not "anyone with the link" — these are passport/PAN
+// scans, real customer PII (same reasoning as escapenfly-crm's own fix).
+async function driveSharePermission(fileOrFolderId, token) {
+  const r = await fetchRetry(`https://www.googleapis.com/drive/v3/files/${fileOrFolderId}/permissions?fields=id`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: 'reader', type: 'domain', domain: 'escapenfly.com' })
+  }, 'Drive-sharePermission');
+  if (!r.ok) throw new Error(`Drive sharing failed: HTTP ${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+// multipart/related upload body, built by hand (Google's documented format
+// for uploadType=multipart) — no extra dependency needed beyond multer,
+// which only parses the INCOMING request from the CRM's browser, not this
+// OUTGOING request to Drive.
+async function driveUploadFile(fileBuffer, fileName, mimeType, folderId, token) {
+  const boundary = 'escapenfly-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+  const metadata = JSON.stringify({ name: fileName, parents: [folderId] });
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n`),
+    Buffer.from(`--${boundary}\r\nContent-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`),
+    fileBuffer,
+    Buffer.from(`\r\n--${boundary}--`)
+  ]);
+  const r = await fetchRetry('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+    body
+  }, 'Drive-uploadFile');
+  if (!r.ok) throw new Error(`Drive file upload failed: HTTP ${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+const documentsUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB — passport/PAN scans, generous headroom over any real one
+
+// ── upload a document, routed through the fixed mailbox instead of the
+// uploading staff member's own Google account ──
+app.post('/internal/documents-upload', documentsUpload.single('file'), async (req, res) => {
+  if (!documentsStoreAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  const { entity_type, entity_id, entity_name, document_type, traveller_name, uploaded_by } = req.body || {};
+  if (!entity_type || !entity_id || !document_type || !req.file) {
+    return res.status(400).json({ error: 'entity_type, entity_id, document_type, and file are required' });
+  }
+  if (['booking', 'visa'].indexOf(entity_type) < 0) {
+    return res.status(400).json({ error: 'entity_type must be "booking" or "visa"' });
+  }
+  try {
+    const table = entity_type === 'booking' ? 'bookings' : 'visa_cases';
+    const entRes = await fetchRetry(`${SB_URL}/rest/v1/${table}?id=eq.${encodeURIComponent(entity_id)}&select=id,google_drive_link`, {
+      headers: SB_SERVICE_HEADERS
+    }, 'SB-docUpload-entityRead');
+    if (!entRes.ok) { const t = await entRes.text(); console.error('documents-upload: entity read failed:', entRes.status, t); return res.status(500).json({ error: t }); }
+    const entRows = await entRes.json();
+    if (!entRows.length) return res.status(404).json({ error: 'entity not found' });
+
+    let folderLink = entRows[0].google_drive_link || '';
+    let folderId = driveFileIdFromLink(folderLink);
+    const uploadToken = await getDriveAccessToken(GDRIVE_IMPERSONATE_EMAIL, DRIVE_UPLOAD_SCOPES);
+
+    if (!folderId) {
+      const folder = await driveCreateFolder(`${entity_name || 'Booking'} - ${entity_id.slice(0, 8)}`, uploadToken);
+      folderId = folder.id;
+      folderLink = folder.webViewLink || '';
+      try {
+        const shareToken = await getDriveAccessToken(GDRIVE_IMPERSONATE_EMAIL, DRIVE_SHARE_SCOPES);
+        await driveSharePermission(folderId, shareToken);
+      } catch (shareErr) {
+        console.error('documents-upload: folder sharing failed (upload continues):', shareErr.message);
+      }
+      const patchRes = await fetchRetry(`${SB_URL}/rest/v1/${table}?id=eq.${encodeURIComponent(entity_id)}`, {
+        method: 'PATCH', headers: { ...SB_SERVICE_HEADERS, Prefer: 'return=minimal' },
+        body: JSON.stringify({ google_drive_link: folderLink })
+      }, 'SB-docUpload-folderLinkSave');
+      if (!patchRes.ok) console.error('documents-upload: saving folder link on entity failed:', patchRes.status, await patchRes.text());
+    }
+
+    const uploaded = await driveUploadFile(req.file.buffer, req.file.originalname, req.file.mimetype, folderId, uploadToken);
+
+    const docRow = {
+      id: crypto.randomUUID(),
+      entity_type, entity_id, document_type,
+      document_name: (traveller_name ? `${traveller_name} — ` : '') + (req.file.originalname || document_type),
+      google_drive_link: uploaded.webViewLink || '',
+      status: 'received',
+      received_date: new Date().toISOString().slice(0, 10),
+      uploaded_by: uploaded_by || '',
+      created_at: new Date().toISOString()
+    };
+    const insRes = await fetchRetry(`${SB_URL}/rest/v1/documents`, {
+      method: 'POST', headers: { ...SB_SERVICE_HEADERS, Prefer: 'return=representation' }, body: JSON.stringify(docRow)
+    }, 'SB-docUpload-insert');
+    if (!insRes.ok) { const t = await insRes.text(); console.error('documents-upload: record insert failed:', insRes.status, t); return res.status(500).json({ error: t }); }
+    const inserted = await insRes.json();
+    res.json({ ok: true, document: inserted[0] || docRow, folder_link: folderLink });
+  } catch (e) {
+    console.error('documents-upload error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── download/view a document — streams the real bytes when the service
+// account can (see the scope comment above), otherwise falls back to the
+// (domain-shared) Drive link ──
+app.post('/internal/documents-download', async (req, res) => {
+  if (!documentsStoreAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  const { doc_id } = req.body || {};
+  if (!doc_id) return res.status(400).json({ error: 'doc_id is required' });
+  try {
+    const docRes = await fetchRetry(`${SB_URL}/rest/v1/documents?id=eq.${encodeURIComponent(doc_id)}&select=*`, {
+      headers: SB_SERVICE_HEADERS
+    }, 'SB-docDownload-read');
+    if (!docRes.ok) { const t = await docRes.text(); console.error('documents-download: read failed:', docRes.status, t); return res.status(500).json({ error: t }); }
+    const rows = await docRes.json();
+    if (!rows.length) return res.status(404).json({ error: 'document not found' });
+    const doc = rows[0];
+    const fileId = driveFileIdFromLink(doc.google_drive_link);
+    if (!fileId) return res.status(404).json({ error: 'no drive link on this document' });
+
+    try {
+      const token = await getDriveAccessToken(GDRIVE_IMPERSONATE_EMAIL, DRIVE_UPLOAD_SCOPES);
+      const fileRes = await fetchRetry(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+        headers: { Authorization: `Bearer ${token}` }
+      }, 'Drive-download');
+      if (!fileRes.ok) throw new Error(`HTTP ${fileRes.status}`);
+      res.setHeader('Content-Type', fileRes.headers.get('content-type') || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `inline; filename="${String(doc.document_name || 'document').replace(/"/g, '')}"`);
+      const buf = Buffer.from(await fileRes.arrayBuffer());
+      return res.send(buf);
+    } catch (streamErr) {
+      console.error('documents-download: content stream unavailable, falling back to link:', streamErr.message);
+      return res.json({ ok: true, fallback_link: doc.google_drive_link });
+    }
+  } catch (e) {
+    console.error('documents-download error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── one-time bulk-fix for documents uploaded before this system existed.
+// Impersonates each document's ORIGINAL uploader (looked up dynamically
+// via team_members.name matching documents.uploaded_by — never a
+// hardcoded mapping, same "team_members is the source of truth" principle
+// escapenfly-crm's own CLAUDE.md establishes) to share THEIR existing file
+// with the whole domain. drive.metadata scope only — this never reads a
+// single byte of file content, just adds a permission, so it works
+// regardless of who originally created the file. No implicit "fix
+// everything" default — the caller must pass the exact doc_ids to
+// process, precisely so a single real document can be verified fixed
+// before running this against the rest. ──
+app.post('/internal/documents-bulk-fix-sharing', async (req, res) => {
+  if (!documentsStoreAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  const { doc_ids } = req.body || {};
+  if (!Array.isArray(doc_ids) || !doc_ids.length) {
+    return res.status(400).json({ error: 'doc_ids (a non-empty array of document ids) is required' });
+  }
+  try {
+    const docsRes = await fetchRetry(`${SB_URL}/rest/v1/documents?id=in.(${doc_ids.map(encodeURIComponent).join(',')})&select=id,uploaded_by,google_drive_link`, {
+      headers: SB_SERVICE_HEADERS
+    }, 'SB-bulkFix-read');
+    if (!docsRes.ok) { const t = await docsRes.text(); console.error('documents-bulk-fix-sharing: read failed:', docsRes.status, t); return res.status(500).json({ error: t }); }
+    const docs = await docsRes.json();
+
+    const results = [];
+    const foundIds = new Set(docs.map(d => d.id));
+    doc_ids.forEach(id => { if (!foundIds.has(id)) results.push({ doc_id: id, ok: false, error: 'document not found' }); });
+
+    const uploaderNames = [...new Set(docs.map(d => d.uploaded_by).filter(Boolean))];
+    const emailByName = {};
+    if (uploaderNames.length) {
+      const tmRes = await fetchRetry(`${SB_URL}/rest/v1/team_members?name=in.(${uploaderNames.map(n => encodeURIComponent(n)).join(',')})&select=name,email`, {
+        headers: SB_SERVICE_HEADERS
+      }, 'SB-bulkFix-teamMembers');
+      if (tmRes.ok) (await tmRes.json()).forEach(tm => { emailByName[tm.name] = tm.email; });
+      else console.error('documents-bulk-fix-sharing: team_members lookup failed:', tmRes.status, await tmRes.text());
+    }
+
+    for (const doc of docs) {
+      const impersonateEmail = emailByName[doc.uploaded_by];
+      const fileId = driveFileIdFromLink(doc.google_drive_link);
+      if (!impersonateEmail) { results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, ok: false, error: 'no matching team_members email for this uploaded_by name' }); continue; }
+      if (!fileId) { results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, ok: false, error: 'could not parse a Drive file id from google_drive_link' }); continue; }
+      try {
+        const token = await getDriveAccessToken(impersonateEmail, DRIVE_SHARE_SCOPES);
+        await driveSharePermission(fileId, token);
+        results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, impersonated_as: impersonateEmail, ok: true });
+      } catch (e) {
+        results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, impersonated_as: impersonateEmail, ok: false, error: e.message });
+      }
+    }
+    res.json({ results, fixed: results.filter(r => r.ok).length, failed: results.filter(r => !r.ok).length });
+  } catch (e) {
+    console.error('documents-bulk-fix-sharing error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── MARKETING DATA SYNC (19 Aug 2026) — Meta/Google direct API sync ──
 // Replaces Windsor.ai's facebook/facebook_organic/instagram/google_ads/
 // googleanalytics4 connectors for marketing_performance. Each route is a
@@ -4336,6 +4659,7 @@ app.get('/health', (req, res) => res.json({
     '/ai', '/webhook/aisensy', '/webhook/chat', '/webhook/website-chat', '/webhook/incoming', '/webhook/meta', '/webhook/website',
     '/notify/manual-lead', '/internal/costing-audit',
     '/internal/roles-write', '/internal/staff-roles-write', '/internal/portal-credentials-read', '/internal/portal-credentials-write',
+    '/internal/documents-upload', '/internal/documents-download', '/internal/documents-bulk-fix-sharing',
     '/internal/sync-meta', '/internal/sync-google',
     '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh', '/cron/refresh-exchange-rates'
   ]

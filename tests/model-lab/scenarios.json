@@ -1,0 +1,1220 @@
+[
+  {
+    "id": "visa_01_basic_tourist",
+    "category": "visa",
+    "description": "Straightforward France tourist visa enquiry — the exact case that surfaced tonight's bugs",
+    "customerTurns": [
+      "Hi need france tourist visa",
+      "september and 2 people, my name is Vineet"
+    ],
+    "expectedIntent": "visa",
+    "mustAsk": [
+      "applicant",
+      "travel",
+      "month"
+    ],
+    "mustNotAsk": [
+      "budget"
+    ],
+    "mustNotSay": [
+      "cannot apply directly",
+      "indians cannot apply direct"
+    ],
+    "notes": "Should not ask budget. Should not claim Indians can't apply directly for France (VFS Global handles this).",
+    "expectedLead": {
+      "name": "Vineet",
+      "destination": "France",
+      "travel_month": "September",
+      "pax": "2",
+      "type": "visa"
+    }
+  },
+  {
+    "id": "visa_02_dubai_uae",
+    "category": "visa",
+    "description": "Dubai visa — the founder_notes accuracy test case",
+    "customerTurns": [
+      "Hi need dubai trip and visa for december",
+      "2 people, 2 lac, name vineet bansal"
+    ],
+    "mustNotSay": [
+      "4-6 weeks",
+      "15-20 days",
+      "4 to 6 weeks"
+    ],
+    "notes": "Accuracy check only (no invented processing-time number) — intent is defensibly holiday or visa for a message mentioning both trip and visa.",
+    "expectedLead": {
+      "name": "Vineet Bansal",
+      "destination": "Dubai",
+      "travel_month": "December",
+      "pax": "2",
+      "budget": "2 lakh"
+    }
+  },
+  {
+    "id": "visa_03_no_destination_yet",
+    "category": "visa",
+    "description": "Customer wants visa help but hasn't named a country yet",
+    "customerTurns": [
+      "I need help with a visa"
+    ],
+    "expectedIntent": "visa",
+    "mustAsk": [
+      "country",
+      "where"
+    ],
+    "mustNotAsk": [
+      "budget"
+    ],
+    "notes": "First message — specialist flow won't be active yet (needs a turn to classify intent), verify the general flow still doesn't ask budget prematurely.",
+    "expectedLead": {
+      "type": "visa"
+    }
+  },
+  {
+    "id": "visa_04_schengen_general",
+    "category": "visa",
+    "description": "Generic Schengen visa question, not a specific pre-named country",
+    "customerTurns": [
+      "Do I need a visa for Europe as an Indian citizen"
+    ],
+    "expectedIntent": "visa",
+    "mustNotSay": [
+      "guaranteed",
+      "100% approval",
+      "always approved"
+    ],
+    "notes": "Should never guarantee visa approval.",
+    "expectedLead": {
+      "destination": "Europe",
+      "type": "visa"
+    }
+  },
+  {
+    "id": "visa_05_visa_plus_holiday",
+    "category": "visa",
+    "description": "Visa enquiry that later expands into wanting a full trip planned",
+    "customerTurns": [
+      "Need a Thailand visa",
+      "actually can you also help plan the whole trip, budget is around 1.5 lakh"
+    ],
+    "expectedIntent": "holiday",
+    "notes": "Budget becomes relevant once they ask for the full trip — should not be refused or ignored once offered.",
+    "expectedLead": {
+      "destination": "Thailand",
+      "budget": "1.5 lakh",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "visa_06_refusal_history",
+    "category": "visa",
+    "description": "Customer mentions a previous visa refusal",
+    "customerTurns": [
+      "I need a UK visa but I was refused once before, will that be a problem"
+    ],
+    "expectedIntent": "visa",
+    "mustNotSay": [
+      "guaranteed",
+      "won't be an issue",
+      "no problem at all"
+    ],
+    "notes": "Should not falsely reassure about approval odds — this is exactly the 'never guarantee' rule.",
+    "expectedLead": {
+      "destination": "UK",
+      "type": "visa"
+    }
+  },
+  {
+    "id": "holiday_01_basic_qualify",
+    "category": "holiday",
+    "description": "Basic destination-named holiday enquiry",
+    "customerTurns": [
+      "Looking for a Bali trip"
+    ],
+    "expectedIntent": "holiday",
+    "mustAsk": [
+      "month",
+      "travel"
+    ],
+    "mustNotSay": [
+      "gem",
+      "breathtaking",
+      "stunning"
+    ],
+    "notes": "Stage 1 — should qualify, not describe the destination like a travel blog.",
+    "expectedLead": {
+      "destination": "Bali",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "holiday_02_itinerary_request",
+    "category": "holiday",
+    "description": "Customer explicitly asks what a trip covers",
+    "customerTurns": [
+      "Looking for a Singapore trip",
+      "what should we cover in 5 days"
+    ],
+    "expectedIntent": "holiday",
+    "mustAsk": [
+      "hotel",
+      "star"
+    ],
+    "notes": "Stage 2 — compact recommendation with hotel tiers, not a day-by-day essay.",
+    "expectedLead": {
+      "destination": "Singapore",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "holiday_03_full_qualify_to_handover",
+    "category": "holiday",
+    "description": "Full information given across two messages, should reach handover",
+    "customerTurns": [
+      "Need a Dubai holiday",
+      "december, 2 people, 2 lac budget, name Vineet"
+    ],
+    "expectedIntent": "holiday",
+    "mustAsk": [
+      "number",
+      "phone",
+      "whatsapp"
+    ],
+    "notes": "Should move to handover and ask for contact info once qualified (website channel).",
+    "expectedLead": {
+      "name": "Vineet",
+      "destination": "Dubai",
+      "travel_month": "December",
+      "pax": "2",
+      "budget": "2 lakh",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "holiday_04_honeymoon",
+    "category": "holiday",
+    "description": "Honeymoon-specific holiday enquiry",
+    "customerTurns": [
+      "Honeymoon trip from Chandigarh, thinking Maldives"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotAsk": [
+      "how many people",
+      "number of travellers"
+    ],
+    "notes": "Honeymoon implies 2 travellers — asking headcount here would feel tone-deaf.",
+    "expectedLead": {
+      "destination": "Maldives",
+      "departure_city": "Chandigarh",
+      "travel_style": "honeymoon",
+      "pax": "2",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "holiday_05_family_with_kids",
+    "category": "holiday",
+    "description": "Family holiday mentioning children",
+    "customerTurns": [
+      "Family trip to Thailand, me my wife and 2 kids aged 5 and 8"
+    ],
+    "expectedIntent": "holiday",
+    "notes": "Should acknowledge the family composition naturally, not re-ask headcount.",
+    "expectedLead": {
+      "destination": "Thailand",
+      "pax": "4",
+      "travel_style": "family",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "holiday_06_senior_citizens",
+    "category": "holiday",
+    "description": "Senior citizen travellers",
+    "customerTurns": [
+      "My parents want to visit Europe, both in their 70s, first time travelling abroad"
+    ],
+    "expectedIntent": "holiday",
+    "notes": "First-time-abroad + senior signals should trigger more reassurance/explanation, not a terse qualifying question.",
+    "expectedLead": {
+      "destination": "Europe",
+      "pax": "2",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "holiday_07_group_booking",
+    "category": "holiday",
+    "description": "Larger group booking",
+    "customerTurns": [
+      "Group of 15 friends want to do a Vietnam trip"
+    ],
+    "expectedIntent": "holiday",
+    "notes": "Should handle a non-couple, non-family group size naturally.",
+    "expectedLead": {
+      "destination": "Vietnam",
+      "pax": "15",
+      "travel_style": "group",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "holiday_08_price_sensitive",
+    "category": "holiday",
+    "description": "Explicitly budget-conscious customer",
+    "customerTurns": [
+      "Cheapest possible Goa package for 4 people, we don't have much budget"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "luxury",
+      "premium",
+      "5-star"
+    ],
+    "notes": "Should not lead with upsell language for a stated budget-conscious customer.",
+    "expectedLead": {
+      "destination": "Goa",
+      "pax": "4",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "holiday_09_luxury",
+    "category": "holiday",
+    "description": "Explicitly luxury-seeking customer",
+    "customerTurns": [
+      "Want a luxury Maldives honeymoon, money is not a constraint"
+    ],
+    "expectedIntent": "holiday",
+    "notes": "Tone should match — premium hotel tiers, not budget options.",
+    "expectedLead": {
+      "destination": "Maldives",
+      "pax": "2",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "holiday_10_destination_switch",
+    "category": "holiday",
+    "description": "Customer changes destination mid-conversation",
+    "customerTurns": [
+      "Looking for a Bali trip",
+      "actually let's do Vietnam instead"
+    ],
+    "expectedIntent": "holiday",
+    "notes": "Behavioral check, not a keyword check — read the transcript manually. Good: fresh qualifying questions about Vietnam, at most one natural comparison mention of Bali. Bad: continuing to ask Bali-specific questions, or repeated/confused references to Bali. A single natural comparison mention (e.g. 'different energy from Bali') is not a failure.",
+    "expectedLead": {
+      "destination": "Vietnam",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "flights_01_basic",
+    "category": "flights",
+    "description": "Basic flight booking enquiry",
+    "customerTurns": [
+      "Need a flight from Delhi to Dubai in November"
+    ],
+    "expectedIntent": "flights",
+    "mustAsk": [
+      "passenger",
+      "how many"
+    ],
+    "mustNotAsk": [
+      "hotel",
+      "star category"
+    ],
+    "notes": "Should not drift into hotel/holiday questions.",
+    "expectedLead": {
+      "destination": "Dubai",
+      "departure_city": "Delhi",
+      "travel_month": "November",
+      "type": "flights"
+    }
+  },
+  {
+    "id": "flights_02_cabin_class",
+    "category": "flights",
+    "description": "Flight enquiry with class preference stated",
+    "customerTurns": [
+      "Business class flight Mumbai to London for 2 people in March"
+    ],
+    "expectedIntent": "flights",
+    "mustNotAsk": [
+      "cabin class",
+      "economy or business"
+    ],
+    "notes": "Already given — should not re-ask cabin class.",
+    "expectedLead": {
+      "destination": "London",
+      "departure_city": "Mumbai",
+      "travel_month": "March",
+      "pax": "2",
+      "cabin_class": "business",
+      "type": "flights"
+    }
+  },
+  {
+    "id": "flights_03_flexible_dates",
+    "category": "flights",
+    "description": "Customer unsure of exact dates",
+    "customerTurns": [
+      "Want to fly to Bangkok sometime in Feb, dates are flexible"
+    ],
+    "expectedIntent": "flights",
+    "notes": "Should accept approximate timing rather than demanding exact dates.",
+    "expectedLead": {
+      "destination": "Bangkok",
+      "travel_month": "February",
+      "type": "flights"
+    }
+  },
+  {
+    "id": "flights_04_no_outbound_link",
+    "category": "flights",
+    "description": "Enough info given — should stay in-conversation, not send the customer elsewhere",
+    "customerTurns": [
+      "Delhi to Singapore, 2 passengers, economy, mid-December"
+    ],
+    "expectedIntent": "flights",
+    "mustNotSay": [
+      "google flights",
+      "booking.com",
+      "agoda"
+    ],
+    "notes": "Should NOT suggest Google Flights or any outbound comparison link — keep the customer in this conversation, move to handover instead.",
+    "expectedLead": {
+      "destination": "Singapore",
+      "departure_city": "Delhi",
+      "pax": "2",
+      "cabin_class": "economy",
+      "travel_month": "December",
+      "type": "flights"
+    }
+  },
+  {
+    "id": "hotel_01_basic",
+    "category": "hotel",
+    "description": "Basic hotel booking enquiry",
+    "customerTurns": [
+      "Need a hotel in Goa for 3 nights"
+    ],
+    "expectedIntent": "hotel",
+    "mustNotAsk": [
+      "visa",
+      "flight"
+    ],
+    "notes": "Behavioral check, not a keyword check — read the transcript manually. Good: asks for dates (implying check-in/check-out) and headcount (implying guests), in natural phrasing. Bad: doesn't ask for either concept at all, or asks in a stiff, form-like way. The specific words used to ask don't matter — whether the right information gets requested naturally does.",
+    "expectedLead": {
+      "destination": "Goa",
+      "type": "hotel"
+    }
+  },
+  {
+    "id": "hotel_02_category_given",
+    "category": "hotel",
+    "description": "Hotel category preference already stated",
+    "customerTurns": [
+      "4-star hotel in Dubai downtown, check in 10th Dec check out 15th Dec, 2 adults"
+    ],
+    "expectedIntent": "hotel",
+    "mustNotAsk": [
+      "what category",
+      "budget category",
+      "how many nights"
+    ],
+    "notes": "All core fields given upfront — should not re-ask any of them.",
+    "expectedLead": {
+      "destination": "Dubai",
+      "hotel_category": "4-star",
+      "check_in": "10th December",
+      "check_out": "15th December",
+      "pax": "2",
+      "type": "hotel"
+    }
+  },
+  {
+    "id": "hotel_03_no_outbound_link",
+    "category": "hotel",
+    "description": "Enough info given — should stay in-conversation, not send the customer elsewhere",
+    "customerTurns": [
+      "3-star hotel Bangkok, 12-16 Jan, 2 guests 1 room"
+    ],
+    "expectedIntent": "hotel",
+    "mustNotSay": [
+      "booking.com",
+      "agoda",
+      "google flights"
+    ],
+    "notes": "Should NOT suggest Booking.com/Agoda or any outbound comparison link — keep the customer in this conversation, move to handover instead.",
+    "expectedLead": {
+      "destination": "Bangkok",
+      "hotel_category": "3-star",
+      "check_in": "12th January",
+      "check_out": "16th January",
+      "pax": "2",
+      "type": "hotel"
+    }
+  },
+  {
+    "id": "existing_01_reference_first",
+    "category": "existing_booking",
+    "description": "Customer with an existing booking issue",
+    "customerTurns": [
+      "I have an issue with my existing booking"
+    ],
+    "expectedIntent": "existing_booking",
+    "mustAsk": [
+      "booking reference",
+      "phone number"
+    ],
+    "mustNotAsk": [
+      "destination",
+      "budget",
+      "where are you travelling"
+    ],
+    "notes": "Should ask for reference/phone first, not run a new-sales qualification flow.",
+    "expectedLead": {
+      "type": "existing_booking"
+    }
+  },
+  {
+    "id": "existing_02_cancellation",
+    "category": "existing_booking",
+    "description": "Customer wants to cancel a booking",
+    "customerTurns": [
+      "I need to cancel my trip, booking ref ENF-12345"
+    ],
+    "expectedIntent": "existing_booking",
+    "notes": "Should not attempt to process the cancellation itself — hand over to a human.",
+    "expectedLead": {
+      "booking_reference": "ENF-12345",
+      "type": "existing_booking"
+    }
+  },
+  {
+    "id": "existing_03_upset_customer",
+    "category": "existing_booking",
+    "description": "Frustrated customer with a booking problem",
+    "customerTurns": [
+      "This is ridiculous, my hotel booking got cancelled and nobody told me!"
+    ],
+    "mustNotSay": [
+      "calm down",
+      "relax"
+    ],
+    "notes": "Tone check only, not intent classification — both complaint and existing_booking are defensible for an angry customer with a cancelled booking.",
+    "expectedLead": {}
+  },
+  {
+    "id": "cross_01_multi_question",
+    "category": "cross-cutting",
+    "description": "Customer asks several things in one message",
+    "customerTurns": [
+      "I want to go to Japan, what's the visa process, best time to visit, and roughly how much would it cost for 2 people"
+    ],
+    "expectedIntent": "holiday",
+    "notes": "Should address the question(s) without turning into an overwhelming multi-paragraph dump — check it stays organized and doesn't ignore parts of the ask.",
+    "expectedLead": {
+      "destination": "Japan",
+      "pax": "2",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "cross_02_incomplete_info",
+    "category": "cross-cutting",
+    "description": "Customer gives very little information",
+    "customerTurns": [
+      "hi",
+      "want to travel somewhere"
+    ],
+    "notes": "Behavioral check only (asks a natural clarifying question) — intent classification is genuinely ambiguous for \"hi\" / \"want to travel somewhere\".",
+    "expectedLead": {}
+  },
+  {
+    "id": "cross_03_advice_only_no_intent_to_buy",
+    "category": "cross-cutting",
+    "description": "Pure information-seeking, no buying signal",
+    "customerTurns": [
+      "What's the best time of year to visit Japan"
+    ],
+    "notes": "Behavior check only, not intent classification — genuinely non-deterministic between holiday and other_travel across runs for a pure destination-advice question with no booking signal; both are defensible, flapped both directions in real testing.",
+    "expectedLead": {
+      "destination": "Japan"
+    }
+  },
+  {
+    "id": "cross_04_difficult_question",
+    "category": "cross-cutting",
+    "description": "A question Maya genuinely shouldn't guess on",
+    "customerTurns": [
+      "What are my exact chances of getting a US visa approved"
+    ],
+    "expectedIntent": "visa",
+    "mustNotSay": [
+      "guaranteed",
+      "100%",
+      "definitely approved",
+      "high chance"
+    ],
+    "notes": "Should decline to predict approval odds, not invent a confidence percentage.",
+    "expectedLead": {
+      "destination": "USA",
+      "type": "visa"
+    }
+  },
+  {
+    "id": "cross_05_off_topic",
+    "category": "cross-cutting",
+    "description": "Completely unrelated question",
+    "customerTurns": [
+      "Can you help me write a python script"
+    ],
+    "expectedIntent": "off_topic",
+    "notes": "Should redirect to travel in one line, not attempt to help or go silent.",
+    "expectedLead": {}
+  },
+  {
+    "id": "cross_06_solo_traveller",
+    "category": "cross-cutting",
+    "description": "Solo traveller, safety-conscious",
+    "customerTurns": [
+      "Solo female traveller, is Vietnam safe to travel alone"
+    ],
+    "expectedIntent": "holiday",
+    "notes": "Should answer the safety question genuinely, not deflect it.",
+    "expectedLead": {
+      "destination": "Vietnam",
+      "pax": "1",
+      "travel_style": "solo",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "cross_07_first_time_vs_experienced",
+    "category": "cross-cutting",
+    "description": "Experienced traveller giving terse, complete information upfront",
+    "customerTurns": [
+      "Bali, march, 2 pax, 1.5L, done this before no need for basics"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "let me explain",
+      "first time"
+    ],
+    "notes": "Should stay concise and skip beginner-level explanation given the explicit signal.",
+    "expectedLead": {
+      "destination": "Bali",
+      "travel_month": "March",
+      "pax": "2",
+      "budget": "1.5 lakh",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "cross_08_conversation_length",
+    "category": "cross-cutting",
+    "description": "Full qualify-to-handover flow, checking message count discipline",
+    "customerTurns": [
+      "Need a Dubai trip",
+      "december, 2 people",
+      "2 lac budget, name Vineet"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotAsk": [
+      "passport number",
+      "passport expiry",
+      "second traveller's name",
+      "companion's name"
+    ],
+    "notes": "Should reach handover within a few messages and never ask for document-collection details this early.",
+    "expectedLead": {
+      "name": "Vineet",
+      "destination": "Dubai",
+      "travel_month": "December",
+      "pax": "2",
+      "budget": "2 lakh",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "consultative_01_budget_question",
+    "category": "consultative-questioning",
+    "description": "Customer asks about cost without stating a budget — Maya must ask for it, but not as a bare form field",
+    "customerTurns": [
+      "Looking at a Thailand trip in December for 2 people, how much would it cost roughly"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "what's your budget",
+      "what is your budget",
+      "what is your budget range"
+    ],
+    "notes": "Behavioral check, not just the keyword list — read the transcript. Good: a natural, scenario-framed budget question giving the customer something to answer against (e.g. \"comfortable mid-range or more premium?\"). Bad: a bare form-field ask like \"What's your budget?\" with nothing to anchor against.",
+    "expectedLead": {
+      "destination": "Thailand",
+      "travel_month": "December",
+      "pax": "2",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "consultative_02_travel_style_question",
+    "category": "consultative-questioning",
+    "description": "Customer is undecided on trip style — Maya must ask, but not as a bare form field",
+    "customerTurns": [
+      "Thinking about a Vietnam trip, not sure what kind of trip to plan though"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "what's your travel style",
+      "what is your travel style",
+      "what type of trip"
+    ],
+    "notes": "Behavioral check, not just the keyword list — read the transcript. Good: a natural, scenario-framed style question (e.g. \"relaxed sightseeing, or more adventure and activities?\"). Bad: a bare form-field ask like \"What's your travel style?\" with nothing to anchor against.",
+    "expectedLead": {
+      "destination": "Vietnam",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "consultative_03_no_stacked_form_ask",
+    "category": "consultative-questioning",
+    "description": "Family trip with budget and style both open — should still be ONE natural question, not a stacked form",
+    "customerTurns": [
+      "Family trip to Bali, 4 of us, budget and style both open at this point"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "what's your budget",
+      "what is your budget",
+      "what's your travel style",
+      "what is your travel style"
+    ],
+    "notes": "Behavioral check, not just the keyword list — read the transcript. Should ask exactly ONE natural, scenario-framed question (budget OR style, not both), never a bare form-field ask or multiple questions stacked in one message.",
+    "expectedLead": {
+      "destination": "Bali",
+      "pax": "4",
+      "travel_style": "family",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "pilot_honeymoon_maldives",
+    "category": "honeymoon",
+    "description": "Honeymoon enquiry, budget stated then raised",
+    "customerTurns": [
+      "Hi! We're planning our honeymoon and thinking Maldives.",
+      "Budget is around 3 lakh total for both of us.",
+      "We can actually increase the budget a bit if it means a nicer resort."
+    ],
+    "expectedIntent": "holiday",
+    "mustNotAsk": [
+      "how many people",
+      "number of travellers",
+      "how many travellers"
+    ],
+    "notes": "Honeymoon implies 2 travellers — asking headcount is tone-deaf. KEY TEST: does the actual recommendation change (resort tier, overwater vs beach villa, etc.) once the budget is raised in turn 3, or does Maya just acknowledge it without adjusting anything?",
+    "expectedLead": {
+      "destination": "Maldives",
+      "travel_style": "honeymoon",
+      "pax": "2",
+      "budget": "3 lakh",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "pilot_changing_nights_bali",
+    "category": "changing_nights",
+    "description": "Trip length changes mid-conversation, then a child is mentioned",
+    "customerTurns": [
+      "Thinking Bali for 5 nights, family of 4.",
+      "Actually we might make it 14 nights instead.",
+      "We have a 3-year-old with us too."
+    ],
+    "expectedIntent": "holiday",
+    "notes": "KEY TEST: does the itinerary/pacing advice genuinely adapt for 14 nights vs the original 5 (different pacing, maybe multiple regions), and does she factor in a toddler once mentioned (steering away from adventure-heavy suggestions) without being asked directly?",
+    "expectedLead": {
+      "destination": "Bali",
+      "pax": "4",
+      "travel_style": "family",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "pilot_changing_budget_thailand",
+    "category": "changing_budget",
+    "description": "Budget triples mid-conversation",
+    "customerTurns": [
+      "Thailand holiday for 2 of us, budget is tight — maybe 80k total.",
+      "We can increase the budget, maybe up to 3 lakh."
+    ],
+    "expectedIntent": "holiday",
+    "notes": "KEY TEST: does the actual recommendation upgrade materially (hotel category, activities, region) once budget triples, or is it a generic 'great, more options open up' non-answer with no concrete change?",
+    "expectedLead": {
+      "destination": "Thailand",
+      "pax": "2",
+      "budget": "3 lakh",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "pilot_unrealistic_budget_switzerland",
+    "category": "unrealistic_budget",
+    "description": "Budget genuinely far below a realistic minimum",
+    "customerTurns": [
+      "We want to do Switzerland, 7 nights, 2 people, budget is 60,000 total."
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "not possible",
+      "cannot do",
+      "impossible"
+    ],
+    "notes": "Switzerland's realistic minimum is far above ₹60k for 7 nights/2 people. KEY TEST: factual safety without being preachy — one soft sentence per the founder_notes min_budget rule, no breakdown/lecture, still moves toward handover rather than shutting the conversation down.",
+    "expectedLead": {
+      "destination": "Switzerland",
+      "pax": "2",
+      "budget": "60,000",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "pilot_seasonal_iceland",
+    "category": "seasonal_timing",
+    "description": "Wrong season for the customer's actual goal",
+    "customerTurns": [
+      "We want to see the northern lights in Iceland — thinking of going in July."
+    ],
+    "expectedIntent": "holiday",
+    "notes": "July is the wrong season for the northern lights (need dark skies, roughly Sept-March). KEY TEST: genuine seasonal/travel judgment — does she catch and correct this gently, or proceed as if July were a normal time to see them?",
+    "expectedLead": {
+      "destination": "Iceland",
+      "travel_month": "July",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "pilot_destination_comparison_bali_vietnam",
+    "category": "destination_comparison",
+    "description": "Customer deciding between two named destinations with a stated constraint",
+    "customerTurns": [
+      "Trying to decide between Bali and Vietnam for a 10-day trip, just the two of us. We don't want adventure stuff."
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "both are great",
+      "both are wonderful",
+      "both are amazing"
+    ],
+    "notes": "KEY TEST: an actual differentiated comparison reflecting real judgment (pace, vibe, cost, what 'no adventure' rules in/out for each) vs a generic OTA-style non-answer that doesn't help pick one.",
+    "expectedLead": {
+      "pax": "2",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "pilot_destination_redirect_maldives_budget",
+    "category": "destination_redirect",
+    "description": "Stated destination is unaffordable at the stated budget; customer confirms they can't move",
+    "customerTurns": [
+      "We want Maldives, 5 nights, 2 people, budget is 50,000 total.",
+      "We really can't go higher than that — is there something similar but cheaper?"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "not possible",
+      "cannot"
+    ],
+    "notes": "₹50k for Maldives/2/5 nights is well below any realistic minimum. KEY TEST: does she competently redirect to a genuinely comparable alternative (Lakshadweep, Andamans, etc.) once the customer confirms they can't increase budget, rather than repeating that Maldives isn't feasible?",
+    "expectedLead": {
+      "destination": "Maldives",
+      "pax": "2",
+      "budget": "50,000",
+      "type": "holiday"
+    }
+  },
+  {
+    "id": "pilot_visa_schengen_uk",
+    "category": "visa",
+    "description": "Schengen visa question, then a non-Schengen country is added to the trip",
+    "customerTurns": [
+      "Do I need a visa for France as an Indian passport holder?",
+      "We're also planning to visit London on the same trip."
+    ],
+    "expectedIntent": "visa",
+    "mustNotSay": [
+      "esta",
+      "eta"
+    ],
+    "notes": "France needs a Schengen visa; the UK is NOT in the Schengen area and needs a completely separate visa. KEY TEST: does she catch and correctly explain the UK-is-separate point once London is mentioned, without conflating it into the Schengen visa or inventing wrong specifics?",
+    "expectedLead": {
+      "destination": "France",
+      "type": "visa"
+    }
+  },
+  {
+    "id": "holiday_14_itinerary_change",
+    "category": "itinerary_changes",
+    "description": "Customer revises the shape of the trip, not the destination/budget/dates",
+    "customerTurns": [
+      "Kerala trip for 6 nights, backwaters and hill stations, 2 of us",
+      "Actually, less hill station time — we'd rather do more beach and relaxation instead"
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Kerala",
+      "pax": "2",
+      "type": "holiday"
+    },
+    "notes": "KEY TEST: itinerary change, not destination/budget/date change — does she genuinely revise the shape of the trip (more beach, less hill station) or just acknowledge and repeat the original plan?"
+  },
+  {
+    "id": "holiday_16_seasonal_monsoon",
+    "category": "seasonal_timing",
+    "description": "Monsoon-season mismatch — a different judgment than the Iceland \"impossible\" case",
+    "customerTurns": [
+      "Thinking Kerala in July for a relaxed beach holiday, 2 of us."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Kerala",
+      "travel_month": "July",
+      "pax": "2",
+      "type": "holiday"
+    },
+    "notes": "July is peak monsoon in Kerala — genuinely different judgment than Iceland's binary case: monsoon doesn't rule out the trip, but changes what's enjoyable and needs itinerary adjustment, not a flat no. KEY TEST: does she frame this as an adjustment, not a blanket refusal or a blanket ignore?"
+  },
+  {
+    "id": "holiday_17_luxury_family",
+    "category": "luxury",
+    "description": "Luxury with a family (teenagers), distinct from the existing childless-honeymoon luxury test",
+    "customerTurns": [
+      "Looking for a proper luxury holiday for our family — 2 adults, 2 teenagers — Maldives or somewhere similar. Budget isn't really a constraint, we just want the best."
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "cheap",
+      "budget option",
+      "affordable"
+    ],
+    "expectedLead": {
+      "destination": "Maldives",
+      "pax": "4",
+      "travel_style": "family",
+      "type": "holiday"
+    },
+    "notes": "Distinct from the existing luxury test (childless honeymoon) — luxury WITH kids is a different planning problem. KEY TEST: does the response genuinely reflect BOTH 'luxury' and 'family with teenagers' together, or default to a generic high-end pitch that ignores the family angle?"
+  },
+  {
+    "id": "visa_07_feasibility_judgment",
+    "category": "visa",
+    "description": "Visa feasibility judgment after a prior rejection with a different country",
+    "customerTurns": [
+      "I have a previous visa rejection from Canada, want to try Australia this time — realistic chances?"
+    ],
+    "expectedIntent": "visa",
+    "mustNotSay": [
+      "guaranteed",
+      "100%",
+      "definitely approved",
+      "no problem at all"
+    ],
+    "expectedLead": {
+      "destination": "Australia",
+      "type": "visa"
+    },
+    "notes": "KEY TEST: does she decline to predict odds (matching the existing 'never guarantee' rule) while still being useful, without conflating a Canada rejection with Australia's own separate process?"
+  },
+  {
+    "id": "visa_08_disagrees_with_maya",
+    "category": "objections",
+    "description": "Customer directly challenges a correct visa fact",
+    "customerTurns": [
+      "Do I need a visa for Sri Lanka as an Indian?",
+      "My friend went last year without any visa at all, are you sure?"
+    ],
+    "expectedIntent": "visa",
+    "expectedLead": {
+      "destination": "Sri Lanka",
+      "type": "visa"
+    },
+    "notes": "Sri Lanka requires an ETA for Indian passport holders — a lightweight online process a friend might casually describe as 'no visa.' KEY TEST: when directly challenged with 'are you sure', does she hold the correct fact without being defensive, wavering into false agreement, or restating something wrong to avoid conflict?"
+  },
+  {
+    "id": "cross_09_conflicting_requirements_across_turns",
+    "category": "conflicting_requirements",
+    "description": "Headcount changes drastically while budget stays fixed, across turns",
+    "customerTurns": [
+      "Want a Bali trip, 2 of us, budget around 1.5 lakh.",
+      "Actually make it a group of 8 — my whole friend circle is coming too.",
+      "Same budget though, 1.5 lakh total still."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Bali",
+      "pax": "8",
+      "budget": "1.5 lakh",
+      "type": "holiday"
+    },
+    "notes": "Budget staying fixed while headcount jumps 2→8 is a genuine internal conflict. KEY TEST: does she catch and gently surface this rather than silently accepting both contradictory facts as if they still both hold?"
+  },
+  {
+    "id": "cross_10_objects_to_recommendation",
+    "category": "objections",
+    "description": "Customer pushes back on a specific recommendation, not a fact",
+    "customerTurns": [
+      "Family trip to Thailand, 2 adults 2 kids, budget 1.5 lakh, want somewhere with a good beach.",
+      "I don't love your Phuket idea, we did that already, give me something else."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Thailand",
+      "pax": "4",
+      "travel_style": "family",
+      "budget": "1.5 lakh",
+      "type": "holiday"
+    },
+    "notes": "Distinct from visa_08's factual disagreement — this is pushback on a RECOMMENDATION. KEY TEST: does she offer a genuinely different, well-reasoned alternative (not Phuket again with different wording), without being defensive?"
+  },
+  {
+    "id": "existing_04_repeat_customer_new_trip",
+    "category": "repeat_customer",
+    "description": "Returning customer starting a fresh enquiry",
+    "customerTurns": [
+      "Hi, thinking about a trip to Japan this time."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Japan",
+      "type": "holiday"
+    },
+    "syntheticReturningProfile": {
+      "name": "Priya",
+      "destination": "Bali",
+      "travelMonth": "March"
+    },
+    "notes": "REQUIRES a synthetic returningProfile override — see syntheticReturningProfile above. KEY TEST: does she use the returning-customer context naturally (greet by name, not assume same-trip continuity) without forcing it or ignoring it?"
+  },
+  {
+    "id": "new_changing_dates_01",
+    "category": "changing_dates",
+    "description": "Clean month swap due to a stated real-world constraint",
+    "customerTurns": [
+      "Planning a Dubai trip for December, 2 of us.",
+      "Actually my leave got approved for January instead, let's shift to that."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Dubai",
+      "pax": "2",
+      "travel_month": "January",
+      "type": "holiday"
+    },
+    "notes": "KEY TEST: does she cleanly update to January (not append it alongside December, not silently keep planning around December-specific things)?"
+  },
+  {
+    "id": "new_changing_dates_02",
+    "category": "changing_dates",
+    "description": "Vaguer date shift — a range, not a clean swap",
+    "customerTurns": [
+      "Looking at a Europe trip, thinking early April, 2 people.",
+      "We might actually need to push it to late April or even May — work is uncertain right now."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Europe",
+      "pax": "2",
+      "type": "holiday"
+    },
+    "notes": "A vaguer date shift than new_changing_dates_01. KEY TEST: does she handle the uncertainty gracefully (acknowledge flexibility) rather than demanding a single locked-in month?"
+  },
+  {
+    "id": "new_lead_extraction_dense_01",
+    "category": "lead_extraction",
+    "description": "All lead fields given at once, in a single dense message",
+    "customerTurns": [
+      "Hi, I'm Rohan, want to plan a honeymoon to Bali for me and my wife, sometime in November, budget around 2.5 lakh."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "name": "Rohan",
+      "destination": "Bali",
+      "travel_style": "honeymoon",
+      "pax": "2",
+      "travel_month": "November",
+      "budget": "2.5 lakh",
+      "type": "holiday"
+    },
+    "notes": "Pure extraction-accuracy stress test — name, destination, style, implied pax, month, and budget all in one message. KEY TEST: does the very first parsed.lead capture all of this correctly in one shot?"
+  },
+  {
+    "id": "new_lead_extraction_fragmented_01",
+    "category": "lead_extraction",
+    "description": "Same total information as the dense case, spread across 7 short fragments",
+    "customerTurns": [
+      "Hi",
+      "Thinking of a trip somewhere",
+      "Maybe Vietnam",
+      "Around March",
+      "Just me and my partner",
+      "Budget wise maybe 1.2 lakh",
+      "My name's Ananya by the way"
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "name": "Ananya",
+      "destination": "Vietnam",
+      "travel_month": "March",
+      "pax": "2",
+      "budget": "1.2 lakh",
+      "type": "holiday"
+    },
+    "notes": "KEY TEST: cumulative extraction accuracy over many turns — does the FINAL parsed.lead correctly hold everything by the last turn, with nothing dropped as fragments arrive?"
+  },
+  {
+    "id": "new_family_teenagers_01",
+    "category": "family_travel",
+    "description": "Family with teenagers, not young kids",
+    "customerTurns": [
+      "Family trip, me and my husband plus our two teenagers, 15 and 17. Thinking Thailand."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Thailand",
+      "pax": "4",
+      "travel_style": "family",
+      "type": "holiday"
+    },
+    "notes": "Teenagers need different planning than young kids (activity/independence-friendly, not kid-proofing). KEY TEST: does the response actually differentiate teenager-appropriate suggestions, or treat all 'family' the same regardless of kids' ages?"
+  },
+  {
+    "id": "new_family_multigenerational_01",
+    "category": "family_travel",
+    "description": "Three generations travelling together",
+    "customerTurns": [
+      "Planning a trip with my parents (both 68), my wife and me, and our 6-year-old — 3 generations travelling together. Thinking Singapore."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Singapore",
+      "pax": "5",
+      "travel_style": "family",
+      "type": "holiday"
+    },
+    "notes": "Senior mobility needs + a young child at once is genuinely harder than either alone. KEY TEST: does she acknowledge and plan around BOTH constraints together, not just one?"
+  },
+  {
+    "id": "new_destination_comparison_food_01",
+    "category": "destination_comparison",
+    "description": "A different comparison axis (food) than the pilot's \"no adventure\" framing",
+    "customerTurns": [
+      "Trying to decide between Japan and South Korea for a 8-day trip, just the two of us — food is honestly the main priority."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "pax": "2",
+      "type": "holiday"
+    },
+    "notes": "KEY TEST: does the comparison actually engage with 'food' specifically (street food culture, dining style, cost), rather than defaulting to a generic sightseeing comparison?"
+  },
+  {
+    "id": "new_objections_contact_info_01",
+    "category": "objections",
+    "description": "Customer objects to being asked for contact info",
+    "customerTurns": [
+      "Thailand trip, 2 of us, December, budget 1.2 lakh.",
+      "Why do you need my phone number, can't you just tell me the price here?"
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "mandatory",
+      "required to proceed",
+      "cannot help without"
+    ],
+    "expectedLead": {
+      "destination": "Thailand",
+      "pax": "2",
+      "travel_month": "December",
+      "budget": "1.2 lakh",
+      "type": "holiday"
+    },
+    "notes": "A real, common objection pattern. KEY TEST: does she explain the value exchange naturally and respectfully, without being pushy, evasive, or making the phone number sound mandatory?"
+  },
+  {
+    "id": "new_conflicting_requirements_single_turn_01",
+    "category": "conflicting_requirements",
+    "description": "Conflict stated within ONE turn, not built up across turns",
+    "customerTurns": [
+      "Want a 5-star luxury Maldives honeymoon but our budget is only 70,000 total for both of us."
+    ],
+    "expectedIntent": "holiday",
+    "mustNotSay": [
+      "not possible",
+      "impossible",
+      "cannot do"
+    ],
+    "expectedLead": {
+      "destination": "Maldives",
+      "travel_style": "honeymoon",
+      "pax": "2",
+      "budget": "70,000",
+      "type": "holiday"
+    },
+    "notes": "KEY TEST: does she surface the 5-star-vs-70k mismatch honestly and redirect constructively, rather than pretending both are compatible or bluntly refusing?"
+  },
+  {
+    "id": "new_incomplete_named_destination_only_01",
+    "category": "incomplete_information",
+    "description": "Destination given, everything else explicitly not yet decided",
+    "customerTurns": [
+      "Interested in Vietnam. Not sure about anything else yet."
+    ],
+    "expectedIntent": "holiday",
+    "expectedLead": {
+      "destination": "Vietnam",
+      "type": "holiday"
+    },
+    "notes": "Distinct incompleteness flavor from cross_02's near-blank 'hi'. KEY TEST: does she ask ONE natural next question, given the customer already signaled they're still figuring things out?"
+  },
+  {
+    "id": "new_existing_booking_plus_new_trip_01",
+    "category": "existing_booking",
+    "description": "Booking-support conversation that pivots into a new enquiry",
+    "customerTurns": [
+      "Hi, I have a booking with you already, reference ENF-98765, wanted to check the status.",
+      "Also separately, we're thinking of planning another trip, maybe Vietnam next year."
+    ],
+    "expectedIntent": "existing_booking",
+    "mustNotAsk": [
+      "destination",
+      "budget"
+    ],
+    "expectedLead": {
+      "booking_reference": "ENF-98765",
+      "type": "existing_booking"
+    },
+    "notes": "KEY TEST: does she handle the reference/status request properly first, then transition naturally into the new enquiry, rather than conflating the two or dropping one?"
+  },
+  {
+    "id": "new_couple_anniversary_01",
+    "category": "honeymoon_couple",
+    "description": "Anniversary trip for an established couple, distinct from a honeymoon",
+    "customerTurns": [
+      "Planning our 5th anniversary trip, thinking somewhere in Europe. Just my wife and me."
+    ],
+    "expectedIntent": "holiday",
+    "mustNotAsk": [
+      "how many people",
+      "number of travellers"
+    ],
+    "expectedLead": {
+      "destination": "Europe",
+      "pax": "2",
+      "type": "holiday"
+    },
+    "notes": "Distinct from the honeymoon test — an established couple, not newlyweds. KEY TEST: does she correctly infer 2 travellers without asking, and does the tone genuinely fit 'anniversary' rather than defaulting to honeymoon-flavored language?"
+  }
+]

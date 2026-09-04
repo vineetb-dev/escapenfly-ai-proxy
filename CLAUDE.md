@@ -650,6 +650,45 @@ with Vineet once this deploys — check whether `campaign_id`/`adset_id`/
 `ad_id` come back populated on a real test lead, and diff `/internal/sync-meta`'s
 summary against a pre-bump run for any metric that drops to 0.
 
+## tests/model-lab/ — what's tracked, what isn't, and why (3 Sep 2026)
+**This repo is public** (confirmed: `server.js`/`meta-sync.js` are fetchable
+anonymously from `raw.githubusercontent.com`). That fact governs everything
+below — it's not a general tidiness preference, it's the actual reason for
+the split.
+
+The harness code and scenario definitions ARE tracked: `build-scenarios.js`,
+`run-model-lab.js`, `run-triage.js`, `validate-triage.js`,
+`replay-visa-safety.js`, `lib/{ai-triage,context-snapshot,cost,
+objective-scorer,report}.js`, and `scenarios.json`. Checked every one of
+these directly, line by line, before tracking any of them: all synthetic —
+fictional customer messages, generic test-authoring notes, public Anthropic
+pricing, pure logic. No founder_notes/consultant_tips text, no real customer
+data, no API keys (`lib/ai-triage.js`'s only key reference is
+`process.env.ANTHROPIC_API_KEY`, same pattern as `server.js` — never a
+hardcoded value). This is what makes the model-switch reasoning in "The
+two-model split" above reproducible — clone the repo, run the harness
+yourself, get the same shape of numbers.
+
+**`tests/model-lab/results/` is deliberately, permanently gitignored — do
+NOT add exceptions for individual files in it, however tempting.** This
+directory is what running the harness above actually produces: per-turn
+`snapshots/*.json` (a live capture of real `founder_notes`/
+`visa_intelligence` rows at run time — actual consultant-authored content
+like specific hotel-area advice, not descriptions of it), full model
+transcripts (`raw-results.json`), and generated reports (`report.md`,
+`triage-summary.md`, `all-flags.json`). The specific numbers cited in "The
+two-model split" (26/47/59 triage flags, 57/47/55 pass rates, the quoted
+Opus/Haiku examples) all live in this directory — genuinely useful to keep
+around locally, genuinely not safe to publish. Committing any of it,
+including just the "headline" report files, would publish EscapeNFly's
+proprietary consultant knowledge to anyone who fetches this public repo
+anonymously. `tests/last-run-results.json` (the sibling `run-tests.js`
+harness's own output) was already gitignored on this same reasoning before
+today — `tests/model-lab/results/` is the same pattern, not a new one.
+Re-running the harness regenerates this directory locally at zero
+information loss; there is no "helpfully" re-adding it that doesn't leak
+something.
+
 ## Known, deliberate, NOT-yet-fixed gaps
 - RLS disabled on all Supabase tables except `costing_audits` (see above —
   same as the CRM repo for every other table) — deferred, needs a real

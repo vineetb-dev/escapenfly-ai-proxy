@@ -1,4 +1,5 @@
 tests/last-run-results.json
+tests/model-lab/results/
 node_modules/
 .env
 .env.*

@@ -4515,16 +4515,140 @@ async function driveCreateFolder(name, token) {
   return r.json();
 }
 
-// Domain-restricted, not "anyone with the link" — these are passport/PAN
-// scans, real customer PII (same reasoning as escapenfly-crm's own fix).
-async function driveSharePermission(fileOrFolderId, token) {
-  const r = await fetchRetry(`https://www.googleapis.com/drive/v3/files/${fileOrFolderId}/permissions?fields=id`, {
+// v-fix (4 Sept 2026) — NARROWED from domain-wide to per-person. Real bug
+// reported by staff, confirmed independently: the domain-wide grant below
+// meant every logged-in staff member could open EVERY booking's
+// passport/PAN documents by direct Drive link, not just their own
+// client's — this directly contradicted the access decision (assigned rep
+// + a fixed broad-access list only) that was actually never built at the
+// Drive-sharing level, only assumed. See escapenfly-crm's own
+// canViewDocuments()/driveSharePermission() for the CRM-side half of this
+// same fix (the client-side upload path — the one staff actually use
+// today — has its own separate implementation of this function; this one
+// backs the not-yet-wired /internal/documents-upload endpoint below, kept
+// in sync so it doesn't reintroduce the domain-wide leak once wired up).
+async function driveShareWithUser(fileOrFolderId, token, emailAddress) {
+  // sendNotificationEmail=false — Drive's default emails every newly-shared
+  // person; suppressed so a bulk retrofit doesn't flood staff inboxes.
+  const r = await fetchRetry(`https://www.googleapis.com/drive/v3/files/${fileOrFolderId}/permissions?fields=id&sendNotificationEmail=false`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ role: 'reader', type: 'domain', domain: 'escapenfly.com' })
-  }, 'Drive-sharePermission');
-  if (!r.ok) throw new Error(`Drive sharing failed: HTTP ${r.status} ${await r.text()}`);
+    body: JSON.stringify({ role: 'reader', type: 'user', emailAddress })
+  }, 'Drive-shareWithUser');
+  if (!r.ok) throw new Error(`Drive sharing failed for ${emailAddress}: HTTP ${r.status} ${await r.text()}`);
   return r.json();
+}
+
+async function driveListPermissions(fileOrFolderId, token) {
+  const r = await fetchRetry(`https://www.googleapis.com/drive/v3/files/${fileOrFolderId}/permissions?fields=permissions(id,type,domain,emailAddress,role)`, {
+    headers: { Authorization: `Bearer ${token}` }
+  }, 'Drive-listPermissions');
+  if (!r.ok) throw new Error(`Drive list-permissions failed: HTTP ${r.status} ${await r.text()}`);
+  const data = await r.json();
+  return data.permissions || [];
+}
+
+async function driveDeletePermission(fileOrFolderId, permissionId, token) {
+  const r = await fetchRetry(`https://www.googleapis.com/drive/v3/files/${fileOrFolderId}/permissions/${permissionId}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` }
+  }, 'Drive-deletePermission');
+  // 404 here means it's already gone — treat as success, not a failure.
+  if (!r.ok && r.status !== 404) throw new Error(`Drive delete-permission failed: HTTP ${r.status} ${await r.text()}`);
+}
+
+// Shares individually with each email in `recipientEmails` — never the
+// whole domain. One failed recipient doesn't sink the others; each share
+// is attempted independently and failures are reported, not swallowed.
+async function driveSharePermission(fileOrFolderId, token, recipientEmails) {
+  const emails = [...new Set((recipientEmails || []).filter(Boolean))];
+  const results = [], failed = [];
+  for (const email of emails) {
+    try { results.push(await driveShareWithUser(fileOrFolderId, token, email)); }
+    catch (e) { failed.push(email); console.error(`driveSharePermission: failed for ${email}:`, e.message); }
+  }
+  if (!results.length && emails.length) throw new Error(`Drive sharing failed for all recipients: ${emails.join(', ')}`);
+  if (failed.length) console.warn(`driveSharePermission: partially failed for: ${failed.join(', ')}`);
+  return results;
+}
+
+// Returns every email currently entitled to see ALL bookings'/visa cases'
+// documents (not just their own) — mirrors escapenfly-crm's own
+// effectivePerms()/canViewDocuments() logic exactly (role permissions,
+// with any staff_roles.permission_overrides REPLACING that module's
+// action list, never merged), read live off roles/staff_roles/team_members
+// via SB_HEADERS (the anon key — roles/staff_roles both carry an
+// anon_select_only RLS policy, the same read path loadPermSystem() uses in
+// the CRM itself). Deliberately NOT a hardcoded email list — same
+// "team_members/roles are the source of truth" principle escapenfly-crm's
+// CLAUDE.md establishes elsewhere, so a future role/permission change is
+// picked up automatically instead of silently drifting from the CRM-side
+// gate. Verified against production: resolves to exactly Vineet, Vivek,
+// Abhishek (partner role), Prabhjot Singh and Vinay Kumar (per-person
+// staff_roles.permission_overrides) — 5 people, checked directly at the DB
+// level, not assumed.
+async function getBroadAccessEmails() {
+  const [teamRes, rolesRes, staffRolesRes] = await Promise.all([
+    fetchRetry(`${SB_URL}/rest/v1/team_members?select=email,role`, { headers: SB_HEADERS }, 'SB-broadAccess-team'),
+    fetchRetry(`${SB_URL}/rest/v1/roles?select=id,permissions`, { headers: SB_HEADERS }, 'SB-broadAccess-roles'),
+    fetchRetry(`${SB_URL}/rest/v1/staff_roles?select=email,role_id,permission_overrides`, { headers: SB_HEADERS }, 'SB-broadAccess-staffRoles')
+  ]);
+  if (!teamRes.ok || !rolesRes.ok || !staffRolesRes.ok) {
+    throw new Error(`getBroadAccessEmails: read failed (team=${teamRes.status} roles=${rolesRes.status} staff_roles=${staffRolesRes.status})`);
+  }
+  const team = await teamRes.json();
+  const roles = await rolesRes.json();
+  const staffRoles = await staffRolesRes.json();
+  const permsByRole = {};
+  roles.forEach(r => { permsByRole[r.id] = r.permissions || {}; });
+  const staffByEmail = {};
+  staffRoles.forEach(s => { staffByEmail[s.email] = s; });
+
+  return team.filter(t => {
+    const staff = staffByEmail[t.email];
+    const roleId = (staff && staff.role_id) || t.role;
+    const overrides = (staff && staff.permission_overrides) || {};
+    const docPerms = overrides.documents || (permsByRole[roleId] || {}).documents || [];
+    return docPerms.indexOf('view_all') !== -1;
+  }).map(t => t.email);
+}
+
+// Looks up bookings/visa_cases assigned_to_email for a batch of entity
+// refs in one round trip each (bookings and visa_cases share the exact
+// same column name). Returns a map keyed "entityType:entityId".
+async function lookupAssignedReps(bookingIds, visaIds) {
+  const map = {};
+  const jobs = [];
+  if (bookingIds.length) jobs.push(
+    fetchRetry(`${SB_URL}/rest/v1/bookings?id=in.(${bookingIds.map(encodeURIComponent).join(',')})&select=id,assigned_to_email`, { headers: SB_SERVICE_HEADERS }, 'SB-retrofit-bookingReps')
+      .then(async r => { if (r.ok) (await r.json()).forEach(b => { map[`booking:${b.id}`] = b.assigned_to_email; }); else console.error('lookupAssignedReps: bookings read failed:', r.status, await r.text()); })
+  );
+  if (visaIds.length) jobs.push(
+    fetchRetry(`${SB_URL}/rest/v1/visa_cases?id=in.(${visaIds.map(encodeURIComponent).join(',')})&select=id,assigned_to_email`, { headers: SB_SERVICE_HEADERS }, 'SB-retrofit-visaReps')
+      .then(async r => { if (r.ok) (await r.json()).forEach(v => { map[`visa:${v.id}`] = v.assigned_to_email; }); else console.error('lookupAssignedReps: visa_cases read failed:', r.status, await r.text()); })
+  );
+  await Promise.all(jobs);
+  return map;
+}
+
+// Removes any domain-wide grant on a file/folder and adds per-person
+// grants for `recipients` (assigned rep + broad-access list) — the core
+// retrofit operation, shared by both the file-level and folder-level
+// paths in /internal/documents-bulk-fix-sharing below. Returns a summary
+// of what it actually did, not just "ok", so a single-item test can be
+// verified against real before/after Drive state, not just a 200.
+async function retrofitPermissions(fileOrFolderId, token, recipients) {
+  const before = await driveListPermissions(fileOrFolderId, token);
+  const domainGrants = before.filter(p => p.type === 'domain');
+  for (const g of domainGrants) await driveDeletePermission(fileOrFolderId, g.id, token);
+  const existingUserEmails = new Set(before.filter(p => p.type === 'user').map(p => p.emailAddress));
+  const toAdd = recipients.filter(e => e && !existingUserEmails.has(e));
+  const shareResults = toAdd.length ? await driveSharePermission(fileOrFolderId, token, toAdd) : [];
+  return {
+    domain_grants_removed: domainGrants.length,
+    already_shared_with: [...existingUserEmails],
+    newly_shared_with: toAdd.slice(0, shareResults.length)
+  };
 }
 
 // multipart/related upload body, built by hand (Google's documented format
@@ -4564,7 +4688,7 @@ app.post('/internal/documents-upload', documentsUpload.single('file'), async (re
   }
   try {
     const table = entity_type === 'booking' ? 'bookings' : 'visa_cases';
-    const entRes = await fetchRetry(`${SB_URL}/rest/v1/${table}?id=eq.${encodeURIComponent(entity_id)}&select=id,google_drive_link`, {
+    const entRes = await fetchRetry(`${SB_URL}/rest/v1/${table}?id=eq.${encodeURIComponent(entity_id)}&select=id,google_drive_link,assigned_to_email`, {
       headers: SB_SERVICE_HEADERS
     }, 'SB-docUpload-entityRead');
     if (!entRes.ok) { const t = await entRes.text(); console.error('documents-upload: entity read failed:', entRes.status, t); return res.status(500).json({ error: t }); }
@@ -4583,7 +4707,11 @@ app.post('/internal/documents-upload', documentsUpload.single('file'), async (re
       folderId = folder.id;
       folderLink = folder.webViewLink || '';
       try {
-        await driveSharePermission(folderId, driveToken);
+        // v-fix (4 Sept 2026): per-person (assigned rep + broad-access
+        // list), never the whole domain — see driveSharePermission()/
+        // getBroadAccessEmails() above.
+        const broadAccess = await getBroadAccessEmails();
+        await driveSharePermission(folderId, driveToken, [entRows[0].assigned_to_email, ...broadAccess]);
       } catch (shareErr) {
         console.error('documents-upload: folder sharing failed (upload continues):', shareErr.message);
       }
@@ -4656,58 +4784,130 @@ app.post('/internal/documents-download', async (req, res) => {
   }
 });
 
-// ── one-time bulk-fix for documents uploaded before this system existed.
-// Impersonates each document's ORIGINAL uploader (looked up dynamically
-// via team_members.name matching documents.uploaded_by — never a
-// hardcoded mapping, same "team_members is the source of truth" principle
-// escapenfly-crm's own CLAUDE.md establishes) to share THEIR existing file
-// with the whole domain. Uses DRIVE_SCOPES (see the scope comment above —
-// broader than this specific operation strictly needs, since it's the one
-// scope actually authorized for this client ID), so it works regardless
-// of who originally created the file. No implicit "fix everything"
-// default — the caller must pass the exact doc_ids to process, precisely
-// so a single real document can be verified fixed before running this
-// against the rest. ──
+// ── RETROFIT (4 Sept 2026) — this endpoint's job fundamentally changed.
+// Originally (3 Sept 2026) a one-time bulk-fix that ADDED domain-wide
+// sharing to 124 documents that had never been shared at all. That domain
+// grant is now itself the leak (see driveSharePermission()'s comment
+// above) — this endpoint now does the opposite: for each item, it lists
+// the file/folder's REAL current Drive permissions, removes any
+// `type:domain` grant found, and adds per-person grants for the entity's
+// assigned rep + the broad-access list (getBroadAccessEmails()) — real
+// before/after Drive state via retrofitPermissions(), not an assumption.
+//
+// Two independent item shapes, since the earlier domain-wide leak existed
+// at two different Drive levels:
+//   doc_ids — FILE-level items: individual `documents` rows whose file got
+//     an individual domain-wide permission (the original 3 Sept bulk-fix,
+//     124 real rows as of 4 Sept — re-verified, not assumed from the
+//     original count). Impersonates each document's ORIGINAL UPLOADER
+//     (looked up dynamically via team_members.name matching
+//     documents.uploaded_by — never hardcoded — since only the file's
+//     owner/editor, not a mere reader, can manage its sharing).
+//   folders — FOLDER-level items: {entity_type, entity_id, impersonate_as}
+//     for a booking/visa case whose Drive FOLDER itself (not just files in
+//     it) got domain-shared via the CRM's own client-side upload flow
+//     (rbkUploadDocuments → driveSharePermission, since PR #8 merged, 3
+//     Sept 2026). impersonate_as is the folder's original creator's
+//     team_members.name (same lookup mechanism as doc_ids, since a folder
+//     has no uploaded_by column of its own to read it from automatically —
+//     the caller supplies it, e.g. from that entity's own documents rows).
+//
+// Uses DRIVE_SCOPES (the one scope actually authorized for this client
+// ID — see the scope comment above), so it works regardless of who
+// originally created the file/folder. No implicit "fix everything"
+// default for either shape — the caller must pass the exact items to
+// process, precisely so a single real item can be verified fixed (before
+// state / after state, not just an "ok") before running this against the
+// rest. ──
 app.post('/internal/documents-bulk-fix-sharing', async (req, res) => {
   if (!documentsStoreAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
-  const { doc_ids } = req.body || {};
-  if (!Array.isArray(doc_ids) || !doc_ids.length) {
-    return res.status(400).json({ error: 'doc_ids (a non-empty array of document ids) is required' });
+  const { doc_ids, folders } = req.body || {};
+  const hasDocIds = Array.isArray(doc_ids) && doc_ids.length;
+  const hasFolders = Array.isArray(folders) && folders.length;
+  if (!hasDocIds && !hasFolders) {
+    return res.status(400).json({ error: 'at least one of doc_ids (document id[]) or folders ({entity_type,entity_id,impersonate_as}[]) is required, non-empty' });
   }
   try {
-    const docsRes = await fetchRetry(`${SB_URL}/rest/v1/documents?id=in.(${doc_ids.map(encodeURIComponent).join(',')})&select=id,uploaded_by,google_drive_link`, {
-      headers: SB_SERVICE_HEADERS
-    }, 'SB-bulkFix-read');
-    if (!docsRes.ok) { const t = await docsRes.text(); console.error('documents-bulk-fix-sharing: read failed:', docsRes.status, t); return res.status(500).json({ error: t }); }
-    const docs = await docsRes.json();
-
+    const broadAccess = await getBroadAccessEmails();
     const results = [];
-    const foundIds = new Set(docs.map(d => d.id));
-    doc_ids.forEach(id => { if (!foundIds.has(id)) results.push({ doc_id: id, ok: false, error: 'document not found' }); });
 
-    const uploaderNames = [...new Set(docs.map(d => d.uploaded_by).filter(Boolean))];
-    const emailByName = {};
-    if (uploaderNames.length) {
-      const tmRes = await fetchRetry(`${SB_URL}/rest/v1/team_members?name=in.(${uploaderNames.map(n => encodeURIComponent(n)).join(',')})&select=name,email`, {
+    // ── file-level items ──
+    if (hasDocIds) {
+      const docsRes = await fetchRetry(`${SB_URL}/rest/v1/documents?id=in.(${doc_ids.map(encodeURIComponent).join(',')})&select=id,uploaded_by,google_drive_link,entity_type,entity_id`, {
         headers: SB_SERVICE_HEADERS
-      }, 'SB-bulkFix-teamMembers');
-      if (tmRes.ok) (await tmRes.json()).forEach(tm => { emailByName[tm.name] = tm.email; });
-      else console.error('documents-bulk-fix-sharing: team_members lookup failed:', tmRes.status, await tmRes.text());
-    }
+      }, 'SB-retrofit-readDocs');
+      if (!docsRes.ok) { const t = await docsRes.text(); console.error('documents-bulk-fix-sharing: docs read failed:', docsRes.status, t); return res.status(500).json({ error: t }); }
+      const docs = await docsRes.json();
+      const foundIds = new Set(docs.map(d => d.id));
+      doc_ids.forEach(id => { if (!foundIds.has(id)) results.push({ item: id, type: 'file', ok: false, error: 'document not found' }); });
 
-    for (const doc of docs) {
-      const impersonateEmail = emailByName[doc.uploaded_by];
-      const fileId = driveFileIdFromLink(doc.google_drive_link);
-      if (!impersonateEmail) { results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, ok: false, error: 'no matching team_members email for this uploaded_by name' }); continue; }
-      if (!fileId) { results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, ok: false, error: 'could not parse a Drive file id from google_drive_link' }); continue; }
-      try {
-        const token = await getDriveAccessToken(impersonateEmail, DRIVE_SCOPES);
-        await driveSharePermission(fileId, token);
-        results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, impersonated_as: impersonateEmail, ok: true });
-      } catch (e) {
-        results.push({ doc_id: doc.id, uploaded_by: doc.uploaded_by, impersonated_as: impersonateEmail, ok: false, error: e.message });
+      const uploaderNames = [...new Set(docs.map(d => d.uploaded_by).filter(Boolean))];
+      const emailByName = {};
+      if (uploaderNames.length) {
+        const tmRes = await fetchRetry(`${SB_URL}/rest/v1/team_members?name=in.(${uploaderNames.map(n => encodeURIComponent(n)).join(',')})&select=name,email`, {
+          headers: SB_SERVICE_HEADERS
+        }, 'SB-retrofit-teamMembers');
+        if (tmRes.ok) (await tmRes.json()).forEach(tm => { emailByName[tm.name] = tm.email; });
+        else console.error('documents-bulk-fix-sharing: team_members lookup failed:', tmRes.status, await tmRes.text());
+      }
+
+      const repByEntity = await lookupAssignedReps(
+        [...new Set(docs.filter(d => d.entity_type === 'booking').map(d => d.entity_id))],
+        [...new Set(docs.filter(d => d.entity_type === 'visa').map(d => d.entity_id))]
+      );
+
+      for (const doc of docs) {
+        const impersonateEmail = emailByName[doc.uploaded_by];
+        const fileId = driveFileIdFromLink(doc.google_drive_link);
+        const assignedEmail = repByEntity[`${doc.entity_type}:${doc.entity_id}`];
+        if (!impersonateEmail) { results.push({ item: doc.id, type: 'file', ok: false, error: 'no matching team_members email for this uploaded_by name' }); continue; }
+        if (!fileId) { results.push({ item: doc.id, type: 'file', ok: false, error: 'could not parse a Drive file id from google_drive_link' }); continue; }
+        try {
+          const token = await getDriveAccessToken(impersonateEmail, DRIVE_SCOPES);
+          const summary = await retrofitPermissions(fileId, token, [assignedEmail, ...broadAccess]);
+          results.push({ item: doc.id, type: 'file', uploaded_by: doc.uploaded_by, impersonated_as: impersonateEmail, assigned_rep: assignedEmail || null, ok: true, ...summary });
+        } catch (e) {
+          results.push({ item: doc.id, type: 'file', uploaded_by: doc.uploaded_by, impersonated_as: impersonateEmail, ok: false, error: e.message });
+        }
       }
     }
+
+    // ── folder-level items ──
+    if (hasFolders) {
+      const impNames = [...new Set(folders.map(f => f.impersonate_as).filter(Boolean))];
+      const emailByName = {};
+      if (impNames.length) {
+        const tmRes = await fetchRetry(`${SB_URL}/rest/v1/team_members?name=in.(${impNames.map(n => encodeURIComponent(n)).join(',')})&select=name,email`, {
+          headers: SB_SERVICE_HEADERS
+        }, 'SB-retrofit-folderTeamMembers');
+        if (tmRes.ok) (await tmRes.json()).forEach(tm => { emailByName[tm.name] = tm.email; });
+        else console.error('documents-bulk-fix-sharing: folder team_members lookup failed:', tmRes.status, await tmRes.text());
+      }
+
+      for (const f of folders) {
+        const item = `${f.entity_type}:${f.entity_id}`;
+        if (['booking', 'visa'].indexOf(f.entity_type) < 0) { results.push({ item, type: 'folder', ok: false, error: 'entity_type must be "booking" or "visa"' }); continue; }
+        const impersonateEmail = emailByName[f.impersonate_as];
+        if (!impersonateEmail) { results.push({ item, type: 'folder', ok: false, error: 'no matching team_members email for impersonate_as' }); continue; }
+        const table = f.entity_type === 'booking' ? 'bookings' : 'visa_cases';
+        try {
+          const entRes = await fetchRetry(`${SB_URL}/rest/v1/${table}?id=eq.${encodeURIComponent(f.entity_id)}&select=id,google_drive_link,assigned_to_email`, {
+            headers: SB_SERVICE_HEADERS
+          }, 'SB-retrofit-folderEntity');
+          if (!entRes.ok) { const t = await entRes.text(); results.push({ item, type: 'folder', ok: false, error: `entity read failed: ${t}` }); continue; }
+          const entRows = await entRes.json();
+          if (!entRows.length) { results.push({ item, type: 'folder', ok: false, error: 'entity not found' }); continue; }
+          const folderId = driveFileIdFromLink(entRows[0].google_drive_link);
+          if (!folderId) { results.push({ item, type: 'folder', ok: false, error: 'could not parse a Drive folder id from google_drive_link' }); continue; }
+          const token = await getDriveAccessToken(impersonateEmail, DRIVE_SCOPES);
+          const summary = await retrofitPermissions(folderId, token, [entRows[0].assigned_to_email, ...broadAccess]);
+          results.push({ item, type: 'folder', impersonated_as: impersonateEmail, assigned_rep: entRows[0].assigned_to_email || null, ok: true, ...summary });
+        } catch (e) {
+          results.push({ item, type: 'folder', impersonated_as: impersonateEmail, ok: false, error: e.message });
+        }
+      }
+    }
+
     res.json({ results, fixed: results.filter(r => r.ok).length, failed: results.filter(r => !r.ok).length });
   } catch (e) {
     console.error('documents-bulk-fix-sharing error:', e.message);

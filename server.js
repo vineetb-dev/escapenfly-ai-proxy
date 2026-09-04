@@ -368,7 +368,16 @@ const TEAM = {
   damini:   { name: 'Damini',          email: 'support3@escapenfly.com', wa: '919888002635', dept: 'Visa' },
   admin:    { name: 'Vineet Bansal',   email: 'vineet.b@escapenfly.com', wa: '919216320050', dept: 'Admin' },
   vivek:    { name: 'Vivek Bansal',    email: 'vivek.b@escapenfly.com',  wa: '918427694918', dept: 'Founder' },
-  abhishek: { name: 'Abhishek Sharma', email: '',                       wa: '918146888811', dept: 'Founder' }
+  // v-fix (4 Sept 2026): email was '' — harmless while nothing here read
+  // it (only .wa mattered for the old WhatsApp sends), but the new
+  // dashboard-notification work (writeNotification(), 4 Sept 2026) reads
+  // t.email for every FOUNDER_KEYS loop, which would have silently written
+  // assigned_to_email:'' for him on every team_digest/booking_confirmed/
+  // eod_summary row. Real address confirmed directly against the CRM's own
+  // team_members table this same session (same lookup already used to wire
+  // his notifications:view_all grant there) — abhisheksharma@escapenfly.com,
+  // not assumed from the '@escapenfly.com' pattern alone.
+  abhishek: { name: 'Abhishek Sharma', email: 'abhisheksharma@escapenfly.com', wa: '918146888811', dept: 'Founder' }
 };
 
 // v3.2 — recipient rosters for the new notification jobs
@@ -1429,35 +1438,84 @@ async function sendWA(phone, templateName, params) {
   }
 }
 
-// ── NOTIFY TEAM (instant new-lead alert) ──
-async function notifyTeam(assigned, leadData) {
-  // Changed 3 Sept 2026: internal team notifications move to the CRM
-  // dashboard (internal_notifications table) instead of WhatsApp — real
-  // WhatsApp fatigue was the reason ("most people just don't see" it).
-  // Client-facing WhatsApp templates (lead-received confirmation,
-  // Instagram tag, Google review requests) are UNCHANGED and untouched —
-  // this function only ever handled internal team pings, never client
-  // messaging, so the split is clean; nothing else in this file needs to
-  // change for that boundary to hold.
-  //
-  // Function name/signature kept identical on purpose — 6 call sites
-  // elsewhere in this file check its boolean return; only the internal
-  // implementation changes here.
+// ── INTERNAL NOTIFICATIONS (dashboard, not WhatsApp) ──
+// v-fix (4 Sept 2026) — this is the actual completion of the "stop all
+// internal WhatsApp" request. notifyTeam() (3 Sept 2026, below) only ever
+// redirected ONE thing: the instant new-lead-assigned ping. Real user
+// report the next day ("still getting WhatsApp for internal stuff") plus a
+// direct code audit found 8 more staff-facing sendWA()/sendSessionMessage()
+// calls across 5 separate cron endpoints that were never touched — digests,
+// stale-lead alerts, visa appointment reminders, the booking digest, EOD
+// summary. All of those now write here too, via this shared helper, same
+// as notifyTeam() already did. Client-facing WhatsApp (lead-received
+// confirmation, Instagram tag, Google review requests, Maya's own replies)
+// is UNTOUCHED — every function below only ever handled internal team
+// pings, never customer messaging.
+//
+// Design call on digests specifically (individual_lead_digest,
+// team_lead_digest_v2, eod_summary): these summarize AGGREGATE COUNTS with
+// no individually-addressable underlying rows in the query that produces
+// them (countLeadsFor/countSince return numbers, not lead lists) — there is
+// nothing to explode into per-item rows even if that were desirable. Kept
+// as one notification per recipient representing the whole snapshot,
+// matching the shape the original WhatsApp template already had (one
+// message per person, all their numbers in it).
+//
+// The stale-lead digest to Vineet and the booking digest to founders DO
+// have individually-addressable underlying rows (specific leads, specific
+// bookings) — but they're handled two different ways on purpose:
+//   - Booking digest → exploded into one notification PER BOOKING per
+//     founder. A confirmed booking is exactly the kind of individually
+//     meaningful, closeable event lead_assigned already models — collapsing
+//     4 real bookings into one "4 new bookings, ₹X total" row throws away
+//     which ones, the same loss of information a dashboard feed shouldn't
+//     have when the data to avoid it already exists in the query result.
+//   - Stale-lead digest to Vineet → kept as ONE notification per cron run
+//     (not one per lead), explicitly because the per-lead version already
+//     exists as its own notification (stale_lead, addressed to the
+//     assigned rep) and Vineet — holding notifications:view_all — already
+//     sees every one of those individually. This digest is a deliberate
+//     duplicate-but-different view: a single at-a-glance count for someone
+//     who doesn't need to click into 16 separate rows to know "16 leads
+//     went stale today." Exploding it too would just be the same 16 leads
+//     appearing twice in his feed for no added information.
+async function writeNotification({ type, summary, assignedToEmail, enquiryId, bookingId }) {
   try {
     const r = await fetchRetry(`${SB_URL}/rest/v1/internal_notifications`, {
       method: 'POST',
       headers: { ...SB_HEADERS, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
       body: JSON.stringify({
-        notification_type: 'lead_assigned',
-        summary: `New lead: ${leadData.name || 'Unknown'} → ${leadData.destination || 'TBD'} — assigned to ${assigned.name}`,
-        assigned_to_email: assigned.email || null
+        notification_type: type,
+        summary,
+        assigned_to_email: assignedToEmail || null,
+        enquiry_id: enquiryId || null,
+        booking_id: bookingId || null
       })
-    }, 'notifyTeam-dashboard');
+    }, `writeNotification-${type}`);
+    if (!r.ok) console.error(`writeNotification [${type}] insert failed:`, r.status, await r.text());
     return r.ok;
   } catch (e) {
-    console.error('notifyTeam (dashboard insert) error:', e.message);
+    console.error(`writeNotification [${type}] error:`, e.message);
     return false;
   }
+}
+
+// ── NOTIFY TEAM (instant new-lead alert) ──
+async function notifyTeam(assigned, leadData) {
+  // Changed 3 Sept 2026: internal team notifications move to the CRM
+  // dashboard (internal_notifications table) instead of WhatsApp — real
+  // WhatsApp fatigue was the reason ("most people just don't see" it).
+  //
+  // Function name/signature kept identical on purpose — 6 call sites
+  // elsewhere in this file check its boolean return; only the internal
+  // implementation changes here (now routes through the shared
+  // writeNotification() helper above, same as everything else added
+  // 4 Sept 2026).
+  return writeNotification({
+    type: 'lead_assigned',
+    summary: `New lead: ${leadData.name || 'Unknown'} → ${leadData.destination || 'TBD'} — assigned to ${assigned.name}`,
+    assignedToEmail: assigned.email
+  });
 }
 
 // ── EXCHANGE RATE REFRESH (21 Aug 2026) — feeds exchange_rates.base_rate_inr ──
@@ -2279,9 +2337,13 @@ app.post('/cron/daily-digest', async (req, res) => {
       const c = await countLeadsFor(t.name);
       results[key] = c;
       // Still counted (team_lead_digest below needs a value for every
-      // REP_KEYS slot), but departed staff get no personal WA send.
+      // REP_KEYS slot), but departed staff get no personal notification.
       if (!DEPARTED_KEYS.includes(key)) {
-        await sendWA(t.wa, 'individual_lead_digest', [t.name, String(c.new), String(c.followup), String(c.urgent)]);
+        await writeNotification({
+          type: 'lead_digest',
+          summary: `Lead snapshot for ${t.name} — ${c.new} new, ${c.followup} follow-up, ${c.urgent} urgent`,
+          assignedToEmail: t.email
+        });
       }
       console.log(`📊 [digest] ${t.name}: new=${c.new} followup=${c.followup} urgent=${c.urgent}`);
     }
@@ -2289,16 +2351,24 @@ app.post('/cron/daily-digest', async (req, res) => {
     const damini = TEAM.damini;
     const dC = await countLeadsFor(damini.name, { enquiryType: 'visa' });
     results.damini = dC;
-    await sendWA(damini.wa, 'individual_lead_digest', [damini.name, String(dC.new), String(dC.followup), String(dC.urgent)]);
+    await writeNotification({
+      type: 'lead_digest',
+      summary: `Lead snapshot for ${damini.name} (visa) — ${dC.new} new, ${dC.followup} follow-up, ${dC.urgent} urgent`,
+      assignedToEmail: damini.email
+    });
     console.log(`📊 [digest] ${damini.name} (visa): new=${dC.new} followup=${dC.followup} urgent=${dC.urgent}`);
 
     const totalLive = Object.values(results).reduce((sum, c) => sum + c.live, 0);
     const digestBlock = buildTeamDigestBlock(results, damini, totalLive);
     for (const key of FOUNDER_KEYS) {
       const t = TEAM[key];
-      await sendWA(t.wa, 'team_lead_digest_v2', [t.name, digestBlock]);
+      await writeNotification({
+        type: 'team_digest',
+        summary: `Team lead digest — Total live: ${totalLive}\n${digestBlock}`,
+        assignedToEmail: t.email
+      });
     }
-    console.log(`📊 [digest] Team digest v2 sent to founders. Total live leads: ${totalLive}\n${digestBlock}`);
+    console.log(`📊 [digest] Team digest sent to founders (dashboard). Total live leads: ${totalLive}\n${digestBlock}`);
   } catch (e) {
     console.error('daily-digest error:', e);
   }
@@ -2325,8 +2395,15 @@ app.post('/cron/stale-check', async (req, res) => {
     // (confirmed ~4x/day from last_stale_alert_at timestamps during
     // investigation), that was N separate WhatsApp pings just for him,
     // every run. Collected here instead and sent as ONE digest message
-    // after the loop. Reps keep their own per-lead template send
+    // after the loop. Reps keep their own per-lead notification
     // unchanged — that granularity is useful to them.
+    // v-fix (4 Sept 2026): both the per-rep alert and Vineet's digest now
+    // write to internal_notifications instead of WhatsApp — see the
+    // writeNotification() comment above for the full reasoning, including
+    // why Vineet's digest stays batched (one row per run) rather than
+    // exploded per-lead even though he'd see the per-lead ones anyway via
+    // notifications:view_all — it's a deliberate, distinct at-a-glance
+    // view, not a duplicate by accident.
     const vineetDigestLines = [];
     for (const row of rows) {
       // Dedup: skip unless this is a first-time alert, last_activity_at
@@ -2348,8 +2425,13 @@ app.post('/cron/stale-check', async (req, res) => {
       const destination = lead.dest || 'their enquiry';
       const customerName = lead.name || 'Unknown';
 
-      if (repEntry && repEntry.wa) {
-        await sendWA(repEntry.wa, 'stale_lead_alert', [repEntry.name, customerName, destination, String(hoursStale)]);
+      if (repEntry) {
+        await writeNotification({
+          type: 'stale_lead',
+          summary: `${customerName} (${destination}) — ${hoursStale}h stale, no follow-up`,
+          assignedToEmail: repEntry.email,
+          enquiryId: row.id
+        });
       }
       vineetDigestLines.push(`• ${customerName} (${destination}) — ${hoursStale}h stale, rep: ${repName}`);
       console.log(`⏰ [stale] ${customerName} (${destination}) — ${hoursStale}h stale, rep: ${repName}`);
@@ -2372,25 +2454,18 @@ app.post('/cron/stale-check', async (req, res) => {
       alertedCount++;
     }
 
-    // NOTE — real risk, not silently assumed safe: this uses
-    // sendSessionMessage (the MAYA_CAMPAIGN free-text send Maya's own
-    // customer replies use), because the approved stale_lead_alert
-    // template has a fixed single-lead shape (rep/customer/destination/
-    // hours) and can't carry a variable-length list — there is no
-    // approved multi-lead digest template today. Unlike sendWA's
-    // pre-approved template campaign, WhatsApp Business API session
-    // messages are only deliverable within a 24h window opened by the
-    // RECIPIENT messaging the business number first. Vineet is staff,
-    // not part of the customer inbound flow, so there's no guarantee
-    // he has an open session at any given run. If this silently stops
-    // delivering, check that first — it's not necessarily a code bug.
-    // A real pre-approved batched-digest template is the more durable
-    // fix but needs external AiSensy/Meta template approval, which no
-    // code change here can do.
+    // v-fix (4 Sept 2026): was sendSessionMessage (free-text WhatsApp,
+    // subject to the 24h-session-window caveat this comment used to flag)
+    // — now a single dashboard notification instead. No session-window
+    // risk anymore; a dashboard row has no such delivery window.
     if (vineetDigestLines.length) {
-      const digestMsg = `⏰ Stale-lead digest — ${vineetDigestLines.length} lead${vineetDigestLines.length === 1 ? '' : 's'} newly flagged this run:\n\n${vineetDigestLines.join('\n')}`;
-      const digestOk = await sendSessionMessage(TEAM.admin.wa, digestMsg);
-      if (!digestOk) console.error('⚠️ [stale-check] Vineet digest send FAILED — see sendSessionMessage log above (likely no open 24h session, see comment above this block).');
+      const digestMsg = `${vineetDigestLines.length} lead${vineetDigestLines.length === 1 ? '' : 's'} newly flagged stale this run:\n\n${vineetDigestLines.join('\n')}`;
+      const digestOk = await writeNotification({
+        type: 'stale_lead_digest',
+        summary: digestMsg,
+        assignedToEmail: TEAM.admin.email
+      });
+      if (!digestOk) console.error('⚠️ [stale-check] Vineet digest notification FAILED — see writeNotification log above.');
     }
     console.log(`⏰ [stale-check] ${rows.length} currently stale, ${alertedCount} alerted (rest deduped), Vineet digest: ${vineetDigestLines.length ? `sent (${vineetDigestLines.length} leads)` : 'skipped (nothing new)'}.`);
   } catch (e) {
@@ -2416,11 +2491,19 @@ app.post('/cron/visa-appointments', async (req, res) => {
       try { lead = JSON.parse(row.original_message_text || '{}'); } catch (e) {}
       const customerName = lead.name || 'Unknown';
       const destination = lead.dest || 'their visa';
+      // v-fix (4 Sept 2026): one dashboard notification PER RECIPIENT
+      // (Damini + Prabhjot), not one row shared between both — same
+      // reasoning as the founder-digest loops below.
       for (const key of VISA_REP_KEYS) {
         const t = TEAM[key];
-        await sendWA(t.wa, 'visa_appointment_reminder', [t.name, customerName, destination, tomorrow]);
+        await writeNotification({
+          type: 'visa_appointment',
+          summary: `Visa appointment tomorrow (${tomorrow}) — ${customerName} (${destination})`,
+          assignedToEmail: t.email,
+          enquiryId: row.id
+        });
       }
-      console.log(`🛂 [visa-appt] Reminder sent for ${customerName} (${destination}) — appt ${tomorrow}`);
+      console.log(`🛂 [visa-appt] Reminder queued for ${customerName} (${destination}) — appt ${tomorrow}`);
     }
     console.log(`🛂 [visa-appointments] ${rows.length} appointment(s) tomorrow.`);
   } catch (e) {
@@ -2464,8 +2547,18 @@ app.post('/cron/booking-check', async (req, res) => {
       return;
     }
 
-    const lines = [];
     let totalValue = 0;
+    // v-fix (4 Sept 2026): previously one combined digest message per
+    // founder (forced by sendWA's fixed-shape templates / sendSessionMessage
+    // needing one string). A dashboard row has no such shape constraint, so
+    // this is now one notification PER BOOKING per founder instead of one
+    // aggregate blob — a confirmed booking is exactly the kind of
+    // individually meaningful, closeable event lead_assigned already models
+    // in this feed; collapsing several real bookings into one "N bookings,
+    // ₹total" row would throw away which ones, for no reason once the data
+    // to keep them distinct (customer/destination/pax/value, all already in
+    // `rows`) is right there. The old 24h-session-window risk this comment
+    // used to flag for sendSessionMessage doesn't apply to a DB write either.
     for (const row of rows) {
       let lead = {};
       try { lead = JSON.parse(row.original_message_text || '{}'); } catch (e) {}
@@ -2474,25 +2567,12 @@ app.post('/cron/booking-check', async (req, res) => {
       const pax = String(row.pax_adults || '-');
       const value = row.budget_max || 0;
       totalValue += value;
-      lines.push(`• ${customerName} (${destination}) — ${pax} pax, ₹${value}`);
-      console.log(`🎉 [booking] Queued for digest: ${customerName} (${destination}) — ₹${value}`);
-    }
-
-    // Same reasoning as the stale-check Vineet digest: booking_confirmed_alert
-    // is an approved TEMPLATE with a fixed single-booking shape (name/dest/
-    // pax/value) and can't carry a variable-length list, so a real batched
-    // message has to go via sendSessionMessage (free text) instead of
-    // sendWA. Same real caveat applies here, to ALL FOUNDER_KEYS recipients
-    // this time, not just Vineet: session messages only deliver within a
-    // 24h window opened by the recipient messaging the business number
-    // first, which none of Vineet/Vivek/Abhishek/Prabhjot are guaranteed to
-    // have open at any given run. If this digest silently stops arriving
-    // for someone, check that before assuming a code regression.
-    const digestMsg = `🎉 Booking digest — ${rows.length} new booking${rows.length === 1 ? '' : 's'} confirmed (₹${totalValue} total):\n\n${lines.join('\n')}`;
-    for (const key of FOUNDER_KEYS) {
-      const t = TEAM[key];
-      const ok = await sendSessionMessage(t.wa, digestMsg);
-      if (!ok) console.error(`⚠️ [booking-check] digest send FAILED for ${t.name} — likely no open 24h session.`);
+      const summary = `Booking confirmed: ${customerName} (${destination}) — ${pax} pax, ₹${value}`;
+      for (const key of FOUNDER_KEYS) {
+        const t = TEAM[key];
+        await writeNotification({ type: 'booking_confirmed', summary, assignedToEmail: t.email, enquiryId: row.id });
+      }
+      console.log(`🎉 [booking] Notified founders: ${customerName} (${destination}) — ₹${value}`);
     }
 
     for (const row of rows) {
@@ -2502,10 +2582,10 @@ app.post('/cron/booking-check', async (req, res) => {
         body: JSON.stringify({ booking_notified: true })
       }, 'SB-markBookingNotified');
       if (!patchR.ok) {
-        console.error(`⚠️ [booking-check] booking_notified write FAILED for ${row.id} — this booking WILL reappear in the next digest: ${patchR.status} ${await patchR.text()}`);
+        console.error(`⚠️ [booking-check] booking_notified write FAILED for ${row.id} — this booking WILL be re-notified next run: ${patchR.status} ${await patchR.text()}`);
       }
     }
-    console.log(`🎉 [booking-check] ${rows.length} new booking(s) batched into one digest per founder (₹${totalValue} total).`);
+    console.log(`🎉 [booking-check] ${rows.length} new booking(s) notified to each founder individually (₹${totalValue} total).`);
   } catch (e) {
     console.error('booking-check error:', e);
   }
@@ -2545,9 +2625,15 @@ app.post('/cron/eod-summary', async (req, res) => {
       totalValue = valRows.reduce((sum, r) => sum + (r.budget_max || 0), 0);
     }
 
+    // v-fix (4 Sept 2026): one notification per founder, same as before —
+    // these are aggregate counts (countSince returns numbers, not a list of
+    // the actual leads behind them), so unlike the booking digest above
+    // there's no underlying per-item data available to explode into
+    // separate rows even if that were desirable.
+    const eodSummary = `EOD summary — Booked: ${bookedToday}, Lost: ${lostToday}, New: ${newToday}, Value: ₹${totalValue}`;
     for (const key of FOUNDER_KEYS) {
       const t = TEAM[key];
-      await sendWA(t.wa, 'eod_summary', [t.name, String(bookedToday), String(lostToday), String(newToday), String(totalValue)]);
+      await writeNotification({ type: 'eod_summary', summary: eodSummary, assignedToEmail: t.email });
     }
     console.log(`🌆 [eod-summary] booked:${bookedToday} lost:${lostToday} new:${newToday} value:₹${totalValue}`);
   } catch (e) {

@@ -445,57 +445,64 @@ function looksLikeSpam(text) {
 // "it looks like there's been a mix-up — this is EscapeNFly, not Dr.
 // Apoorva Garg's office...").
 //
-// TIMING SIGNAL — NOT IMPLEMENTED, flagged rather than faked. The intended
-// primary signal (elapsed time since OUR outbound template was delivered
-// to that number) needs a send timestamp this server does not have: the
-// broadcast itself is sent directly from AiSensy's own campaign dashboard,
-// never through this codebase (no bulk-send endpoint exists here) — so
-// there is no `sent_at` to measure against. Would need either AiSensy
-// forwarding a delivery-status webhook this app could correlate (unconfirmed
-// shape — same "don't guess it" discipline as extractAdReferral/
-// extractCantonTemplateSignal above) or a known broadcast-batch schedule to
-// approximate against. TEXT PATTERNS + SHAPE below are what's actually
-// running, which changes the risk profile from what was designed: these
-// were meant to back up timing, not carry detection alone.
+// TIMING SIGNAL — dropped entirely (12 Sep 2026). Confirmed there is no
+// outbound send timestamp to correlate against: the broadcast is sent
+// directly from AiSensy's own dashboard, never through this codebase. Not
+// revisited unless AiSensy starts forwarding delivery-status webhooks.
 //
-// ASYMMETRIC RISK, different from the Canton-match false-positive case: a
-// false positive there costs one odd extra question (recoverable). A false
-// positive HERE is total silence to a REAL customer — worse and easy to
-// miss, since nothing looks wrong on our side. A couple of these patterns
-// (e.g. "will get back to you as soon as ...") are plausible things a real
-// customer says too. Mitigated by gating on FIRST MESSAGE ONLY (see the
-// call site) — a real auto-responder only ever fires immediately on first
-// contact, never mid-conversation, so requiring "no prior chat history"
-// costs nothing against the actual failure mode while protecting every
-// message in an already-open conversation.
+// PATTERNS REPLACED (12 Sep 2026) with ground truth pulled directly from
+// ai_chats — 73 real auto-responder hits, not guesses. The original
+// pattern list is gone; keeping it alongside these would have reintroduced
+// exactly the false positive the ground-truth data caught: a real human
+// reply — "Hi Sir Yes / Thank you for contacting us, will share the
+// details in mail" — contains "thank you for contacting", which the old
+// loose prefix match (and the old third-party-greeting shape check, same
+// root problem) would have silenced. The fix is matching the STABLE part
+// of each WhatsApp Business default template, not the customizable part:
+//
+// A. Default greeting (~20 of 73, one per business — Dr. Apoorva Garg,
+//    DIROCHE MULTIMED SOLUTIONS, AKAL REALTY, Aggarwal Trading Company,
+//    Chabba Group, HD TEXO FAB, Crescent Travel International, Aman Tours
+//    Travels among them): "Thank you for contacting <NAME>! Please let us
+//    know how we can help you." Businesses customize the name, essentially
+//    never the tail — matching the SUFFIX only is what makes this safe
+//    against the false positive above (that real reply has the prefix, not
+//    this tail).
+// B. Default away message (9 of 73): "Thank you for your message. We're
+//    unavailable right now, but will respond as soon as possible." 6/9 use
+//    a straight apostrophe, 3/9 a curly one (U+2019) — normalized below
+//    rather than doubling every pattern, so this (and any future addition)
+//    doesn't silently miss a third of real hits again.
+// C. Hindi localization of B, present in the real data, not invented:
+//    "हमें मैसेज भेजने के लिए धन्यवाद. हम अभी उपलब्ध नहीं हैं लेकिन जल्द ही
+//    आपसे संपर्क करेंगे" — matched on "उपलब्ध नहीं" (not available)
+//    specifically, NOT धन्यवाद (just "thank you") alone, since a real
+//    customer may well use that word on its own.
+//
+// A genuine human out-of-office ("I will be out of office till Monday due
+// to family emergency...") also appears in the data. Deliberately NOT
+// covered — per the explicit call on this: silence may be defensible there,
+// but it's a judgement call about a real person, not an auto-responder, and
+// these rules aren't widened to make that call automatically.
+//
+// ASYMMETRIC RISK, unchanged from before: a false positive here is total
+// silence to a real customer (worse than the recoverable Canton-match false
+// positive), so precision over recall — matching stable template tails
+// rather than generic courteous phrasing. Still backstopped by the
+// FIRST-MESSAGE-ONLY gate at the call site regardless.
+function normalizeApostrophes(text) {
+  return String(text || '').replace(/[‘’ʼ]/g, "'");
+}
 const AUTO_RESPONDER_PATTERNS = [
-  /\bthank you for (contacting|your message|reaching out)\b/i,
-  /\bwe(?:'re| are) (?:currently )?unavailable\b/i,
-  /\bwill (?:get back|respond) to you as soon as\b/i,
-  /\bplease let us know how we can help\b/i,
-  /\bthis is an automated (?:reply|message|response)\b/i,
-  /\bout of office\b/i,
-  // Hindi "thank you for contacting us / we'll be in touch soon" —
-  // APPROXIMATE: built from the reported pattern, not the literal string
-  // seen (not shared with this app) — tighten once a real example is
-  // available via /debug/auto-responder-log or a pasted sample.
-  /धन्यवाद[^।!.\n]{0,50}(संपर्क|जल्द)|(संपर्क|जल्द)[^।!.\n]{0,50}धन्यवाद/
+  { signal: 'default-greeting', re: /please let us know how we can help you\b/i },
+  { signal: 'default-away-message', re: /thank you for your message\.?\s*we'?re unavailable right now,?\s*but will respond as soon as possible/i },
+  { signal: 'default-away-message-hindi', re: /उपलब्ध नहीं/ }
 ];
 
-// "Thank you for contacting <Name>!" where <Name> isn't us — a third-party
-// business's own greeting arriving at OUR number is near-conclusive on its
-// own even with no other pattern match.
-const THIRD_PARTY_GREETING_RE = /\bthank you for contacting\s+([^!.\n]{2,60})[!.]?/i;
-const OWN_BRAND_RE = /escape\s*n?\s*'?fly/i;
-
 function looksLikeAutoResponder(text) {
-  const t = String(text || '');
-  for (const re of AUTO_RESPONDER_PATTERNS) {
-    if (re.test(t)) return { matched: true, signal: 'text-pattern', detail: re.source };
-  }
-  const m = t.match(THIRD_PARTY_GREETING_RE);
-  if (m && !OWN_BRAND_RE.test(m[1])) {
-    return { matched: true, signal: 'third-party-greeting', detail: m[1].trim() };
+  const t = normalizeApostrophes(text);
+  for (const { signal, re } of AUTO_RESPONDER_PATTERNS) {
+    if (re.test(t)) return { matched: true, signal, detail: re.source };
   }
   return { matched: false };
 }

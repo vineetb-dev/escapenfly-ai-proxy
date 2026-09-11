@@ -3767,6 +3767,120 @@ app.get('/debug/canton-referral-log', (req, res) => {
   res.json(cantonReferralLog);
 });
 
+// ── CANTON BROADCAST TEMPLATE-REPLY SIGNAL (11 Sep 2026) ──
+// Found live, same afternoon the 1,863-contact broadcast went out: tapping
+// the template's "Send me details"/"Call me back" quick-reply button sends
+// EXACTLY that button text as the message and nothing else (confirmed by
+// AiSensy's own docs — "the text in the buttons becomes the user's
+// message" — https://aisensy.com/tutorials/how-to-add-quick-replies-to-template-message)
+// — no destination word, no broadcast code, so isCantonEnquiry() missed it
+// and this was the majority of broadcast replies, not an edge case.
+//
+// THREE candidate signals, all genuinely unconfirmed against real AiSensy
+// traffic before today (same caveat as extractAdReferral above — this is
+// best-effort, logged so the real shape can be confirmed from live replies
+// that are arriving right now, not assumed):
+//   1. AiSensy contact tags (canton_day1/2/3) — every broadcast recipient
+//      has one, so if the incoming payload exposes tags at all, this is the
+//      most reliable signal (Canton-specific by construction, near-zero
+//      collision risk with any other campaign).
+//   2. A template/campaign-name-ish field containing "canton" anywhere in
+//      the payload.
+//   3. The button's own text/payload exactly matching one of the two known
+//      Canton quick-reply labels. Deliberately the WEAKEST signal of the
+//      three — "Send me details"/"Call me back" are generic CTA phrasing
+//      that a future non-Canton broadcast could plausibly reuse, which
+//      would misfire this. Kept anyway because it is the one signal
+//      guaranteed to be present today (AiSensy's own docs confirm the
+//      button text always becomes the message) while 1 and 2 depend on
+//      payload fields this app has never actually seen. Risk asymmetry
+//      favors this: over-matching costs an odd "what do you source"
+//      question to a non-Canton lead (recoverable, no safety issue,
+//      isCantonEnquiry() still self-expires after 15 Oct either way);
+//      under-matching was actively losing real leads this afternoon.
+//      Flagged in the debug log so this can be tightened once Vineet
+//      confirms whether any other live template shares these exact labels.
+const CANTON_BUTTON_TEXTS = ['send me details', 'call me back'];
+const CANTON_TAG_RE = /\bcanton_day[123]\b/i;
+
+function extractCantonTemplateSignal(body, resolvedText) {
+  const msg = body?.data?.message || {};
+  const reasons = [];
+  const raw = {};
+
+  // 1. Contact tags
+  const tagCandidates = [msg.tags, body?.data?.message?.tags, body?.data?.contact?.tags, body?.data?.tags, msg.contact?.tags];
+  let tags = tagCandidates.find(c => Array.isArray(c));
+  if (tags) {
+    raw.tags = tags;
+    if (tags.some(t => CANTON_TAG_RE.test(String(t)))) reasons.push('contact tag matches canton_day1/2/3');
+  }
+
+  // 2. Button object, IF AiSensy sends one separately from message text.
+  const buttonCandidates = [msg.button, body?.data?.message?.button, body?.data?.button, msg.interactive?.button_reply];
+  let button = buttonCandidates.find(c => c && typeof c === 'object');
+  if (button) {
+    raw.button = button;
+    const buttonText = String(button.text || button.payload || button.title || '').trim().toLowerCase();
+    if (CANTON_BUTTON_TEXTS.includes(buttonText)) reasons.push(`button text/payload matches known Canton template label: "${buttonText}"`);
+  }
+
+  // 2b. Fallback: AiSensy's own docs ("the text in the buttons becomes the
+  // user's message") suggest a tap may arrive as PLAIN message text with no
+  // separate button object at all — confirmed empirically against this
+  // app's own local test, where a synthetic "Call me back" with no button
+  // field produced no signal from check 2 above. Check the resolved message
+  // text itself directly against the known labels as a required fallback,
+  // not just a nice-to-have — this is the one check guaranteed to work
+  // regardless of which shape AiSensy actually sends.
+  const trimmedText = String(resolvedText || '').trim().toLowerCase();
+  if (CANTON_BUTTON_TEXTS.includes(trimmedText)) {
+    reasons.push(`message text itself exactly matches known Canton template label: "${trimmedText}"`);
+  }
+
+  // 3. context object (kept for logging even though a raw {from,id} WAMID
+  // reference isn't independently actionable without our own sent-message
+  // log — capturing it now is what makes that build-able later if needed).
+  const contextCandidates = [msg.context, body?.data?.message?.context, body?.data?.context];
+  let context = contextCandidates.find(c => c && typeof c === 'object');
+  if (context) raw.context = context;
+
+  // Deep scan for a template/campaign-name-ish field anywhere, since AiSensy
+  // may surface its own campaign tracking under a key name this app has
+  // never seen (same defensive posture as extractAdReferral's deep scan).
+  const seen = new Set();
+  let templateNameField = null;
+  const visit = (o, depth) => {
+    if (templateNameField || !o || typeof o !== 'object' || depth > 6 || seen.has(o)) return;
+    seen.add(o);
+    for (const [k, v] of Object.entries(o)) {
+      const kl = String(k).toLowerCase();
+      if (typeof v === 'string' && (kl.includes('template') || kl.includes('campaign')) && /canton/i.test(v)) {
+        templateNameField = { key: k, value: v };
+        return;
+      }
+      if (v && typeof v === 'object') visit(v, depth + 1);
+    }
+  };
+  visit(body, 0);
+  if (templateNameField) {
+    raw.templateNameField = templateNameField;
+    reasons.push(`template/campaign field "${templateNameField.key}" mentions canton`);
+  }
+
+  return { isCantonSignal: reasons.length > 0, reasons, raw };
+}
+
+const cantonTemplateSignalLog = [];
+function recordCantonTemplateSignal(entry) {
+  cantonTemplateSignalLog.unshift({ at: new Date().toISOString(), ...entry });
+  if (cantonTemplateSignalLog.length > 100) cantonTemplateSignalLog.length = 100;
+}
+app.get('/debug/canton-template-signal-log', (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json(cantonTemplateSignalLog);
+});
+
 // ── PRIMARY: AISENSY INCOMING-MESSAGE WEBHOOK ──
 // Confirmed payload shape (v3.0.1 full logging, 5 Jul 2026):
 // { id, created_at, topic:"message.sender.user", project_id, delivery_attempt,
@@ -3841,6 +3955,22 @@ app.post('/webhook/incoming', async (req, res) => {
       recordCantonReferral({ phone, source: adReferral.source, text: adReferral.text, raw: adReferral.raw });
     }
 
+    // Broadcast template quick-reply buttons ("Send me details"/"Call me
+    // back") send only that generic text — no destination word, no
+    // broadcast code — so they'd otherwise miss isCantonEnquiry() entirely.
+    // Reuses the existing, already-tested broadcastCode match path rather
+    // than adding a new parameter to isCantonEnquiry()/canton-product.js: a
+    // detected template signal is treated exactly like the customer having
+    // typed the [CANTON] broadcast code themselves. A literal broadcast
+    // code already present in the text (bc.code above) always wins — this
+    // only fills in when there wasn't one.
+    const templateSignal = extractCantonTemplateSignal(b, text);
+    if (templateSignal.isCantonSignal || Object.keys(templateSignal.raw).length) {
+      console.log(`🔘 [${phone}] canton template signal: match=${templateSignal.isCantonSignal} reasons=${templateSignal.reasons.join('; ') || 'none'}`);
+      recordCantonTemplateSignal({ phone, text, ...templateSignal });
+    }
+    const effectiveBroadcastCode = broadcastCode || (templateSignal.isCantonSignal ? 'CANTON' : '');
+
     if (!text) {
       console.log(`Incoming from ${phone}: empty/media-only (${msgType || 'unknown type'}) — sending fallback reply.`);
       const lastSent = mediaFallbackSentAt.get(phone) || 0;
@@ -3858,7 +3988,7 @@ app.post('/webhook/incoming', async (req, res) => {
     // REPLY-FIRST: the send happens via onReply the moment Claude answers.
     await withPhoneLock(phone, () =>
       mayaTurn(phone, text, reply => sendSessionMessage(phone, reply), 'whatsapp', null,
-        broadcastCode ? { whatsapp_broadcast_code: broadcastCode } : null,
+        effectiveBroadcastCode ? { whatsapp_broadcast_code: effectiveBroadcastCode } : null,
         adReferral.text)
     );
   } catch (e) {

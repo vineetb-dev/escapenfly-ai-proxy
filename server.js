@@ -437,6 +437,83 @@ function looksLikeSpam(text) {
   return SPAM_KEYWORDS.some(k => t.includes(k));
 }
 
+// ── AUTO-RESPONDER DETECTION (11 Sep 2026) ──
+// Found live: 64 of ~96 broadcast-triggered conversations that day were
+// OTHER businesses' own WhatsApp Business auto-replies firing back at our
+// broadcast template, and Maya answered every one — a bot explaining
+// itself to a bot (real example: Dr. Apoorva Garg's clinic auto-reply got
+// "it looks like there's been a mix-up — this is EscapeNFly, not Dr.
+// Apoorva Garg's office...").
+//
+// TIMING SIGNAL — NOT IMPLEMENTED, flagged rather than faked. The intended
+// primary signal (elapsed time since OUR outbound template was delivered
+// to that number) needs a send timestamp this server does not have: the
+// broadcast itself is sent directly from AiSensy's own campaign dashboard,
+// never through this codebase (no bulk-send endpoint exists here) — so
+// there is no `sent_at` to measure against. Would need either AiSensy
+// forwarding a delivery-status webhook this app could correlate (unconfirmed
+// shape — same "don't guess it" discipline as extractAdReferral/
+// extractCantonTemplateSignal above) or a known broadcast-batch schedule to
+// approximate against. TEXT PATTERNS + SHAPE below are what's actually
+// running, which changes the risk profile from what was designed: these
+// were meant to back up timing, not carry detection alone.
+//
+// ASYMMETRIC RISK, different from the Canton-match false-positive case: a
+// false positive there costs one odd extra question (recoverable). A false
+// positive HERE is total silence to a REAL customer — worse and easy to
+// miss, since nothing looks wrong on our side. A couple of these patterns
+// (e.g. "will get back to you as soon as ...") are plausible things a real
+// customer says too. Mitigated by gating on FIRST MESSAGE ONLY (see the
+// call site) — a real auto-responder only ever fires immediately on first
+// contact, never mid-conversation, so requiring "no prior chat history"
+// costs nothing against the actual failure mode while protecting every
+// message in an already-open conversation.
+const AUTO_RESPONDER_PATTERNS = [
+  /\bthank you for (contacting|your message|reaching out)\b/i,
+  /\bwe(?:'re| are) (?:currently )?unavailable\b/i,
+  /\bwill (?:get back|respond) to you as soon as\b/i,
+  /\bplease let us know how we can help\b/i,
+  /\bthis is an automated (?:reply|message|response)\b/i,
+  /\bout of office\b/i,
+  // Hindi "thank you for contacting us / we'll be in touch soon" —
+  // APPROXIMATE: built from the reported pattern, not the literal string
+  // seen (not shared with this app) — tighten once a real example is
+  // available via /debug/auto-responder-log or a pasted sample.
+  /धन्यवाद[^।!.\n]{0,50}(संपर्क|जल्द)|(संपर्क|जल्द)[^।!.\n]{0,50}धन्यवाद/
+];
+
+// "Thank you for contacting <Name>!" where <Name> isn't us — a third-party
+// business's own greeting arriving at OUR number is near-conclusive on its
+// own even with no other pattern match.
+const THIRD_PARTY_GREETING_RE = /\bthank you for contacting\s+([^!.\n]{2,60})[!.]?/i;
+const OWN_BRAND_RE = /escape\s*n?\s*'?fly/i;
+
+function looksLikeAutoResponder(text) {
+  const t = String(text || '');
+  for (const re of AUTO_RESPONDER_PATTERNS) {
+    if (re.test(t)) return { matched: true, signal: 'text-pattern', detail: re.source };
+  }
+  const m = t.match(THIRD_PARTY_GREETING_RE);
+  if (m && !OWN_BRAND_RE.test(m[1])) {
+    return { matched: true, signal: 'third-party-greeting', detail: m[1].trim() };
+  }
+  return { matched: false };
+}
+
+// Ring buffer, same shape as every other debug log in this file — records
+// every skip (for tuning the pattern list) AND every "matched but let
+// through because mid-conversation" case (to judge the first-message gate
+// itself, not just the detector).
+const autoResponderLog = [];
+function recordAutoResponderEvent(entry) {
+  autoResponderLog.unshift({ at: new Date().toISOString(), ...entry });
+  if (autoResponderLog.length > 100) autoResponderLog.length = 100;
+}
+app.get('/debug/auto-responder-log', (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  res.json(autoResponderLog);
+});
+
 // ── CLAUDE-BASED ASSIGNMENT (primary) ──
 async function assignTeamWithClaude(data) {
   const teamList = Object.entries(TEAM).filter(([k, t]) => t.dept !== 'Admin' && t.dept !== 'Founder' && !DEPARTED_KEYS.includes(k))
@@ -3939,6 +4016,22 @@ app.post('/webhook/incoming', async (req, res) => {
       console.log(`🤝 [${phone}] DMC vendor number — skipping Maya customer flow, sending ack instead.`);
       await sendSessionMessage(phone, "Thanks for the response — forwarding to our team.");
       return;
+    }
+
+    const autoResponderCheck = looksLikeAutoResponder(text);
+    if (autoResponderCheck.matched) {
+      // Gated to first-message-only — see looksLikeAutoResponder's own
+      // comment for why. Costs one extra loadChat() read, only on messages
+      // that already matched a pattern (not every message).
+      const priorChat = await loadChat(phone);
+      const isFirstMessage = !priorChat.msgs || priorChat.msgs.length === 0;
+      if (isFirstMessage) {
+        console.log(`🤖 [${phone}] auto-responder detected (${autoResponderCheck.signal}: ${autoResponderCheck.detail}) — skipping Maya, no reply, no lead, contact stays live: "${short(text)}"`);
+        recordAutoResponderEvent({ phone, text, skipped: true, ...autoResponderCheck });
+        return;
+      }
+      console.log(`🤖 [${phone}] auto-responder-shaped text but mid-conversation — treating as real, replying normally (${autoResponderCheck.signal})`);
+      recordAutoResponderEvent({ phone, text, skipped: false, ...autoResponderCheck });
     }
 
     const bc = extractBroadcastCode(text);

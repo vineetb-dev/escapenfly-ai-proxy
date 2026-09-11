@@ -811,7 +811,17 @@ const VISA_INTEL_ALIASES = {
   'uae': 'dubai', 'emirates': 'dubai',
   'indonesia': 'bali',
   'korea': 'south korea',
-  'almaty': 'kazakhstan'
+  'almaty': 'kazakhstan',
+  // 10 Sep 2026 (Canton Fair): a customer says "Canton fair"/"Canton", never
+  // "China" or "Guangzhou" literally, on the turn that actually needs this
+  // lookup — found live, the same day visa_intelligence's china/guangzhou
+  // rows went verified: without this, Layer 0 (see applyVisaSafetyBackstop)
+  // saw no verified data on that turn, so the backstop ran live against
+  // whatever Maya said instead of trusting the now-verified row that
+  // genuinely covers this destination. founder_notes already has its own
+  // literal 'canton fair' row so that lookup was never affected — this is
+  // visa_intelligence-only, same gap class every other entry above fixes.
+  'canton fair': 'china', 'canton': 'china', 'kanton': 'china'
 };
 
 let visaIntelKeyListCache = { keys: null, fetchedAt: 0 };

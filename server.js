@@ -17,11 +17,12 @@ const { z } = require('zod');
 // specific /internal/sync-* request that needs it, not at server startup.
 const { runSync: runMetaSync } = require('./meta-sync');
 const { runSync: runGoogleSync } = require('./google-sync');
-// Canton Fair product knowledge (10 Sep 2026) — see canton-product.js. Pure,
-// dependency-free logic (keyword/campaign/referral matching + the knowledge
-// block itself), safe to require eagerly like the two sync modules above.
-// Self-expiring (CANTON_EXPIRES_AT, 15 Oct 2026) — do not remove that guard.
-const { isCantonEnquiry, CANTON_KNOWLEDGE, CANTON_EXPIRES_AT } = require('./canton-product');
+// canton-product.js / isCantonEnquiry() RETIRED (12 Sep 2026) — replaced by
+// the campaign_for_contact() DB lookup (see getCampaignForContact() below).
+// canton-product.js itself is left in the repo untouched (not deleted), just
+// no longer required from here — see the campaign-resolution section for why
+// the DB lookup is strictly better (phone-binding-first, keyword fallback,
+// sells_until instead of a hardcoded expiry constant).
 // Document store (3 Sept 2026) — JWT for domain-wide-delegation impersonation
 // (already a dependency, google-sync.js uses the same package's GoogleAuth
 // class for GA4's service account), multer for multipart file uploads (new
@@ -493,10 +494,21 @@ function looksLikeSpam(text) {
 function normalizeApostrophes(text) {
   return String(text || '').replace(/[‘’ʼ]/g, "'");
 }
+// D. Added 12 Sep 2026 — the 3 patterns above caught 0 of 20 auto-responders
+// in a later traffic sample: different WhatsApp Business accounts, different
+// exact template wording than the Day 1 ground truth A/B/C were built from.
+// Anchored to the START of the message (not a bare substring match like A/B)
+// — that anchor is specifically what lets this stay safe against the same
+// "Hi Sir Yes... thank you for contacting us" human false positive: the real
+// reply doesn't open with the greeting, it opens with "Hi Sir Yes". Verified
+// against real traffic: catches 9 of 20, zero false positives.
+const AUTO_RESPONDER_START_RE = /^\s*(thank(s| you) for (contacting|getting in touch|reaching out|showing interest)|welcome to|dear (guest|valued customer))/i;
+
 const AUTO_RESPONDER_PATTERNS = [
   { signal: 'default-greeting', re: /please let us know how we can help you\b/i },
   { signal: 'default-away-message', re: /thank you for your message\.?\s*we'?re unavailable right now,?\s*but will respond as soon as possible/i },
-  { signal: 'default-away-message-hindi', re: /उपलब्ध नहीं/ }
+  { signal: 'default-away-message-hindi', re: /उपलब्ध नहीं/ },
+  { signal: 'anchored-opening', re: AUTO_RESPONDER_START_RE }
 ];
 
 function looksLikeAutoResponder(text) {
@@ -621,8 +633,18 @@ function intentToEnquiryType(intent, destination) {
 //   msgs          → conversation history (assistant entries = reply text only)
 //   last_lead_sig → JSON {known:{...lead fields...}, sig:"<change-detection>"}
 //   last_msg/last_reply/muted/updated_at → as before
+// campaign_code/broadcast_code/lead_source/pdf_sent_at/handed_over_at (12 Sep
+// 2026) → real top-level columns, NOT gated by the 24h freshness TTL below.
+// These are durable facts about this phone's relationship to a campaign
+// (has the link been sent, has handover happened), not conversational
+// context that should go stale — same "survives expiry" treatment as
+// `muted`. This is also what replaces the old per-conversation
+// `chat.cantonMatch` sticky flag: the durable state now lives in the
+// campaign_contacts binding table (see getCampaignForContact()), which
+// campaign_for_contact() re-resolves correctly every turn regardless of
+// ai_chats row freshness, so there's no JS-side sticky flag to maintain.
 function emptyChat(phone) {
-  return { phone, msgs: [], lastMsg: null, lastReply: null, known: {}, sig: null, cantonMatch: false, muted: false, lastUpdatedMs: 0 };
+  return { phone, msgs: [], lastMsg: null, lastReply: null, known: {}, sig: null, muted: false, campaignCode: null, broadcastCode: null, leadSource: null, pdfSentAt: null, handedOverAt: null, lastUpdatedMs: 0 };
 }
 
 async function loadChat(phone) {
@@ -643,14 +665,12 @@ async function loadChat(phone) {
       lastReply: row.last_reply,
       known: (fresh && leadBox.known) ? leadBox.known : {},
       sig: fresh ? (leadBox.sig || null) : null,
-      // Canton Fair (10 Sep 2026) — sticky per-conversation flag, kept OUT
-      // of `known` deliberately: `known` is both shown to Claude verbatim
-      // (knownLine) and whitelisted field-by-field into the CRM lead row
-      // (buildLeadFields) — this boolean belongs to neither. Same freshness
-      // gating as known/sig: an expired (24h+) chat re-derives it fresh
-      // rather than carrying a stale match forward.
-      cantonMatch: fresh ? !!leadBox.cantonMatch : false,
       muted: !!row.muted, // mute survives expiry (manual flag)
+      campaignCode: row.campaign_code || null,
+      broadcastCode: row.broadcast_code || null,
+      leadSource: row.lead_source || null,
+      pdfSentAt: row.pdf_sent_at || null,
+      handedOverAt: row.handed_over_at || null,
       lastUpdatedMs: new Date(row.updated_at).getTime()
     };
   } catch (e) {
@@ -669,8 +689,13 @@ async function saveChat(chat) {
         msgs: chat.msgs,
         last_msg: chat.lastMsg,
         last_reply: chat.lastReply,
-        last_lead_sig: JSON.stringify({ known: chat.known || {}, sig: chat.sig || null, cantonMatch: !!chat.cantonMatch }),
+        last_lead_sig: JSON.stringify({ known: chat.known || {}, sig: chat.sig || null }),
         muted: chat.muted,
+        campaign_code: chat.campaignCode || null,
+        broadcast_code: chat.broadcastCode || null,
+        lead_source: chat.leadSource || null,
+        pdf_sent_at: chat.pdfSentAt || null,
+        handed_over_at: chat.handedOverAt || null,
         updated_at: new Date().toISOString()
       })
     }, 'SB-saveChat');
@@ -880,6 +905,90 @@ async function loadVisaIntelligence(destination) {
     return rows[0] || null; // exact match only — same discipline as loadFounderNotes, no fuzzy substring fallback
   } catch (e) {
     console.error('loadVisaIntelligence error:', e.message);
+    return null;
+  }
+}
+
+// ── CAMPAIGN RESOLUTION (12 Sep 2026) — replaces isCantonEnquiry()/canton-product.js ──
+// campaign_for_contact(p_phone, p_text) is a DB-side function (not written
+// here — DB side is already migrated and live): binding-by-phone against
+// campaign_contacts takes priority (order by bound_at desc), keyword match
+// against campaigns.keywords is a fallback ONLY for phones with no live
+// binding at all, and sells_until is checked inside the function itself —
+// nothing to re-check or expire in JS. Strictly better than the retired
+// JS-side heuristics (keyword/tag/button/referral-headline matching): one
+// deterministic lookup instead of five, and the binding is durable across
+// the whole relationship, not just one ai_chats row.
+async function getCampaignForContact(phone, text) {
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/rpc/campaign_for_contact`, {
+      method: 'POST',
+      headers: SB_HEADERS,
+      body: JSON.stringify({ p_phone: phone, p_text: text || null })
+    }, 'SB-campaignForContact');
+    if (!r.ok) { console.error('campaign_for_contact failed:', r.status, await r.text()); return null; }
+    const rows = await r.json();
+    return rows[0] || null;
+  } catch (e) {
+    console.error('campaign_for_contact error:', e.message);
+    return null;
+  }
+}
+
+// Upserts a durable campaign_contacts binding, channel:'inbound', the moment
+// a phone with no existing binding matches a campaign purely by keyword.
+// Not explicitly spelled out in the brief, but inferred from the schema
+// itself: campaign_contacts_channel_check allows 'whatsapp_broadcast',
+// 'meta_ad', 'inbound', 'manual' — 'inbound' has no other purpose than
+// exactly this case. Without it, the EXACT bug class already found and
+// fixed once before (turn 2's "which phase?" carries no keyword of its own)
+// would reappear for any customer who reaches Maya organically rather than
+// via a pre-bound broadcast/ad contact.
+async function bindInboundKeywordMatch(phone, campaignCode) {
+  try {
+    const r = await fetchRetry(`${SB_URL}/rest/v1/campaign_contacts?on_conflict=phone,campaign_code`, {
+      method: 'POST',
+      headers: { ...SB_HEADERS, Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify({ phone, campaign_code: campaignCode, channel: 'inbound', bound_at: new Date().toISOString() })
+    }, 'SB-bindInbound');
+    if (!r.ok) console.error('bindInboundKeywordMatch failed:', r.status, await r.text());
+  } catch (e) {
+    console.error('bindInboundKeywordMatch error:', e.message);
+  }
+}
+
+// ── META CLICK-TO-WHATSAPP AD BINDING (Change C, 12 Sep 2026) ──
+// Meta CTWA sends a `referral` object on the inbound webhook, NOT a
+// `context` object — confirmed, not the "unconfirmed shape" guesswork the
+// old extractAdReferral()/extractCantonTemplateSignal() were built under.
+// That mismatch was the entire 0% ad-attribution gap: nothing before this
+// ever looked at msg.referral.source_id at all. Upserts the binding BEFORE
+// campaign resolution happens, so the ad click resolves correctly on this
+// very first turn instead of only from turn 2 onward.
+async function bindMetaAdClick(phone, referral) {
+  const sourceId = referral?.source_id;
+  if (!sourceId) return null;
+  try {
+    const campR = await fetchRetry(`${SB_URL}/rest/v1/campaigns?platform_ad_ids=cs.{${sourceId}}&status=eq.live&select=campaign_code&limit=1`, { headers: SB_HEADERS }, 'SB-adCampaignLookup');
+    if (!campR.ok) { console.error('ad campaign lookup failed:', campR.status, await campR.text()); return null; }
+    const rows = await campR.json();
+    const campaignCode = rows[0]?.campaign_code;
+    if (!campaignCode) {
+      console.log(`📎 [${phone}] meta_ad click source_id=${sourceId} matched no live campaign`);
+      recordCantonReferral({ phone, source: 'meta_ad', sourceId, campaignCode: null, bound: false, raw: referral });
+      return null;
+    }
+    const r = await fetchRetry(`${SB_URL}/rest/v1/campaign_contacts?on_conflict=phone,campaign_code`, {
+      method: 'POST',
+      headers: { ...SB_HEADERS, Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify({ phone, campaign_code: campaignCode, channel: 'meta_ad', ad_id: sourceId, ctwa_clid: referral.ctwa_clid || null, bound_at: new Date().toISOString() })
+    }, 'SB-bindMetaAd');
+    if (!r.ok) { console.error('bindMetaAdClick upsert failed:', r.status, await r.text()); return null; }
+    console.log(`📎 [${phone}] bound to ${campaignCode} via meta_ad (source_id=${sourceId})`);
+    recordCantonReferral({ phone, source: 'meta_ad', sourceId, campaignCode, bound: true, raw: referral });
+    return { campaignCode, sourceId, ctwaClid: referral.ctwa_clid || null };
+  } catch (e) {
+    console.error('bindMetaAdClick error:', e.message);
     return null;
   }
 }
@@ -1254,7 +1363,12 @@ const ATTRIBUTION_KEYS = [
   'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
   'gclid', 'fbclid', 'landing_page', 'referrer',
   'platform_campaign_id', 'platform_adset_id', 'platform_ad_id',
-  'whatsapp_broadcast_code'
+  'whatsapp_broadcast_code',
+  // 12 Sep 2026 (Change D) — the one genuinely new attribution fact the
+  // campaign_for_contact() lookup adds: which campaign this lead actually
+  // came from. Same first-touch-wins, column-AND-blob discipline as every
+  // other key here.
+  'campaign_code'
 ];
 
 // ── NON-EMPTY-ONLY MERGE: fresh values win only when they carry information ──
@@ -1378,12 +1492,17 @@ function buildLeadFields(data, isNew = false) {
   }
 
   // first_touch_source: derived once, at creation only (isNew) — an UPDATE
-  // must never relabel where this lead originally came from.
+  // must never relabel where this lead originally came from. utm_source
+  // still wins first (real tagged website traffic), but a WhatsApp lead has
+  // neither a utm_source nor a referrer URL — Change D (12 Sep 2026) adds
+  // the two campaign-derived fallbacks that actually apply to that case,
+  // ahead of the old referrer/'direct' catch-all.
   const firstTouchFields = {};
   if (isNew) {
     let referrerHost = '';
     try { referrerHost = data.referrer ? new URL(data.referrer).hostname : ''; } catch (e) {}
-    firstTouchFields.first_touch_source = cap(data.utm_source || referrerHost || 'direct', 120);
+    const campaignDerivedSource = data.whatsapp_broadcast_code ? 'whatsapp_broadcast' : (data.platform_ad_id ? 'meta_ad' : '');
+    firstTouchFields.first_touch_source = cap(data.utm_source || campaignDerivedSource || referrerHost || 'direct', 120);
   }
 
   return {
@@ -3056,7 +3175,7 @@ const MAYA_REPLY_TOOL = {
 // Claude call using forced tool-use for guaranteed-valid structured output.
 // v3.1: known lead info is injected via the system prompt (token diet —
 // history no longer carries full JSON blobs).
-async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotesList = [], visaIntelList = [], intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, cantonMatch = false, debugRef = null, model = CHAT_MODEL) {
+async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNotesList = [], visaIntelList = [], intent = null, liveWeather = null, forexRate = null, enquiryStatus = null, pastDestinations = [], returningProfile = {}, camp = null, debugRef = null, model = CHAT_MODEL) {
   const todayStr = new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Asia/Kolkata' });
   const currentDateLine = `\n\nTODAY'S ACTUAL DATE: ${todayStr}. Use this to reason correctly about relative time — if a customer says a month without a year (e.g. "December"), assume the NEXT upcoming occurrence of that month from today's real date, not a past or arbitrary year. NEVER offer already-past years as options when asking a customer to confirm their travel year.`;
   const knownLine = (known && Object.values(known).some(v => v))
@@ -3126,16 +3245,16 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
   const returningProfileLine = (returningProfile && returningProfile.name)
     ? `\n\nRETURNING CUSTOMER (real profile from a previous visit — this is the START of a new conversation, so use this to avoid re-asking what you already know): name is ${returningProfile.name}${returningProfile.destination ? `, last discussed ${returningProfile.destination}` : ''}${returningProfile.travelMonth ? ` for ${returningProfile.travelMonth}` : ''}. You may greet them by name naturally (e.g. "Hi ${returningProfile.name}!") but do not assume they want the SAME trip again — confirm what they're looking for this time rather than assuming continuity.`
     : '';
-  // Canton Fair (10 Sep 2026) — genuinely per-conversation (only a small
-  // fraction of turns are Canton enquiries), so this MUST stay on the
-  // dynamic/uncached tail below, never folded into buildChatSystem()'s
-  // output above — that block is the cached prefix shared by every
-  // conversation in a (channel, intent) bucket, Canton or not, and mixing a
-  // conditional block into it would invalidate that shared cache prefix on
-  // every single turn, Canton or not. isCantonEnquiry() itself already
-  // self-expires (CANTON_EXPIRES_AT) so this line goes quiet on its own
-  // after bookings close.
-  const cantonLine = cantonMatch ? '\n\n' + CANTON_KNOWLEDGE : '';
+  // Campaign knowledge (12 Sep 2026, replaces the old Canton-only cantonLine)
+  // — genuinely per-conversation (only a fraction of turns match a live
+  // campaign), so this MUST stay on the dynamic/uncached tail below, never
+  // folded into buildChatSystem()'s output above — that block is the cached
+  // prefix shared by every conversation in a (channel, intent) bucket,
+  // campaign or not, and mixing a conditional block into it would
+  // invalidate that shared cache prefix on every single turn. `camp` is
+  // resolved once per turn by getCampaignForContact() (mayaTurn), which
+  // itself already respects sells_until — nothing to re-check here.
+  const campaignLine = camp?.knowledge ? '\n\n' + camp.knowledge : '';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
@@ -3167,7 +3286,7 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
           max_tokens: 600,
           system: [
             { type: 'text', text: buildChatSystem(channel, intent), cache_control: { type: 'ephemeral' } },
-            { type: 'text', text: currentDateLine + knownLine + founderLine + visaLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine + cantonLine }
+            { type: 'text', text: currentDateLine + knownLine + founderLine + visaLine + liveDataLine + statusLine + pastDestinationsLine + returningProfileLine + campaignLine }
           ],
           messages: msgs,
           tools: [MAYA_REPLY_TOOL],
@@ -3265,7 +3384,7 @@ async function isDmcVendorNumber(phone) {
 const FALLBACK_REPLY = 'Thanks for your message! Our travel expert will call you shortly. You can also reach us directly at +91 98517 39851. 😊';
 const UNSUPPORTED_MEDIA_REPLY = "Thanks for sharing that! I work best with text messages right now, so I can't open images, documents, or links yet. For general enquiries, please call us at +91 98517 39851. For partner & DMC queries, contact Vivek Bansal at 9988740145. For complaints or urgent issues, contact Vineet Bansal at 9216320050. Just type your travel query in words and I'll help right away!";
 
-async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef = null, attribution = null, adReferralText = '') {
+async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef = null, attribution = null) {
   const t0 = Date.now();
   const log = { intent: '-', crm: 'none', notify: '-' };
   let tAI = t0, tSent = t0;
@@ -3350,41 +3469,54 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     const returningProfile = (isNewSession && validPhone(statusLookupPhone))
       ? await loadCustomerProfile(statusLookupPhone) : {};
 
-    // ── CANTON FAIR PRODUCT MATCH (10 Sep 2026) ──
-    // Checked here, not inside callMayaJSON, because the signal sources vary
-    // by WHEN they were captured: broadcastCode/campaignCode from a click-to-
-    // WhatsApp lead's very first message are only visible via THIS turn's
-    // `attribution` argument (chat.known won't have them merged in until
-    // after this turn's reply — see the ATTRIBUTION_KEYS merge further
-    // below), but from the second message onward they already live in
-    // chat.known (first-touch-persisted). Checking both covers turn 1 and
-    // every later turn without re-asking the customer to repeat a code they
-    // never typed themselves in the first place.
-    //
-    // STICKY, deliberately: isCantonEnquiry() only ever looks at THIS turn's
-    // signals, but a real Canton conversation's own turn 2+ routinely carries
-    // none of them — "we import LED lights, which phase?" has no Canton
-    // keyword, no broadcast/campaign code, no ad referral of its own; it
-    // only makes sense as an answer to turn 1's "what do you source?". Once
-    // a conversation matches on any turn, chat.cantonMatch (persisted
-    // alongside known/sig — see loadChat/saveChat) keeps it matched for the
-    // rest of THIS conversation. Still re-runs isCantonEnquiry() rather than
-    // trusting the stored flag forever, specifically so a conversation that
-    // straddles CANTON_EXPIRES_AT stops getting the knowledge block the
-    // moment bookings actually close, same as a fresh match would.
-    const cantonNow = new Date();
-    const cantonSignalMatch = isCantonEnquiry({
-      text: message,
-      broadcastCode: chat.known?.whatsapp_broadcast_code || attribution?.whatsapp_broadcast_code || '',
-      campaignCode: chat.known?.campaign_code || '',
-      adReferral: adReferralText,
-      now: cantonNow
-    });
-    const cantonMatch = cantonSignalMatch || (chat.cantonMatch && cantonNow <= CANTON_EXPIRES_AT);
-    chat.cantonMatch = cantonMatch; // persisted via saveChat() at the end of this turn
+    // ── CAMPAIGN RESOLUTION (12 Sep 2026) — replaces isCantonEnquiry() ──
+    // Resolved fresh every turn: campaign_for_contact() is a cheap, indexed,
+    // phone-binding-first lookup, and the durable state now lives in the
+    // campaign_contacts table, not in any JS-side sticky flag (see
+    // emptyChat/loadChat/saveChat's comment on what this replaced).
+    const camp = await getCampaignForContact(phone, message);
+    // A phone with no existing binding that matches purely by keyword gets
+    // one now, fire-and-forget — see bindInboundKeywordMatch's own comment
+    // for why this isn't optional. Self-limiting: once bound, matched_by
+    // becomes 'binding:inbound' on every later turn, so this only ever
+    // fires once per phone per campaign.
+    if (camp?.matched_by === 'keyword') {
+      bindInboundKeywordMatch(phone, camp.campaign_code).catch(() => {});
+    }
+
+    // ── SEND THE LINK FIRST (Change B, 12 Sep 2026) ──
+    // Deterministic, code-driven — never left to the LLM to type the URL
+    // correctly or remember to include it. Gated on pdf_sent_at IS NULL so
+    // this can only ever fire once per conversation, never once per
+    // message; pdf_sent_at is set below ONLY from these calls' actual
+    // success response, never optimistically. If pdf_url is null (not yet
+    // configured for this campaign), skip silently — no error, no
+    // fallback text.
+    let pdfJustSentAt = null;
+    if (camp?.pdf_url && !chat.pdfSentAt && onReply) {
+      const sentIntro = await onReply(camp.opening_line);
+      const sentLink = sentIntro !== false ? await onReply(camp.pdf_url) : false;
+      if (sentIntro !== false && sentLink !== false) {
+        pdfJustSentAt = new Date().toISOString();
+        console.log(`🔗 [${phone}] campaign link sent (${camp.campaign_code})`);
+      } else {
+        console.log(`⚠️ [${phone}] campaign link send failed — will retry next turn (${camp.campaign_code})`);
+      }
+    }
+    // Set on `chat` immediately (not deferred to the end of the function) so
+    // BOTH saveChat() call sites in this turn — including the early
+    // Claude-failure fallback just below — persist it. campaignCode/
+    // leadSource reflect this turn's live resolution (campaign_for_contact's
+    // own binding-first lookup already provides durability across turns —
+    // no extra JS-side stickiness needed); pdfSentAt/broadcastCode preserve
+    // whatever was already true rather than ever being blanked back to null.
+    chat.campaignCode = camp?.campaign_code || null;
+    chat.leadSource = camp?.matched_by || null;
+    chat.pdfSentAt = chat.pdfSentAt || pdfJustSentAt || null;
+    chat.broadcastCode = chat.broadcastCode || attribution?.whatsapp_broadcast_code || null;
 
     const debugRef = {};
-    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotesList, visaIntelList, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations, returningProfile, cantonMatch, debugRef);
+    const parsed = await callMayaJSON(chat.msgs, chat.known, phone, channel, founderNotesList, visaIntelList, effectiveIntent, liveWeather, forexRate, enquiryStatus, pastDestinations, returningProfile, camp, debugRef);
     tAI = Date.now();
 
     if (!parsed) {
@@ -3441,7 +3573,13 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       nextAction: parsed.next_action || '',
       handover: !!parsed.handover,
       query: message,
-      source: channel === 'website' ? 'website-ai-chat' : 'whatsapp-ai-chat'
+      source: channel === 'website' ? 'website-ai-chat' : 'whatsapp-ai-chat',
+      // Change D (12 Sep 2026) — set directly from `camp`, not via the
+      // `attribution` object below: camp is resolved fresh every turn by
+      // getCampaignForContact(), it isn't something a caller passes in.
+      // First-touch semantics apply the same as every other ATTRIBUTION_KEYS
+      // field (existing wins) once it's added to that list below.
+      campaign_code: camp?.campaign_code || ''
     };
     // Whitelist only — never spread the request body, so a crafted POST
     // cannot inject arbitrary columns. See ATTRIBUTION_KEYS above
@@ -3453,6 +3591,9 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       }
     }
     chat.known = mergeLeadData(chat.known || {}, freshData);
+    // Change D — ai_chats.handed_over_at, set once, the first time handover
+    // happens, and never touched again (mirrors pdf_sent_at's discipline).
+    if (parsed.handover && !chat.handedOverAt) chat.handedOverAt = new Date().toISOString();
 
     // ── WEBSITE SESSION → PHONE GRADUATION (§11) ──
     let effectivePhone = phone;
@@ -3794,53 +3935,19 @@ function extractBroadcastCode(text) {
   };
 }
 
-// ── CLICK-TO-WHATSAPP AD REFERRAL (10 Sep 2026, Canton Fair campaign) ──
-// A Meta click-to-WhatsApp ad (e.g. CANTON-OCT26) opens WhatsApp with the
-// ad's own pre-filled greeting ("Hello! Can I get more info on this?") — no
-// destination word, no broadcast code. WhatsApp's own `referral` object
-// (the ad creative's headline/body) is the only signal identifying which ad
-// sent this lead. UNLIKE extractBroadcastCode() above, this is genuinely
-// UNVERIFIED against real traffic: the "Confirmed payload shape" comment on
-// /webhook/incoming below (5 Jul 2026 full-logging session) never included a
-// referral object, because nothing before today asked AiSensy for one.
-// Checks the couple of plausible locations a BSP would put it, then falls
-// back to a deep scan (same defensive posture as deepExtract() above) for a
-// `referral` key anywhere in the payload. Every match (or payload that looks
-// referral-shaped but didn't parse cleanly) is logged to
-// /debug/canton-referral-log specifically so the real shape can be confirmed
-// off the first live Meta ad click tomorrow, rather than assumed from docs.
-function extractAdReferral(body) {
-  const msg = body?.data?.message || {};
-  const candidates = [msg.referral, body?.data?.referral, body?.referral, msg.message_content?.referral];
-  let referral = candidates.find(c => c && typeof c === 'object');
-  let source = referral ? 'direct' : 'none';
-
-  if (!referral) {
-    // Deep scan — same shape as deepExtract(), but this field's presence and
-    // key name are unconfirmed, so this is a best-effort fallback, not a
-    // guaranteed catch.
-    const seen = new Set();
-    const visit = (o, depth) => {
-      if (referral || !o || typeof o !== 'object' || depth > 6 || seen.has(o)) return;
-      seen.add(o);
-      for (const [k, v] of Object.entries(o)) {
-        if (String(k).toLowerCase() === 'referral' && v && typeof v === 'object') { referral = v; return; }
-        if (v && typeof v === 'object') visit(v, depth + 1);
-      }
-    };
-    visit(body, 0);
-    if (referral) source = 'deep-scan';
-  }
-
-  if (!referral) return { text: '', raw: null, source: 'none' };
-  const headline = String(referral.headline || referral.title || '').trim();
-  const bodyText = String(referral.body || referral.description || '').trim();
-  return { text: `${headline} ${bodyText}`.trim(), raw: referral, source };
-}
-
-// Ring buffer, same shape as webhookSigLog/stackedQuestionLog above — only
-// logs when SOMETHING referral-shaped was found (or the deep scan ran and
-// found nothing), so normal non-ad WhatsApp traffic doesn't fill this up.
+// extractAdReferral() / extractCantonTemplateSignal() RETIRED (12 Sep 2026).
+// Both were built to guess campaign membership from unconfirmed payload
+// shapes (referral headline text, contact tags, button objects, message-
+// text fallback) precisely because there was no durable, authoritative
+// source of truth to check against. There is now: campaign_contacts, a real
+// binding table covering all 6,077 broadcast recipients (button taps
+// included — verified directly: the exact case that used to need the old
+// text-fallback resolves correctly via binding:whatsapp_broadcast with zero
+// text matching at all). Meta ad clicks get the equivalent treatment below
+// (bindMetaAdClick, Change C) — confirmed, not guessed: Meta CTWA sends a
+// `referral` object with a real `source_id` (the ad ID), not `context`,
+// which is the actual reason ad attribution was stuck at 0% — nothing
+// before today ever looked at that field.
 const cantonReferralLog = [];
 function recordCantonReferral(entry) {
   cantonReferralLog.unshift({ at: new Date().toISOString(), ...entry });
@@ -3849,120 +3956,6 @@ function recordCantonReferral(entry) {
 app.get('/debug/canton-referral-log', (req, res) => {
   if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
   res.json(cantonReferralLog);
-});
-
-// ── CANTON BROADCAST TEMPLATE-REPLY SIGNAL (11 Sep 2026) ──
-// Found live, same afternoon the 1,863-contact broadcast went out: tapping
-// the template's "Send me details"/"Call me back" quick-reply button sends
-// EXACTLY that button text as the message and nothing else (confirmed by
-// AiSensy's own docs — "the text in the buttons becomes the user's
-// message" — https://aisensy.com/tutorials/how-to-add-quick-replies-to-template-message)
-// — no destination word, no broadcast code, so isCantonEnquiry() missed it
-// and this was the majority of broadcast replies, not an edge case.
-//
-// THREE candidate signals, all genuinely unconfirmed against real AiSensy
-// traffic before today (same caveat as extractAdReferral above — this is
-// best-effort, logged so the real shape can be confirmed from live replies
-// that are arriving right now, not assumed):
-//   1. AiSensy contact tags (canton_day1/2/3) — every broadcast recipient
-//      has one, so if the incoming payload exposes tags at all, this is the
-//      most reliable signal (Canton-specific by construction, near-zero
-//      collision risk with any other campaign).
-//   2. A template/campaign-name-ish field containing "canton" anywhere in
-//      the payload.
-//   3. The button's own text/payload exactly matching one of the two known
-//      Canton quick-reply labels. Deliberately the WEAKEST signal of the
-//      three — "Send me details"/"Call me back" are generic CTA phrasing
-//      that a future non-Canton broadcast could plausibly reuse, which
-//      would misfire this. Kept anyway because it is the one signal
-//      guaranteed to be present today (AiSensy's own docs confirm the
-//      button text always becomes the message) while 1 and 2 depend on
-//      payload fields this app has never actually seen. Risk asymmetry
-//      favors this: over-matching costs an odd "what do you source"
-//      question to a non-Canton lead (recoverable, no safety issue,
-//      isCantonEnquiry() still self-expires after 15 Oct either way);
-//      under-matching was actively losing real leads this afternoon.
-//      Flagged in the debug log so this can be tightened once Vineet
-//      confirms whether any other live template shares these exact labels.
-const CANTON_BUTTON_TEXTS = ['send me details', 'call me back'];
-const CANTON_TAG_RE = /\bcanton_day[123]\b/i;
-
-function extractCantonTemplateSignal(body, resolvedText) {
-  const msg = body?.data?.message || {};
-  const reasons = [];
-  const raw = {};
-
-  // 1. Contact tags
-  const tagCandidates = [msg.tags, body?.data?.message?.tags, body?.data?.contact?.tags, body?.data?.tags, msg.contact?.tags];
-  let tags = tagCandidates.find(c => Array.isArray(c));
-  if (tags) {
-    raw.tags = tags;
-    if (tags.some(t => CANTON_TAG_RE.test(String(t)))) reasons.push('contact tag matches canton_day1/2/3');
-  }
-
-  // 2. Button object, IF AiSensy sends one separately from message text.
-  const buttonCandidates = [msg.button, body?.data?.message?.button, body?.data?.button, msg.interactive?.button_reply];
-  let button = buttonCandidates.find(c => c && typeof c === 'object');
-  if (button) {
-    raw.button = button;
-    const buttonText = String(button.text || button.payload || button.title || '').trim().toLowerCase();
-    if (CANTON_BUTTON_TEXTS.includes(buttonText)) reasons.push(`button text/payload matches known Canton template label: "${buttonText}"`);
-  }
-
-  // 2b. Fallback: AiSensy's own docs ("the text in the buttons becomes the
-  // user's message") suggest a tap may arrive as PLAIN message text with no
-  // separate button object at all — confirmed empirically against this
-  // app's own local test, where a synthetic "Call me back" with no button
-  // field produced no signal from check 2 above. Check the resolved message
-  // text itself directly against the known labels as a required fallback,
-  // not just a nice-to-have — this is the one check guaranteed to work
-  // regardless of which shape AiSensy actually sends.
-  const trimmedText = String(resolvedText || '').trim().toLowerCase();
-  if (CANTON_BUTTON_TEXTS.includes(trimmedText)) {
-    reasons.push(`message text itself exactly matches known Canton template label: "${trimmedText}"`);
-  }
-
-  // 3. context object (kept for logging even though a raw {from,id} WAMID
-  // reference isn't independently actionable without our own sent-message
-  // log — capturing it now is what makes that build-able later if needed).
-  const contextCandidates = [msg.context, body?.data?.message?.context, body?.data?.context];
-  let context = contextCandidates.find(c => c && typeof c === 'object');
-  if (context) raw.context = context;
-
-  // Deep scan for a template/campaign-name-ish field anywhere, since AiSensy
-  // may surface its own campaign tracking under a key name this app has
-  // never seen (same defensive posture as extractAdReferral's deep scan).
-  const seen = new Set();
-  let templateNameField = null;
-  const visit = (o, depth) => {
-    if (templateNameField || !o || typeof o !== 'object' || depth > 6 || seen.has(o)) return;
-    seen.add(o);
-    for (const [k, v] of Object.entries(o)) {
-      const kl = String(k).toLowerCase();
-      if (typeof v === 'string' && (kl.includes('template') || kl.includes('campaign')) && /canton/i.test(v)) {
-        templateNameField = { key: k, value: v };
-        return;
-      }
-      if (v && typeof v === 'object') visit(v, depth + 1);
-    }
-  };
-  visit(body, 0);
-  if (templateNameField) {
-    raw.templateNameField = templateNameField;
-    reasons.push(`template/campaign field "${templateNameField.key}" mentions canton`);
-  }
-
-  return { isCantonSignal: reasons.length > 0, reasons, raw };
-}
-
-const cantonTemplateSignalLog = [];
-function recordCantonTemplateSignal(entry) {
-  cantonTemplateSignalLog.unshift({ at: new Date().toISOString(), ...entry });
-  if (cantonTemplateSignalLog.length > 100) cantonTemplateSignalLog.length = 100;
-}
-app.get('/debug/canton-template-signal-log', (req, res) => {
-  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
-  res.json(cantonTemplateSignalLog);
 });
 
 // ── PRIMARY: AISENSY INCOMING-MESSAGE WEBHOOK ──
@@ -4046,30 +4039,16 @@ app.post('/webhook/incoming', async (req, res) => {
     text = bc.text;
     if (broadcastCode) console.log(`📣 [${phone}] broadcast code: ${broadcastCode}`);
 
-    // Unlike the broadcast code above, referral headline/body is never part
-    // of the customer's own typed text — nothing to strip out of `text`
-    // here, just extra context to hand Maya's Canton-match check.
-    const adReferral = extractAdReferral(b);
-    if (adReferral.raw) {
-      console.log(`📎 [${phone}] ad referral (${adReferral.source}): "${short(adReferral.text)}"`);
-      recordCantonReferral({ phone, source: adReferral.source, text: adReferral.text, raw: adReferral.raw });
-    }
-
-    // Broadcast template quick-reply buttons ("Send me details"/"Call me
-    // back") send only that generic text — no destination word, no
-    // broadcast code — so they'd otherwise miss isCantonEnquiry() entirely.
-    // Reuses the existing, already-tested broadcastCode match path rather
-    // than adding a new parameter to isCantonEnquiry()/canton-product.js: a
-    // detected template signal is treated exactly like the customer having
-    // typed the [CANTON] broadcast code themselves. A literal broadcast
-    // code already present in the text (bc.code above) always wins — this
-    // only fills in when there wasn't one.
-    const templateSignal = extractCantonTemplateSignal(b, text);
-    if (templateSignal.isCantonSignal || Object.keys(templateSignal.raw).length) {
-      console.log(`🔘 [${phone}] canton template signal: match=${templateSignal.isCantonSignal} reasons=${templateSignal.reasons.join('; ') || 'none'}`);
-      recordCantonTemplateSignal({ phone, text, ...templateSignal });
-    }
-    const effectiveBroadcastCode = broadcastCode || (templateSignal.isCantonSignal ? 'CANTON' : '');
+    // ── META CLICK-TO-WHATSAPP AD BINDING (Change C, 12 Sep 2026) ──
+    // Must happen BEFORE mayaTurn (which resolves the campaign via
+    // getCampaignForContact()), so a just-created binding is visible to
+    // that same lookup on this very first turn rather than only from turn
+    // 2 onward. msg.referral is the real, confirmed field for this — see
+    // bindMetaAdClick's own comment for why the old context-based guessing
+    // was wrong. Threading the real ad_id through `attribution` reuses the
+    // existing ATTRIBUTION_KEYS pipeline (platform_ad_id is already
+    // whitelisted there) rather than adding a second attribution path.
+    const adBinding = msg.referral ? await bindMetaAdClick(phone, msg.referral) : null;
 
     if (!text) {
       console.log(`Incoming from ${phone}: empty/media-only (${msgType || 'unknown type'}) — sending fallback reply.`);
@@ -4086,10 +4065,18 @@ app.post('/webhook/incoming', async (req, res) => {
 
     // ALWAYS-REPLY policy; muted phones handled inside mayaTurn.
     // REPLY-FIRST: the send happens via onReply the moment Claude answers.
+    // Campaign resolution itself (replacing isCantonEnquiry()/the old
+    // broadcastCode+referral+template-signal heuristics) now happens inside
+    // mayaTurn via getCampaignForContact() — see its own comment. This call
+    // site only still carries the two attribution fields mayaTurn can't
+    // derive from phone+text alone: a literally-typed [CODE], and the real
+    // ad_id when Change C just bound one.
+    const attribution = {};
+    if (broadcastCode) attribution.whatsapp_broadcast_code = broadcastCode;
+    if (adBinding?.sourceId) attribution.platform_ad_id = adBinding.sourceId;
     await withPhoneLock(phone, () =>
       mayaTurn(phone, text, reply => sendSessionMessage(phone, reply), 'whatsapp', null,
-        effectiveBroadcastCode ? { whatsapp_broadcast_code: effectiveBroadcastCode } : null,
-        adReferral.text)
+        Object.keys(attribution).length ? attribution : null)
     );
   } catch (e) {
     console.error('Incoming webhook error:', e);

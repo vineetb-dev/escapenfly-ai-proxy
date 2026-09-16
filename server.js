@@ -17,6 +17,12 @@ const { z } = require('zod');
 // specific /internal/sync-* request that needs it, not at server startup.
 const { runSync: runMetaSync } = require('./meta-sync');
 const { runSync: runGoogleSync } = require('./google-sync');
+// Social publishing (16 Sept 2026) — FB cross-post + daily team WhatsApp
+// content send. Same eager-require-is-safe reasoning as the two lines
+// above: publish-social.js's own requireEnv() checks don't fire until a
+// route actually calls into it, so a missing META_ACCESS_TOKEN/AISENSY_KEY
+// fails closed on that specific request, not at server startup.
+const { publishFbRow, teamDailyContent, fbSafetyCrosspost } = require('./publish-social');
 // Canton Fair product knowledge (10 Sep 2026) — see canton-product.js. Pure,
 // dependency-free logic (keyword/campaign/referral matching + the knowledge
 // block itself), safe to require eagerly like the two sync modules above.
@@ -5302,6 +5308,60 @@ app.post('/internal/sync-google', async (req, res) => {
     res.json(summary);
   } catch (err) {
     console.error('sync-google failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── SOCIAL PUBLISHING (16 Sept 2026) — the two things Windsor can't do ──
+// Facebook Page video/carousel/text cross-post of a marketing_publishes row,
+// and the daily "share this yourself" AiSensy send to the team. Real logic
+// lives in publish-social.js, same "thin wrapper" shape as sync-meta/
+// sync-google above. Auth reuses ADMIN_WRITE_SECRET/adminWriteAuthOk — same
+// family as the other CRM-triggered /internal/* writes, not a new secret.
+app.post('/internal/publish-fb', async (req, res) => {
+  if (!adminWriteAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const result = await publishFbRow({
+      publishId: req.query.publish_id,
+      dry: req.query.dry === '1',
+      allowText: req.body && req.body.allow_text === true,
+      imageUrls: (req.body && req.body.image_urls) || null
+    });
+    res.status(result.ok ? 200 : 400).json(result);
+  } catch (err) {
+    console.error('publish-fb failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/internal/team-daily-content', async (req, res) => {
+  if (!adminWriteAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const result = await teamDailyContent({
+      date: req.query.date || null,
+      to: req.query.to || null,
+      dry: req.query.dry === '1',
+      statusImageUrls: (req.body && req.body.status_image_urls) || null
+    });
+    res.json(result);
+  } catch (err) {
+    console.error('team-daily-content failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Everyday path is Cowork calling /internal/publish-fb per row right after
+// it posts on Windsor — this cron only catches rows that fell through
+// (Cowork skipped/failed the call), gated like every other /cron/* route
+// (CRON_SECRET via cronAuthOk), not ADMIN_WRITE_SECRET, since it's
+// scheduler-triggered, not app-triggered.
+app.post('/cron/fb-safety-crosspost', async (req, res) => {
+  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const result = await fbSafetyCrosspost({ dry: req.query.dry === '1' });
+    res.json(result);
+  } catch (err) {
+    console.error('fb-safety-crosspost failed:', err);
     res.status(500).json({ error: err.message });
   }
 });

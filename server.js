@@ -5378,7 +5378,8 @@ app.get('/health', (req, res) => res.json({
     '/internal/roles-write', '/internal/staff-roles-write', '/internal/portal-credentials-read', '/internal/portal-credentials-write',
     '/internal/documents-upload', '/internal/documents-download', '/internal/documents-bulk-fix-sharing',
     '/internal/sync-meta', '/internal/sync-google',
-    '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh', '/cron/refresh-exchange-rates'
+    '/internal/publish-fb', '/internal/team-daily-content',
+    '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh', '/cron/refresh-exchange-rates', '/cron/fb-safety-crosspost'
   ]
 }));
 

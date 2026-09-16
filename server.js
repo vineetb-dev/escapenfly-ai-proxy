@@ -23,6 +23,12 @@ const { runSync: runGoogleSync } = require('./google-sync');
 // route actually calls into it, so a missing META_ACCESS_TOKEN/AISENSY_KEY
 // fails closed on that specific request, not at server startup.
 const { publishFbRow, teamDailyContent, fbSafetyCrosspost } = require('./publish-social');
+// Maya on Messenger + Instagram DMs (16 Sept 2026) — see maya-messaging.js.
+// mayaTurn/validPhone are passed into handleMessagingEntry() as a `deps`
+// object at the call site rather than required back here, to avoid a
+// circular require (this file requires maya-messaging.js before its own
+// module.exports exists yet) — see that file's header comment.
+const maya = require('./maya-messaging');
 // Canton Fair product knowledge (10 Sep 2026) — see canton-product.js. Pure,
 // dependency-free logic (keyword/campaign/referral matching + the knowledge
 // block itself), safe to require eagerly like the two sync modules above.
@@ -1217,12 +1223,12 @@ async function loadForexRate(currency) {
 // ai_chats row from a separate WhatsApp conversation in the last 24h, this
 // will overwrite it (saveChat upserts on phone). True cross-channel
 // conversation merging is future work.
-async function graduateSessionToPhone(sessionKey, phone, chat) {
+async function graduateSessionToPhone(sessionKey, phone, chat, channel = 'website') {
   try {
     chat.phone = phone;
     await saveChat(chat);
     await upsertCustomerProfile(phone, chat.known || {});
-    console.log(`🔗 [website] session ${sessionKey} graduated to phone ${phone}`);
+    console.log(`🔗 [${channel}] session ${sessionKey} graduated to phone ${phone}`);
     return true;
   } catch (e) {
     console.error('graduateSessionToPhone error:', e.message);
@@ -1267,7 +1273,7 @@ const ATTRIBUTION_KEYS = [
 function mergeLeadData(existing, fresh) {
   const pick = (a, b) => {
     const bv = String(b || '').trim();
-    if (!bv || bv.toLowerCase() === 'unknown' || bv === 'Unknown (WhatsApp)' || bv === 'Unknown (Website Chat)') return a || b || '';
+    if (!bv || bv.toLowerCase() === 'unknown' || bv === 'Unknown (WhatsApp)' || bv === 'Unknown (Website Chat)' || bv === 'Unknown (Messenger)' || bv === 'Unknown (Instagram DM)') return a || b || '';
     return bv;
   };
   const merged = {
@@ -1292,7 +1298,12 @@ function mergeLeadData(existing, fresh) {
     nextAction:  cap(pick(existing.nextAction, fresh.nextAction), 300),
     handover:    !!(fresh.handover || existing.handover),
     query:       cap(fresh.query || existing.query || '', 500),
-    source:      fresh.source || existing.source || 'whatsapp'
+    source:      fresh.source || existing.source || 'whatsapp',
+    // DM channels only ('dm'); left unset for whatsapp/website — see
+    // buildLeadFields, which writes this isNew-gated like first_touch_source
+    // so it's never a candidate for THE TRAP (no read-back-from-blob
+    // dependency, since it's never expected to change turn to turn).
+    medium:      fresh.medium || existing.medium || ''
   };
   // FIRST-TOUCH, opposite of pick(): existing wins. A later turn (or a later
   // visit inside the dedupe window) must never rewrite where this lead
@@ -1390,6 +1401,7 @@ function buildLeadFields(data, isNew = false) {
     let referrerHost = '';
     try { referrerHost = data.referrer ? new URL(data.referrer).hostname : ''; } catch (e) {}
     firstTouchFields.first_touch_source = cap(data.utm_source || referrerHost || 'direct', 120);
+    if (data.medium) firstTouchFields.medium = cap(data.medium, 40);
   }
 
   return {
@@ -2806,6 +2818,51 @@ const CHANNEL_ADAPTERS = {
   }
 };
 
+// messenger/instagram (16 Sept 2026, maya-messaging.js) — DMs are an even
+// poorer place for a full quotation than the website widget: no phone
+// number at all until Maya asks for one, and the actual goal per the brief
+// is graduation OFF the DM thread onto WhatsApp, not carrying the whole
+// qualify-through-handover conversation here. proactiveContentRule/
+// visaSnapshotRule are reused verbatim from website — that content (give
+// the visa checklist yourself, proactively surface Stage 2 recommendations)
+// is channel-neutral; only the contact-capture urgency and conversation
+// length differ.
+// This text is substituted into STAGE_LOGIC.holiday's STAGE 3 paragraph
+// (see {{CONTACT_CAPTURE_RULE}} there) — the same slot website's version
+// uses, where "once you reach Stage 3" is the natural reading. That default
+// timing is wrong for DMs specifically, so this opens with an explicit
+// override of it, the same way the prompt already overrides itself
+// elsewhere (see STAGE_LOGIC.holiday's own "PRIORITY WHEN STAGE 2 AND
+// STAGE 3 BOTH APPLY" paragraph) — a rule whose CONTENT says "early" but
+// which sits inside the Stage 3 paragraph reads as Stage-3-scoped unless
+// told otherwise, confirmed against a real reply that asked a Stage 1
+// qualifying question with no WhatsApp-number ask at all before this fix.
+const dmContactCaptureRule = '\n\nIMPORTANT — OVERRIDES THE STAGE 1/2/3 TIMING ABOVE FOR THIS CHANNEL: you do NOT already know this person\'s WhatsApp number, unlike WhatsApp/website. Introduce yourself by name in your very FIRST reply of a new conversation (e.g. "Hi, I\'m Maya from EscapeNFly!"). Starting from your SECOND reply — do not wait for Stage 3 — weave in a request for their WhatsApp number alongside whatever else you are asking, e.g. "What\'s a good WhatsApp number? I\'ll send the itinerary and quotation there — easier over DM." This is IN ADDITION to the normal Stage 1/2/3 qualifying questions, not instead of them. Capture it in lead.phone the moment they give it. DMs are a poor place for a full quote — getting the conversation onto WhatsApp is itself a priority here, not a formality reserved for the end.';
+const dmConversationLengthRule = '\n\nKEEP THIS SHORT, more so than even the website widget — the goal is getting a WhatsApp number, not running the full qualification here. Ask for destination and travel month if it comes up naturally, but do not block on collecting pax/budget before asking for the WhatsApp number — once you have a destination and a WhatsApp number, that is enough to hand off; the detailed qualification continues on WhatsApp instead of in this thread.';
+CHANNEL_ADAPTERS.messenger = {
+  context: ", replying to a customer's message on EscapeNFly's Facebook Page via Messenger",
+  toneClause: 'typing in a Messenger conversation',
+  formatRule: CHANNEL_ADAPTERS.website.formatRule,
+  signatureRule: 'NEVER add a signature or "— Team EscapeNFly" — Messenger already shows the Page name and avatar.',
+  replyFieldDesc: 'your Messenger reply. Plain text; a line break before a short "•" list is allowed for Stage 2, otherwise keep it a short block with no line breaks.',
+  contactCaptureRule: dmContactCaptureRule,
+  proactiveContentRule: CHANNEL_ADAPTERS.website.proactiveContentRule,
+  visaSnapshotRule: CHANNEL_ADAPTERS.website.visaSnapshotRule,
+  conversationLengthRule: dmConversationLengthRule
+};
+CHANNEL_ADAPTERS.instagram = {
+  ...CHANNEL_ADAPTERS.messenger,
+  context: ", replying to a customer's Instagram Direct Message to EscapeNFly's Instagram account",
+  toneClause: 'typing in an Instagram DM conversation',
+  replyFieldDesc: 'your Instagram DM reply. Plain text; a line break before a short "•" list is allowed for Stage 2, otherwise keep it a short block with no line breaks.',
+  signatureRule: 'NEVER add a signature or "— Team EscapeNFly" — Instagram already shows the account name and avatar.'
+};
+// Channels whose session key starts out as something other than a real
+// phone number and must graduate to one — see the graduation gate in
+// mayaTurn. whatsapp is deliberately excluded: its session key IS always
+// already a real phone.
+const GRADUATABLE_CHANNELS = new Set(['website', 'messenger', 'instagram']);
+
 function buildChatSystem(channel, intent) {
   const a = CHANNEL_ADAPTERS[channel] || CHANNEL_ADAPTERS.whatsapp;
   const stageLogic = STAGE_LOGIC[String(intent || '').toLowerCase()] || STAGE_LOGIC.holiday;
@@ -3447,7 +3504,11 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
       nextAction: parsed.next_action || '',
       handover: !!parsed.handover,
       query: message,
-      source: channel === 'website' ? 'website-ai-chat' : 'whatsapp-ai-chat'
+      source: channel === 'website' ? 'website-ai-chat'
+            : channel === 'messenger' ? 'facebook_messenger'
+            : channel === 'instagram' ? 'instagram_dm'
+            : 'whatsapp-ai-chat',
+      medium: (channel === 'messenger' || channel === 'instagram') ? 'dm' : ''
     };
     // Whitelist only — never spread the request body, so a crafted POST
     // cannot inject arbitrary columns. See ATTRIBUTION_KEYS above
@@ -3460,24 +3521,25 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     }
     chat.known = mergeLeadData(chat.known || {}, freshData);
 
-    // ── WEBSITE SESSION → PHONE GRADUATION (§11) ──
+    // ── SESSION → PHONE GRADUATION (§11) — website originally, now also
+    // messenger/instagram (16 Sept 2026): any channel whose session key is
+    // NOT itself a real phone number graduates the same way the moment
+    // Maya learns one. Messenger/Instagram session keys are 'msgr:'/'igdm:'
+    // prefixed specifically so they can never look like a valid phone to
+    // validPhone() and slip past this gate into the `else if` branch below
+    // (see sessionKeyFor()'s comment in maya-messaging.js).
     // testMode (set only by a test runner — see /webhook/website-chat, or a
-    // direct mayaTurn() call from a runner like tests/run-tests-whatsapp.js)
-    // skips graduation entirely, so effectivePhone never becomes a
-    // real-looking phone number on website. That was enough to close the
-    // 16 Sep production test-data incident for website, since testMode
-    // there indirectly disabled the LEAD CAPTURE block via
-    // validPhone(effectivePhone). It was NOT enough for whatsapp/messenger/
-    // instagram, whose phone/psid/igsid is real (or deliberately
-    // test_-prefixed, which already fails validPhone) from the first turn —
-    // graduation never applies to them, so testMode had no effect on lead
-    // capture there at all. The LEAD CAPTURE gate below now checks
-    // !testMode directly so it's channel-agnostic instead of relying on an
-    // indirect, website-only side effect.
+    // direct mayaTurn() call from a runner like tests/run-tests-whatsapp.js
+    // or tests/run-tests-dm.js) still gates graduation directly and
+    // channel-agnostically, same reasoning as the LEAD CAPTURE gate below —
+    // whatsapp itself is never in GRADUATABLE_CHANNELS (its phone/psid/igsid
+    // is already real, or test_-prefixed and already failing validPhone,
+    // from the first turn), but messenger/instagram test conversations that
+    // capture a phone number mid-conversation must not graduate for real.
     let effectivePhone = phone;
     const capturedPhoneRaw = parsed.lead?.phone ? String(parsed.lead.phone).replace(/\D/g, '') : '';
-    if (!testMode && channel === 'website' && !validPhone(phone) && validPhone(capturedPhoneRaw)) {
-      await graduateSessionToPhone(phone, capturedPhoneRaw, chat);
+    if (!testMode && GRADUATABLE_CHANNELS.has(channel) && !validPhone(phone) && validPhone(capturedPhoneRaw)) {
+      await graduateSessionToPhone(phone, capturedPhoneRaw, chat, channel);
       effectivePhone = capturedPhoneRaw;
     } else if (!testMode && validPhone(phone)) {
       // Already phone-keyed (WhatsApp, or a website session past graduation) —
@@ -3560,7 +3622,10 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
         }
       } else {
         const merged = { ...chat.known };
-        if (!merged.name) merged.name = channel === 'website' ? 'Unknown (Website Chat)' : 'Unknown (WhatsApp)';
+        if (!merged.name) merged.name = channel === 'website' ? 'Unknown (Website Chat)'
+          : channel === 'messenger' ? 'Unknown (Messenger)'
+          : channel === 'instagram' ? 'Unknown (Instagram DM)'
+          : 'Unknown (WhatsApp)';
         const assigned = await assignTeamWithClaude(merged);
         const leadId = await saveLead(merged, assigned);
         log.crm = leadId ? `created:${leadId.slice(0, 8)}→${assigned.name}` : 'create-FAILED';
@@ -4185,11 +4250,33 @@ app.get('/webhook/meta', (req, res) => {
 app.post('/webhook/meta', async (req, res) => {
   res.json({ status: 'ok' });
 
+  // Messenger + Instagram DMs (16 Sept 2026) — observe-only signature check,
+  // same phase-1 discipline as checkAiSensySignature(): log a mismatch,
+  // never reject on one yet. The header name/algorithm come from Meta's
+  // own documented scheme (X-Hub-Signature-256, sha256=<hex> of the raw
+  // body with the app secret), a primary source, but this endpoint has
+  // shipped with zero verification since it was leadgen-only — enforcing
+  // cold, on day one of a new payload shape, risks silently rejecting real
+  // traffic the same way the AiSensy rollout was built to avoid.
+  const metaSig = maya.checkMetaSignature(req.rawBody, req.headers['x-hub-signature-256'], process.env.META_APP_SECRET);
+  if (metaSig.checked && !metaSig.matched) console.error('⚠️ Meta webhook signature mismatch:', metaSig);
+
   try {
     const body = req.body;
-    if (body.object !== 'page') return;
+    if (body.object !== 'page' && body.object !== 'instagram') return;
 
     for (const entry of body.entry || []) {
+      // Messenger (object:'page') and Instagram (object:'instagram') DMs
+      // arrive as entry.messaging[], a completely different shape from
+      // leadgen's entry.changes[] handled below — see maya-messaging.js.
+      if (Array.isArray(entry.messaging) && entry.messaging.length) {
+        await maya.handleMessagingEntry(
+          entry, body.object,
+          { mayaTurn, validPhone, writeNotification },
+          process.env.META_ACCESS_TOKEN,
+          isDuplicateMsgId
+        ).catch(e => console.error('handleMessagingEntry error:', e.message));
+      }
       for (const change of entry.changes || []) {
         if (change.field !== 'leadgen') continue;
 

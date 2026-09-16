@@ -1,5 +1,6 @@
 tests/last-run-results.json
 tests/last-run-results-whatsapp.json
+tests/last-run-results-dm-*.json
 tests/model-lab/results/
 node_modules/
 .env

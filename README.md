@@ -41,6 +41,37 @@ yet verified against real Meta/AiSensy credentials, which don't exist in
 this environment. Do that with Vineet once this deploys, the same way the
 Meta/Google sync endpoints above were signed off.
 
+#### Creating the two jobs above by hand (until `CRONJOB_API_KEY` is set)
+
+The automated setup needs a `CRONJOB_API_KEY` env var on Render (cron-job.org's
+own API key, not one of this app's secrets) so a script can call cron-job.org's
+API directly — not present as of 17 Sept 2026. Until it is, create both jobs
+manually in the cron-job.org dashboard with these exact definitions. IST is
+UTC+5:30, so 09:20/09:30 IST is 03:50/04:00 UTC — cron-job.org schedules run in
+UTC.
+
+**Job 1 — team-daily-content**
+| Field | Value |
+|---|---|
+| URL | `https://escapenfly-ai-proxy.onrender.com/internal/team-daily-content` |
+| Method | `POST` |
+| Schedule | `50 3 * * *` (UTC) — i.e. 09:20 IST daily |
+| Header | `x-admin-write-secret: <ADMIN_WRITE_SECRET>` |
+
+**Job 2 — fb-safety-crosspost**
+| Field | Value |
+|---|---|
+| URL | `https://escapenfly-ai-proxy.onrender.com/cron/fb-safety-crosspost` |
+| Method | `POST` |
+| Schedule | `0 4 * * *` (UTC) — i.e. 09:30 IST daily |
+| Header | `x-cron-secret: <CRON_SECRET>` |
+
+Prefer the header over `?secret=...` in the URL for both — same reasoning as
+`MARKETING_SYNC_SECRET` elsewhere in this file's CLAUDE.md: a query-param
+secret risks landing in cron-job.org's own request logs, a header doesn't.
+Both routes accept either (see `adminWriteAuthOk`/`cronAuthOk` in `server.js`),
+so the header-only choice here is a preference, not a requirement.
+
 ### Existing cron jobs (schedules per CLAUDE.md / Render's dashboard, not
 ### independently re-verified when this file was written)
 

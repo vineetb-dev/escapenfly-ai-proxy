@@ -18,12 +18,51 @@
 // regression. This is a first pass, not a replacement for reading Maya's
 // actual replies.
 
-const API_URL = 'https://escapenfly-ai-proxy.onrender.com/webhook/website-chat';
+const API_URL = process.env.MAYA_TEST_API_URL || 'https://escapenfly-ai-proxy.onrender.com/webhook/website-chat';
+// Same generic reply server.js falls back to when the AI call/parse fails —
+// see FALLBACK_REPLY in server.js. Kept as a literal copy rather than an
+// import since this runner talks to the deployed API over HTTP, not the
+// module directly.
+const FALLBACK_REPLY = 'Thanks for your message! Our travel expert will call you shortly. You can also reach us directly at +91 98517 39851. 😊';
+
+// This runner sends real requests to the LIVE production API_URL above,
+// which write to real production Supabase (ai_chats/customer_profile/
+// enquiries/internal_notifications) unless the server is told this is a
+// test run. Refuse to start unless that's explicitly true — see the 16 Sep
+// 2026 incident this guard exists because of (CLAUDE.md/PR history): 261
+// rows across 4 tables from an ungated run, some of which escaped
+// test-artifact tagging entirely and sat in the CRM as live fake leads.
+const KNOWN_PROD_SUPABASE_REF = 'zkhbaisggymbmurqxejk'; // escapenfly-crm production project
+function assertSafeToRun() {
+  const supabaseUrl = process.env.SUPABASE_URL || '';
+  const pointedAtNonProdSupabase = supabaseUrl && !supabaseUrl.includes(KNOWN_PROD_SUPABASE_REF);
+  const testMode = process.env.MAYA_TEST_MODE === '1';
+  if (!pointedAtNonProdSupabase && !testMode) {
+    console.error(
+      '\nREFUSING TO START.\n' +
+      `This runner sends real messages to ${API_URL},\n` +
+      'which is the live production server and writes to live production Supabase.\n' +
+      'Set one of the following before running:\n' +
+      '  MAYA_TEST_MODE=1              (sends an x-maya-test-mode header; the server then routes\n' +
+      '                                 writes to this run\'s test_-prefixed session keys and\n' +
+      '                                 disables lead creation/notifications for it)\n' +
+      '  SUPABASE_URL=<non-production project URL>   (informational confirmation you are not\n' +
+      '                                 pointed at the production project)\n'
+    );
+    process.exit(1);
+  }
+  return testMode;
+}
+
+const TEST_MODE = assertSafeToRun();
 
 async function sendMessage(sessionKey, message) {
   const res = await fetch(API_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(TEST_MODE ? { 'x-maya-test-mode': '1' } : {})
+    },
     body: JSON.stringify({ phone: sessionKey, message })
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -43,6 +82,18 @@ async function runCase(testCase) {
     try {
       lastResponse = await sendMessage(sessionKey, turn);
       allReplies.push(lastResponse.reply || '');
+      // A fallback reply means the AI call/parse itself failed server-side —
+      // that's never a pass, whatever mustAsk/mustNotSay happen to check for
+      // (an empty mustNotSay list, e.g., would otherwise let this through
+      // silently as PASS). Stop the conversation here rather than continuing
+      // to send turns against a session that's already failed.
+      if (lastResponse.reply === FALLBACK_REPLY) {
+        return {
+          id: testCase.id, category: testCase.category, status: 'FAIL',
+          failures: ['reply was the API-error fallback, not a real answer'],
+          transcript: allReplies, finalLead: lastResponse?.lead, finalIntent: lastResponse?.intent
+        };
+      }
     } catch (e) {
       return { id: testCase.id, status: 'ERROR', error: e.message, transcript: allReplies };
     }

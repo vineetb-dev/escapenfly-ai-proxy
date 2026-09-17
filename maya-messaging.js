@@ -39,6 +39,22 @@ const SB_HEADERS = { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content
 const GRAPH_VERSION = 'v25.0';
 const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_VERSION}`;
 
+// Same Page publish-social.js's FB_PAGE_ID targets — kept as its own literal
+// here rather than imported, same "each integration file pins its own"
+// reasoning as GRAPH_VERSION above. Real incident this fixes: a live
+// Instagram DM (igsid 1752411822575849, 17 Sep 2026) created its dm_sessions
+// row fine but got no reply. entry.id for an Instagram webhook is the
+// Instagram Business Account id (confirmed from that session's own stored
+// page_id: 17841476056303450 — structurally an IG-scoped id, not this Page
+// id), and Meta's Instagram Messaging docs are explicit that sending
+// requires the Page Access Token obtained via the Page node, not the IG
+// node — GET /{ig-business-account-id}?fields=access_token is not the
+// documented way to get one. handleMessagingEntry() below now always
+// exchanges the token against FB_PAGE_ID for both channels; entry.id is
+// still used for the send edge itself (/{ig-user-id}/messages), which is
+// correct as-is.
+const FB_PAGE_ID = '128897537530800';
+
 const MAX_MESSAGE_LEN = 2000; // Meta Send API text limit
 const HANDOFF_AUTO_RESUME_MS = 24 * 60 * 60 * 1000;
 
@@ -158,14 +174,21 @@ function checkMetaSignature(rawBody, signatureHeader, appSecret) {
 
 // ── GRAPH API ──
 
+// Reads the body as text first, not straight .json() — a non-2xx Graph
+// response isn't guaranteed to be JSON (gateway/proxy error pages included),
+// and letting JSON.parse throw there would lose the HTTP status and raw
+// body entirely, replacing them with an opaque "Unexpected token" error.
 async function graphGet(path, params, token) {
   const url = new URL(`${GRAPH_BASE}${path}`);
   url.searchParams.set('access_token', token);
   Object.entries(params || {}).forEach(([k, v]) => url.searchParams.set(k, v));
   const res = await fetch(url.toString());
-  const data = await res.json();
-  if (data.error) throw new Error(`Graph API error [${path}]: ${data.error.message} (code ${data.error.code})`);
-  return data;
+  const rawText = await res.text();
+  let data = null;
+  try { data = JSON.parse(rawText); } catch { /* non-JSON body, handled below */ }
+  if (data && data.error) throw new Error(`Graph API error [${path}]: ${data.error.message} (code ${data.error.code})`);
+  if (!res.ok) throw new Error(`Graph API error [${path}]: HTTP ${res.status} — ${rawText.slice(0, 300)}`);
+  return data || {};
 }
 
 const pageTokenCache = new Map(); // pageId -> {token, at}
@@ -174,9 +197,33 @@ async function getPageAccessToken(pageId, systemUserToken) {
   const cached = pageTokenCache.get(pageId);
   if (cached && Date.now() - cached.at < PAGE_TOKEN_TTL_MS) return cached.token;
   const data = await graphGet(`/${pageId}`, { fields: 'access_token' }, systemUserToken);
-  if (!data.access_token) throw new Error('Could not obtain Page Access Token — check the system user has admin access on the Page');
+  // graphGet already throws on an explicit Graph error or a non-2xx status
+  // (with the raw body) — this covers the remaining silent case: a 200
+  // response that simply doesn't carry the field (e.g. the system user
+  // lacks admin access on this Page). Include the raw response so this
+  // isn't a repeat of the same "no reason logged anywhere" gap.
+  if (!data.access_token) {
+    throw new Error(`Could not obtain Page Access Token for ${pageId} — check the system user has admin access on the Page. Graph response: ${JSON.stringify(data).slice(0, 300)}`);
+  }
   pageTokenCache.set(pageId, { token: data.access_token, at: Date.now() });
   return data.access_token;
+}
+
+// Called once by server.js right after this module loads, so a broken
+// Page-token exchange shows up immediately in deploy logs instead of only
+// surfacing silently on the first real DM (exactly what happened with the
+// igsid 1752411822575849 incident above — nothing in the logs pointed at
+// the token exchange until this was added). Never throws: a missing
+// META_ACCESS_TOKEN or a failed exchange is logged and left for the
+// per-message lazy fetch in handleMessagingEntry (same cache) to retry.
+async function initMetaPageToken(systemUserToken) {
+  if (!systemUserToken) { console.error('initMetaPageToken skipped: META_ACCESS_TOKEN not set'); return; }
+  try {
+    await getPageAccessToken(FB_PAGE_ID, systemUserToken);
+    console.log(`✅ Meta Page access token obtained at startup for Page ${FB_PAGE_ID} (used for both Messenger and Instagram sends)`);
+  } catch (e) {
+    console.error(`❌ initMetaPageToken failed for Page ${FB_PAGE_ID}:`, e.message);
+  }
 }
 
 // recipientIdField: Messenger's Send API takes {recipient:{id: psid}} against
@@ -193,8 +240,14 @@ async function sendViaGraph(edgePath, recipientId, text, pageToken) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ recipient: { id: recipientId }, message: { text: chunk } })
     });
-    const data = await res.json();
-    if (data.error) throw new Error(`Send API error: ${data.error.message} (code ${data.error.code})`);
+    // Same text-first parsing as graphGet — a non-2xx Send API response
+    // isn't guaranteed to be JSON, and this is the exact call this whole
+    // fix is about being able to diagnose from the logs alone.
+    const rawText = await res.text();
+    let data = null;
+    try { data = JSON.parse(rawText); } catch { /* non-JSON body, handled below */ }
+    if (data && data.error) throw new Error(`Send API error [${edgePath}]: ${data.error.message} (code ${data.error.code})`);
+    if (!res.ok) throw new Error(`Send API error [${edgePath}]: HTTP ${res.status} — ${rawText.slice(0, 300)}`);
   }
   return true;
 }
@@ -303,7 +356,14 @@ async function handleMessagingEntry(entry, objectType, deps, systemUserToken, is
     }
 
     try {
-      const pageToken = await getPageAccessToken(pageId, systemUserToken);
+      // Always exchange against FB_PAGE_ID, never the per-message `pageId`
+      // (entry.id) — for a Messenger webhook that already equals FB_PAGE_ID,
+      // but for an Instagram webhook entry.id is the linked Instagram
+      // Business Account id, and Meta's Send API requires the Page Access
+      // Token (obtained via the Page node) for both channels. `pageId` is
+      // still the right value for the actual send edge below — Instagram's
+      // /{ig-user-id}/messages genuinely does take the IG business id.
+      const pageToken = await getPageAccessToken(FB_PAGE_ID, systemUserToken);
       if (channel === 'instagram') await sendInstagramReply(parsed.senderId, reply, pageId, pageToken);
       else await sendMessengerReply(parsed.senderId, reply, pageToken);
     } catch (e) {
@@ -337,6 +397,8 @@ async function handleMessagingEntry(entry, objectType, deps, systemUserToken, is
 module.exports = {
   // orchestration
   handleMessagingEntry,
+  // called once by server.js at startup
+  initMetaPageToken,
   // pure/testable
   parseMessagingEvent,
   sessionKeyFor,
@@ -352,5 +414,6 @@ module.exports = {
   upsertDmSession,
   getDmSession,
   patchDmSession,
-  HANDOFF_AUTO_RESUME_MS
+  HANDOFF_AUTO_RESUME_MS,
+  FB_PAGE_ID
 };

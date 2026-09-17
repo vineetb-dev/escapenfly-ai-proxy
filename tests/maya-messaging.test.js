@@ -18,7 +18,8 @@ const assert = require('assert');
 const crypto = require('crypto');
 const {
   parseMessagingEvent, sessionKeyFor, referralToAttribution,
-  isEscalationPhrase, splitLongMessage, checkMetaSignature, isCurrentlyHandedOff
+  isEscalationPhrase, splitLongMessage, checkMetaSignature, isCurrentlyHandedOff,
+  handleMessagingEntry, getPageAccessToken, sendMessengerReply, sendInstagramReply, FB_PAGE_ID
 } = require('../maya-messaging');
 
 let pass = 0;
@@ -195,4 +196,128 @@ t('handed off more than 24h ago -> false (auto-resumes)', () => {
   assert.strictEqual(isCurrentlyHandedOff({ handed_off: true, handed_off_at: old }), false);
 });
 
-console.log(`\n${pass} passed`);
+console.log('\ngetPageAccessToken (fake Graph response — no real network)');
+async function testGetPageAccessTokenErrorDetail() {
+  const realFetch = global.fetch;
+
+  // A 200 response with no access_token field used to throw a hardcoded,
+  // context-free message — the actual gap this whole fix is about. Using a
+  // distinct fake page id per sub-test avoids the in-module token cache.
+  global.fetch = async () => ({ ok: true, text: async () => JSON.stringify({ id: 'fake_page_999a' }) });
+  try {
+    await getPageAccessToken('fake_page_999a', 'sys_token');
+    console.error('  FAIL getPageAccessToken should have thrown when access_token is missing');
+    process.exitCode = 1;
+  } catch (e) {
+    assert.ok(e.message.includes('fake_page_999a'), 'error names which page id failed');
+    assert.ok(e.message.includes('"id":"fake_page_999a"'), 'error includes the raw Graph response body, not just a generic message');
+    pass++;
+    console.log('  ok   missing access_token -> error includes the raw Graph response body');
+  }
+
+  global.fetch = async () => ({ ok: false, status: 400, text: async () => JSON.stringify({ error: { message: 'Unsupported get request.', code: 100 } }) });
+  try {
+    await getPageAccessToken('fake_page_999b', 'sys_token');
+    console.error('  FAIL getPageAccessToken should have thrown on a Graph API error');
+    process.exitCode = 1;
+  } catch (e) {
+    assert.ok(e.message.includes('Unsupported get request'));
+    assert.ok(e.message.includes('code 100'));
+    pass++;
+    console.log('  ok   an explicit Graph API error still surfaces its real message and code');
+  }
+
+  global.fetch = realFetch;
+}
+
+console.log('\nsendMessengerReply / sendInstagramReply (fake Send API response — no real network)');
+async function testSendViaGraphErrorDetail() {
+  const realFetch = global.fetch;
+
+  // A non-JSON body on a non-2xx response used to throw an opaque JSON
+  // parse error with no HTTP status or body — exactly the shape a
+  // real Send API failure could take that "check e.message" wouldn't help
+  // diagnose.
+  global.fetch = async () => ({ ok: false, status: 502, text: async () => '<html>Bad Gateway</html>' });
+  try {
+    await sendMessengerReply('5591234567890123', 'hi', 'page_token');
+    console.error('  FAIL sendMessengerReply should have thrown on a non-JSON, non-2xx response');
+    process.exitCode = 1;
+  } catch (e) {
+    assert.ok(e.message.includes('502'), 'error includes the HTTP status');
+    assert.ok(e.message.includes('Bad Gateway'), 'error includes the raw response body');
+    pass++;
+    console.log('  ok   a non-JSON Send API failure still surfaces HTTP status + raw body');
+  } finally {
+    global.fetch = realFetch;
+  }
+}
+
+console.log('\nhandleMessagingEntry (fake Graph/Send/Supabase — the real bug: Instagram token exchange)');
+async function testInstagramTokenExchangeUsesPageId() {
+  const realFetch = global.fetch;
+  // Real values from the incident this fixes: entry.id for an Instagram
+  // webhook is the linked Instagram Business Account id (confirmed from
+  // the real dm_sessions row's own page_id column), not the Facebook Page
+  // id — igsid is the real sender from that same session.
+  const IG_BUSINESS_ACCOUNT_ID = '17841476056303450';
+  const IGSID = '1752411822575849';
+
+  const entry = {
+    id: IG_BUSINESS_ACCOUNT_ID,
+    messaging: [{
+      sender: { id: IGSID },
+      recipient: { id: IG_BUSINESS_ACCOUNT_ID },
+      timestamp: Date.now(),
+      message: { mid: 'ig_m_1', text: 'Hi, tell me about Bali packages' }
+    }]
+  };
+
+  const calls = [];
+  global.fetch = async (url) => {
+    const urlStr = String(url);
+    calls.push(urlStr);
+    if (urlStr.includes(`/${FB_PAGE_ID}?`)) {
+      return { ok: true, text: async () => JSON.stringify({ access_token: 'real_page_token' }) };
+    }
+    if (urlStr.includes(`/${IG_BUSINESS_ACCOUNT_ID}/messages`)) {
+      return { ok: true, text: async () => JSON.stringify({ message_id: 'sent_1' }) };
+    }
+    // dm_sessions upsert/patch (Supabase REST) — not what this test is
+    // about; a real, minimal representation-shaped response is enough to
+    // let the orchestration complete.
+    return { ok: true, text: async () => '[{"id":"fake-session-id","phone":null}]', json: async () => [{ id: 'fake-session-id', phone: null }] };
+  };
+
+  const deps = {
+    mayaTurn: async () => 'Bali packages start at ₹70,000 per person...',
+    validPhone: () => false,
+    writeNotification: async () => {}
+  };
+
+  try {
+    await handleMessagingEntry(entry, 'instagram', deps, 'system_user_token', () => false);
+
+    const tokenCall = calls.find(c => c.includes('fields=access_token'));
+    assert.ok(tokenCall, 'a Page-token exchange call was made');
+    assert.ok(tokenCall.includes(`/${FB_PAGE_ID}?`), `token exchange must target FB_PAGE_ID (${FB_PAGE_ID}), not entry.id — got: ${tokenCall}`);
+    assert.ok(!tokenCall.includes(IG_BUSINESS_ACCOUNT_ID), 'token exchange must NOT use the Instagram Business Account id — this was the real bug (igsid ' + IGSID + ' never got a reply)');
+
+    const sendCall = calls.find(c => c.includes('/messages?'));
+    assert.ok(sendCall, 'a Send API call was made');
+    assert.ok(sendCall.includes(`/${IG_BUSINESS_ACCOUNT_ID}/messages`), 'the send edge itself correctly still targets the Instagram Business Account id');
+
+    pass++;
+    console.log('  ok   Instagram token exchange uses FB_PAGE_ID; send edge still uses the IG business account id');
+  } catch (e) {
+    console.error('  FAIL handleMessagingEntry Instagram token exchange\n       ' + e.message);
+    process.exitCode = 1;
+  } finally {
+    global.fetch = realFetch;
+  }
+}
+
+testGetPageAccessTokenErrorDetail()
+  .then(testSendViaGraphErrorDetail)
+  .then(testInstagramTokenExchangeUsesPageId)
+  .then(() => console.log(`\n${pass} passed`));

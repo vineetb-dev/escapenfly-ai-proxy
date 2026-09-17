@@ -178,16 +178,38 @@ async function publishReel({ pageId, pageToken, videoUrl, description }) {
   }, pageToken);
   if (finish.success === false) throw new Error('video_reels finish reported failure');
 
+  // The reel is already published once finish succeeds — status polling
+  // below is a separate, best-effort step (see pollReelStatus). Deliberately
+  // NOT done here: a real Morocco run had start/upload/finish all succeed
+  // (video_id 3608214656001289) but the immediate status GET fail with Graph
+  // error #100 "Unsupported get request" — with polling still inline here,
+  // that exception would unwind past this successful videoId and be treated
+  // as a total publish failure by the caller, losing the real fb id.
+  return { videoId };
+}
+
+// Best-effort only — the reel is already live once publishReel() returns, so
+// nothing here should ever turn a real success into a reported failure.
+// Swallows its own errors (network/Graph API failures alike) and just logs
+// them; the caller gets back whatever status info was obtainable, never a
+// thrown exception.
+async function pollReelStatus({ videoId, pageToken }) {
   const deadline = Date.now() + 60000;
   let status = 'unknown';
+  let permalinkUrl = null;
   while (Date.now() < deadline) {
-    const s = await graphGet(`/${videoId}`, { fields: 'status' }, pageToken);
-    status = (s.status && s.status.video_status) || status;
-    if (status === 'ready') break;
-    if (status === 'error') throw new Error(`Reel processing failed: ${JSON.stringify(s.status)}`);
+    try {
+      const s = await graphGet(`/${videoId}`, { fields: 'status,permalink_url' }, pageToken);
+      status = (s.status && s.status.video_status) || status;
+      permalinkUrl = s.permalink_url || permalinkUrl;
+      if (status === 'ready' || status === 'error') break;
+    } catch (e) {
+      console.error(`publish-social: reel ${videoId} status poll failed (video already published — observability only): ${e.message}`);
+      break;
+    }
     await sleep(3000);
   }
-  return { videoId, status };
+  return { status, permalinkUrl };
 }
 
 async function publishCarousel({ pageId, pageToken, imageUrls, message }) {
@@ -275,21 +297,34 @@ async function publishFbRow({ publishId, dry, allowText, imageUrls }) {
 
   if (dry) return { ok: true, dry: true, mode: plan.mode, plan, derived_image_urls: derivedImageUrls || undefined };
 
-  const pageToken = await getPageAccessToken(FB_PAGE_ID, requireEnv('META_ACCESS_TOKEN'));
-  try {
-    let fbId;
-    if (plan.mode === 'reel') {
-      const r = await publishReel({ pageId: FB_PAGE_ID, pageToken, videoUrl: plan.videoUrl, description: caption });
-      fbId = r.videoId;
-    } else if (plan.mode === 'carousel') {
-      fbId = await publishCarousel({ pageId: FB_PAGE_ID, pageToken, imageUrls: plan.imageUrls, message: caption });
-    } else {
-      fbId = await publishText({ pageId: FB_PAGE_ID, pageToken, message: caption });
-    }
+  // Clears any stale error_text from a prior failed attempt on this same
+  // row alongside recording the new fb: id — a real Norway row succeeded on
+  // a retry but kept showing its earlier failed attempt's error_text next
+  // to the (correct) fb id, since the old success path only ever wrote
+  // platform_post_id.
+  const markSuccess = async (fbId) => {
     const newPlatformPostId = appendFbId(row.platform_post_id, fbId);
     await sb.from('marketing_publishes').update({
-      platform_post_id: newPlatformPostId, updated_at: new Date().toISOString()
+      platform_post_id: newPlatformPostId, error_text: null, updated_at: new Date().toISOString()
     }).eq('id', publishId);
+    return newPlatformPostId;
+  };
+
+  const pageToken = await getPageAccessToken(FB_PAGE_ID, requireEnv('META_ACCESS_TOKEN'));
+  try {
+    if (plan.mode === 'reel') {
+      const { videoId } = await publishReel({ pageId: FB_PAGE_ID, pageToken, videoUrl: plan.videoUrl, description: caption });
+      // Record success immediately — the reel is already live once
+      // publishReel() returns — so a poll-only failure below (best-effort,
+      // never throws) can never turn a real success into a recorded one.
+      const newPlatformPostId = await markSuccess(videoId);
+      const { status } = await pollReelStatus({ videoId, pageToken });
+      return { ok: true, mode: plan.mode, fb_id: videoId, platform_post_id: newPlatformPostId, reel_status: status };
+    }
+    const fbId = plan.mode === 'carousel'
+      ? await publishCarousel({ pageId: FB_PAGE_ID, pageToken, imageUrls: plan.imageUrls, message: caption })
+      : await publishText({ pageId: FB_PAGE_ID, pageToken, message: caption });
+    const newPlatformPostId = await markSuccess(fbId);
     return { ok: true, mode: plan.mode, fb_id: fbId, platform_post_id: newPlatformPostId };
   } catch (e) {
     await sb.from('marketing_publishes').update({
@@ -419,10 +454,11 @@ module.exports = {
   publishFbRow,
   fbSafetyCrosspost,
   teamDailyContent,
-  // exported for tests — publishReel needs a fake 3-phase Graph sequence
-  // (global.fetch mocked), not the "pure, no network" discipline the rest
-  // of this list follows
+  // exported for tests — publishReel/pollReelStatus need a fake Graph
+  // sequence (global.fetch mocked), not the "pure, no network" discipline
+  // the rest of this list follows
   publishReel,
+  pollReelStatus,
   // exported for tests — pure, no network/Supabase
   isVideoUrl,
   hasFbId,

@@ -63,6 +63,11 @@ function hasFbId(platformPostId) {
   return /(^|;)fb:/.test(platformPostId || '');
 }
 
+function extractIgMediaId(platformPostId) {
+  const m = /(^|;)ig:([^;]+)/.exec(platformPostId || '');
+  return m ? m[2] : null;
+}
+
 function appendFbId(existingId, fbId) {
   const trimmed = (existingId || '').trim().replace(/;+$/, '');
   return trimmed ? `${trimmed};fb:${fbId}` : `fb:${fbId}`;
@@ -233,10 +238,35 @@ async function publishFbRow({ publishId, dry, allowText, imageUrls }) {
   }
 
   const caption = [row.caption, row.hashtags].filter(Boolean).join('\n\n');
-  const plan = planFbPublish(asset, { allowText, imageUrls });
-  if (plan.mode === 'error') return { ok: false, error: plan.error };
 
-  if (dry) return { ok: true, dry: true, mode: plan.mode, plan };
+  // Every carousel is posted to Instagram before Facebook, so when the
+  // caller didn't pass image_urls, derive them from the row's own ig: id
+  // instead of requiring a manual export every time. Read-only Graph call,
+  // so it runs under dry too — that's the point of testing with ?dry=1
+  // before a real run: it shows the derived URLs without ever writing.
+  let derivedImageUrls = null;
+  if (asset.type === 'carousel' && (!imageUrls || !imageUrls.length)) {
+    const igMediaId = extractIgMediaId(row.platform_post_id);
+    if (igMediaId) {
+      try {
+        const children = await graphGet(`/${igMediaId}/children`, { fields: 'media_url' }, requireEnv('META_ACCESS_TOKEN'));
+        derivedImageUrls = (children.data || []).map(d => d.media_url).filter(Boolean);
+      } catch (e) {
+        if (!dry) {
+          await sb.from('marketing_publishes').update({
+            error_text: String(e.message).slice(0, 500), updated_at: new Date().toISOString()
+          }).eq('id', publishId);
+        }
+        return { ok: false, error: `ig children lookup failed: ${e.message}` };
+      }
+    }
+  }
+  const effectiveImageUrls = (imageUrls && imageUrls.length) ? imageUrls : derivedImageUrls;
+
+  const plan = planFbPublish(asset, { allowText, imageUrls: effectiveImageUrls });
+  if (plan.mode === 'error') return { ok: false, error: plan.error, derived_image_urls: derivedImageUrls || undefined };
+
+  if (dry) return { ok: true, dry: true, mode: plan.mode, plan, derived_image_urls: derivedImageUrls || undefined };
 
   const pageToken = await getPageAccessToken(FB_PAGE_ID, requireEnv('META_ACCESS_TOKEN'));
   try {
@@ -385,6 +415,7 @@ module.exports = {
   // exported for tests — pure, no network/Supabase
   isVideoUrl,
   hasFbId,
+  extractIgMediaId,
   appendFbId,
   trimCaption,
   planFbPublish,

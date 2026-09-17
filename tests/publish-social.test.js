@@ -21,7 +21,7 @@
 
 const assert = require('assert');
 const {
-  isVideoUrl, hasFbId, appendFbId, trimCaption, planFbPublish,
+  isVideoUrl, hasFbId, extractIgMediaId, appendFbId, trimCaption, planFbPublish,
   pickAiSensyTemplate, selectPrimaryContent, todayIST
 } = require('../publish-social');
 
@@ -49,6 +49,13 @@ t('append to an existing ig: id keeps it', () =>
 t('append with no existing id', () => assert.strictEqual(appendFbId('', '67890'), 'fb:67890'));
 t('append trims a stray trailing semicolon', () =>
   assert.strictEqual(appendFbId('ig:12345;', '67890'), 'ig:12345;fb:67890'));
+
+console.log('\nextractIgMediaId');
+t('pulls the id out of a bare ig: entry', () => assert.strictEqual(extractIgMediaId('ig:18120496165921301'), '18120496165921301'));
+t('pulls the id out when an fb: id already follows', () =>
+  assert.strictEqual(extractIgMediaId('ig:18120496165921301;fb:67890'), '18120496165921301'));
+t('no ig: entry -> null', () => assert.strictEqual(extractIgMediaId('fb:67890'), null));
+t('missing platform_post_id -> null', () => assert.strictEqual(extractIgMediaId(null), null));
 
 console.log('\ntrimCaption');
 t('short text is untouched', () => assert.strictEqual(trimCaption('hello', 900), 'hello'));

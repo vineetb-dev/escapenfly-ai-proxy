@@ -3271,7 +3271,7 @@ async function isDmcVendorNumber(phone) {
 const FALLBACK_REPLY = 'Thanks for your message! Our travel expert will call you shortly. You can also reach us directly at +91 98517 39851. 😊';
 const UNSUPPORTED_MEDIA_REPLY = "Thanks for sharing that! I work best with text messages right now, so I can't open images, documents, or links yet. For general enquiries, please call us at +91 98517 39851. For partner & DMC queries, contact Vivek Bansal at 9988740145. For complaints or urgent issues, contact Vineet Bansal at 9216320050. Just type your travel query in words and I'll help right away!";
 
-async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef = null, attribution = null, adReferralText = '') {
+async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef = null, attribution = null, adReferralText = '', testMode = false) {
   const t0 = Date.now();
   const log = { intent: '-', crm: 'none', notify: '-' };
   let tAI = t0, tSent = t0;
@@ -3461,12 +3461,18 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     chat.known = mergeLeadData(chat.known || {}, freshData);
 
     // ── WEBSITE SESSION → PHONE GRADUATION (§11) ──
+    // testMode (set only by a test runner sending a real request against a
+    // test_-prefixed session key — see /webhook/website-chat) skips
+    // graduation entirely, so effectivePhone never becomes a real-looking
+    // phone number. That alone also disables the LEAD CAPTURE block below,
+    // since it's gated on validPhone(effectivePhone) — one flag closes both
+    // gaps the 16 Sep production test-data incident hit.
     let effectivePhone = phone;
     const capturedPhoneRaw = parsed.lead?.phone ? String(parsed.lead.phone).replace(/\D/g, '') : '';
-    if (channel === 'website' && !validPhone(phone) && validPhone(capturedPhoneRaw)) {
+    if (!testMode && channel === 'website' && !validPhone(phone) && validPhone(capturedPhoneRaw)) {
       await graduateSessionToPhone(phone, capturedPhoneRaw, chat);
       effectivePhone = capturedPhoneRaw;
-    } else if (validPhone(phone)) {
+    } else if (!testMode && validPhone(phone)) {
       // Already phone-keyed (WhatsApp, or a website session past graduation) —
       // keep customer_profile current every turn, not just at graduation.
       await upsertCustomerProfile(phone, chat.known);
@@ -3706,9 +3712,15 @@ app.post('/webhook/website-chat', async (req, res) => {
     const v = cleanAttr(req.body[k] || '');
     if (v) attribution[k] = v;
   }
+  // Test-mode escape hatch for tests/run-tests.js (and any other harness
+  // hitting this live endpoint on purpose) — requires BOTH the header and a
+  // test_-prefixed session key, so this can never be used to silently
+  // suppress lead creation/notifications for a real customer by just
+  // sending an extra header. See mayaTurn's testMode param.
+  const testMode = req.headers['x-maya-test-mode'] === '1' && /^test/i.test(sessionKey);
   const out = {};
   const reply = await withPhoneLock(sessionKey,
-    () => mayaTurn(sessionKey, message, null, 'website', out, attribution));
+    () => mayaTurn(sessionKey, message, null, 'website', out, attribution, '', testMode));
   const founderNotesList = out.founderNotesList || [];
   // Option C (additive hybrid): visa/flights/hotels/budget/tips below stay
   // exactly as they've always behaved for the single-destination case (the

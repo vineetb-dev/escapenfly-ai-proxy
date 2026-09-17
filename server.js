@@ -5492,6 +5492,12 @@ app.get('/health', (req, res) => res.json({
 const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   app.listen(PORT, () => console.log(`EscapeNFly AI Engine v3.9 running on port ${PORT}`));
+  // Warms maya-messaging.js's Page-token cache at startup rather than
+  // lazily on the first real DM — a broken token exchange then shows up in
+  // deploy logs immediately instead of silently on someone's first message
+  // (see initMetaPageToken()'s own comment for the incident this fixes).
+  // Guarded the same way app.listen is — no network call on a bare require.
+  maya.initMetaPageToken(process.env.META_ACCESS_TOKEN).catch(e => console.error('initMetaPageToken error:', e.message));
 }
 
 // Exposed for the isolated model-comparison harness (tests/model-lab/) only —

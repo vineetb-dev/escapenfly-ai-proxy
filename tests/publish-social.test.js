@@ -30,7 +30,7 @@
 const assert = require('assert');
 const {
   isVideoUrl, hasFbId, extractIgMediaId, appendFbId, trimCaption, planFbPublish,
-  pickAiSensyTemplate, selectPrimaryContent, todayIST, publishReel
+  pickAiSensyTemplate, selectPrimaryContent, todayIST, publishReel, pollReelStatus
 } = require('../publish-social');
 
 let pass = 0;
@@ -165,10 +165,11 @@ async function testPublishReel() {
     assert.strictEqual(uploadCall.opts.headers['file_url'], 'https://cdn.example.com/x.mp4');
 
     assert.strictEqual(result.videoId, FAKE_VIDEO_ID);
-    assert.strictEqual(result.status, 'ready');
+    assert.strictEqual(calls.some(c => !c.url.includes('rupload.facebook.com') && !c.url.includes('/video_reels')), false,
+      'publishReel resolves as soon as finish succeeds — it must not itself poll the status endpoint (see pollReelStatus)');
 
     pass++;
-    console.log('  ok   finish call carries video_id; upload uses the start phase\'s upload_url');
+    console.log('  ok   finish call carries video_id; upload uses the start phase\'s upload_url; no status poll from within publishReel');
   } catch (e) {
     console.error('  FAIL publishReel fake 3-phase sequence\n       ' + e.message);
     process.exitCode = 1;
@@ -177,4 +178,76 @@ async function testPublishReel() {
   }
 }
 
-testPublishReel().then(() => console.log(`\n${pass} passed`));
+console.log('\npollReelStatus (best-effort — must never throw, even on a Graph API error)');
+async function testPollReelStatusError() {
+  // Real bug this reproduces: a Morocco reel had start/upload/finish all
+  // succeed (video_id 3608214656001289), but the immediate status GET came
+  // back with Graph error #100 "Unsupported get request". Before the fix,
+  // that exception unwound out of the combined publishReel() and was caught
+  // by publishFbRow's try/catch as a total failure — even though the reel
+  // was already live and platform_post_id was never written.
+  const realFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({ error: { message: 'Unsupported get request.', code: 100 } })
+  });
+  try {
+    const result = await pollReelStatus({ videoId: 'vid_fake_123', pageToken: 'TOKEN1' });
+    assert.strictEqual(result.status, 'unknown', 'a poll error leaves status as "unknown" rather than throwing');
+    assert.strictEqual(result.permalinkUrl, null);
+    pass++;
+    console.log('  ok   a Graph API error on the status poll is swallowed, not thrown');
+  } catch (e) {
+    console.error('  FAIL pollReelStatus swallows a Graph API error\n       ' + e.message);
+    process.exitCode = 1;
+  } finally {
+    global.fetch = realFetch;
+  }
+}
+
+console.log('\nfinish-success-then-poll-error (the exact sequence publishFbRow now runs for a reel)');
+async function testFinishSuccessThenPollError() {
+  const FAKE_VIDEO_ID = 'vid_fake_456';
+  const FAKE_UPLOAD_URL = 'https://rupload.facebook.com/video-upload/v25.0/vid_fake_456';
+  const realFetch = global.fetch;
+  global.fetch = async (url, opts = {}) => {
+    const urlStr = String(url);
+    if (urlStr.includes('rupload.facebook.com')) return { ok: true, json: async () => ({ success: true }) };
+    if (urlStr.includes('/video_reels')) {
+      const body = JSON.parse(opts.body);
+      if (body.upload_phase === 'start') {
+        return { ok: true, json: async () => ({ video_id: FAKE_VIDEO_ID, upload_url: FAKE_UPLOAD_URL }) };
+      }
+      return { ok: true, json: async () => ({ success: true }) }; // finish
+    }
+    // the status-poll GET — the leg that fails in the real Morocco incident
+    return { ok: true, json: async () => ({ error: { message: 'Unsupported get request.', code: 100 } }) };
+  };
+  try {
+    // Mirrors publishFbRow's reel branch: publishReel() (finish) must
+    // resolve successfully on its own — a caller can (and now does) record
+    // the fb: id right here, before ever calling pollReelStatus.
+    const { videoId } = await publishReel({
+      pageId: 'PAGE1', pageToken: 'TOKEN1', videoUrl: 'https://cdn.example.com/x.mp4', description: 'a caption'
+    });
+    assert.strictEqual(videoId, FAKE_VIDEO_ID, 'finish succeeding hands back a real video id, independent of the poll');
+
+    // The subsequent poll fails, but must not throw and must not retract
+    // the success above in any way.
+    const { status } = await pollReelStatus({ videoId, pageToken: 'TOKEN1' });
+    assert.strictEqual(status, 'unknown');
+
+    pass++;
+    console.log('  ok   finish success (real video id) survives a subsequent poll failure with no exception');
+  } catch (e) {
+    console.error('  FAIL finish-success-then-poll-error\n       ' + e.message);
+    process.exitCode = 1;
+  } finally {
+    global.fetch = realFetch;
+  }
+}
+
+testPublishReel()
+  .then(testPollReelStatusError)
+  .then(testFinishSuccessThenPollError)
+  .then(() => console.log(`\n${pass} passed`));

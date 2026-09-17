@@ -30,7 +30,8 @@
 const assert = require('assert');
 const {
   isVideoUrl, hasFbId, extractIgMediaId, appendFbId, trimCaption, planFbPublish,
-  pickAiSensyTemplate, selectPrimaryContent, todayIST, publishReel, pollReelStatus
+  pickAiSensyTemplate, selectPrimaryContent, todayIST, publishReel, pollReelStatus,
+  deriveFirstCarouselImageUrl
 } = require('../publish-social');
 
 let pass = 0;
@@ -121,6 +122,20 @@ t('falls back to a whatsapp status set only when status_image_urls was actually 
 });
 t('no eligible rows and no status images -> null, never fabricates a send', () => {
   assert.strictEqual(selectPrimaryContent([], null), null);
+});
+t('a carousel is selected even though its own asset_url is a Canva edit link, not real media', () => {
+  const rows = [{ row: { channel: 'ig_carousel' }, asset: { asset_url: 'https://www.canva.com/design/ABC123/edit' } }];
+  const p = selectPrimaryContent(rows, null);
+  assert.strictEqual(p.row.channel, 'ig_carousel');
+  assert.strictEqual(p.mediaUrl, null, 'mediaUrl must never be the Canva link — real image comes from a separate ig: derivation step (see teamDailyContent)');
+});
+t('a carousel still beats a whatsapp status set, same priority as before', () => {
+  const rows = [
+    { row: { channel: 'whatsapp' }, asset: { asset_url: null } },
+    { row: { channel: 'ig_carousel' }, asset: { asset_url: 'https://www.canva.com/design/ABC123/edit' } }
+  ];
+  const p = selectPrimaryContent(rows, ['https://x/status1.jpg']);
+  assert.strictEqual(p.row.channel, 'ig_carousel');
 });
 
 console.log('\ntodayIST');
@@ -247,7 +262,63 @@ async function testFinishSuccessThenPollError() {
   }
 }
 
+console.log('\nderiveFirstCarouselImageUrl (fake ig children lookup — no real network)');
+async function testDeriveFirstCarouselImageUrl() {
+  const realFetch = global.fetch;
+  const hadToken = 'META_ACCESS_TOKEN' in process.env;
+  const prevToken = process.env.META_ACCESS_TOKEN;
+  process.env.META_ACCESS_TOKEN = 'fake-token-for-test';
+
+  // no ig media id at all (carousel not yet posted to Instagram) -> null,
+  // and no network call attempted
+  let fetchCalled = false;
+  global.fetch = async () => { fetchCalled = true; return { ok: true, json: async () => ({}) }; };
+  try {
+    const r = await deriveFirstCarouselImageUrl(null);
+    assert.strictEqual(r, null);
+    assert.strictEqual(fetchCalled, false, 'no ig media id means no Graph call at all');
+    pass++;
+    console.log('  ok   no ig media id -> null, no network call');
+  } catch (e) {
+    console.error('  FAIL deriveFirstCarouselImageUrl (no id)\n       ' + e.message);
+    process.exitCode = 1;
+  }
+
+  // real children response -> first media_url
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({ data: [{ media_url: 'https://cdn.example.com/img1.jpg' }, { media_url: 'https://cdn.example.com/img2.jpg' }] })
+  });
+  try {
+    const r = await deriveFirstCarouselImageUrl('ig_media_123');
+    assert.strictEqual(r, 'https://cdn.example.com/img1.jpg');
+    pass++;
+    console.log('  ok   returns the first child media_url');
+  } catch (e) {
+    console.error('  FAIL deriveFirstCarouselImageUrl (success)\n       ' + e.message);
+    process.exitCode = 1;
+  }
+
+  // Graph API error -> null, not thrown (same best-effort contract as
+  // pollReelStatus — a real run hits this when a carousel hasn't been
+  // posted to Instagram yet, or the token lacks access)
+  global.fetch = async () => ({ ok: true, json: async () => ({ error: { message: 'Unsupported get request.', code: 100 } }) });
+  try {
+    const r = await deriveFirstCarouselImageUrl('ig_media_123');
+    assert.strictEqual(r, null);
+    pass++;
+    console.log('  ok   a Graph API error is swallowed, returns null rather than throwing');
+  } catch (e) {
+    console.error('  FAIL deriveFirstCarouselImageUrl (Graph error)\n       ' + e.message);
+    process.exitCode = 1;
+  } finally {
+    global.fetch = realFetch;
+    if (hadToken) process.env.META_ACCESS_TOKEN = prevToken; else delete process.env.META_ACCESS_TOKEN;
+  }
+}
+
 testPublishReel()
   .then(testPollReelStatusError)
   .then(testFinishSuccessThenPollError)
+  .then(testDeriveFirstCarouselImageUrl)
   .then(() => console.log(`\n${pass} passed`));

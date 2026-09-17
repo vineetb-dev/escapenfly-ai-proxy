@@ -2,7 +2,7 @@
  * publish-social.test.js — sanity checks for publish-social.js's pure logic
  * Run with: node tests/publish-social.test.js   (no test framework needed)
  *
- * Covers only the exported pure functions (no network, no Supabase) — same
+ * Mostly covers the exported pure functions (no network, no Supabase) — same
  * scope discipline as canton.test.js. The Supabase-reading/Meta/AiSensy-
  * calling functions (publishFbRow, teamDailyContent, fbSafetyCrosspost) were
  * verified separately: real local server start, real ?dry=1 requests against
@@ -15,6 +15,14 @@
  * that is reproducible here without real META_ACCESS_TOKEN/AISENSY_KEY/a
  * live Render deploy, so it isn't pretended to be — see the PR description
  * for the exact commands run and their real output.
+ *
+ * The one exception to "no network": publishReel() below, added after a
+ * real run (real token, real Egypt carousel succeeding via the same token —
+ * scopes were never the problem) hit a real Graph API error the pure-logic
+ * tests couldn't have caught, since request-body construction across a
+ * 3-phase sequence isn't pure-function-testable. That test fakes global.fetch
+ * for exactly the three calls this one function makes, then restores it —
+ * still no real network, but no longer "pure functions only" either.
  */
 
 'use strict';
@@ -22,7 +30,7 @@
 const assert = require('assert');
 const {
   isVideoUrl, hasFbId, extractIgMediaId, appendFbId, trimCaption, planFbPublish,
-  pickAiSensyTemplate, selectPrimaryContent, todayIST
+  pickAiSensyTemplate, selectPrimaryContent, todayIST, publishReel
 } = require('../publish-social');
 
 let pass = 0;
@@ -118,4 +126,55 @@ t('no eligible rows and no status images -> null, never fabricates a send', () =
 console.log('\ntodayIST');
 t('returns a YYYY-MM-DD string', () => assert.match(todayIST(), /^\d{4}-\d{2}-\d{2}$/));
 
-console.log(`\n${pass} passed`);
+console.log('\npublishReel (fake 3-phase Graph sequence — start/rupload/finish, no real network)');
+async function testPublishReel() {
+  const FAKE_VIDEO_ID = 'vid_fake_123';
+  const FAKE_UPLOAD_URL = 'https://rupload.facebook.com/video-upload/v25.0/vid_fake_123';
+  const calls = [];
+  const realFetch = global.fetch;
+  global.fetch = async (url, opts = {}) => {
+    const urlStr = String(url);
+    calls.push({ url: urlStr, opts });
+    if (urlStr.includes('rupload.facebook.com')) {
+      return { ok: true, json: async () => ({ success: true }) };
+    }
+    if (urlStr.includes('/video_reels')) {
+      const body = JSON.parse(opts.body);
+      if (body.upload_phase === 'start') {
+        return { ok: true, json: async () => ({ video_id: FAKE_VIDEO_ID, upload_url: FAKE_UPLOAD_URL }) };
+      }
+      return { ok: true, json: async () => ({ success: true }) }; // finish
+    }
+    return { ok: true, json: async () => ({ status: { video_status: 'ready' } }) }; // status poll
+  };
+  try {
+    const result = await publishReel({
+      pageId: 'PAGE1', pageToken: 'TOKEN1', videoUrl: 'https://cdn.example.com/x.mp4', description: 'a caption'
+    });
+
+    const finishCall = calls.find(c => c.url.includes('/video_reels') && JSON.parse(c.opts.body).upload_phase === 'finish');
+    assert.ok(finishCall, 'a finish-phase video_reels call was made');
+    const finishBody = JSON.parse(finishCall.opts.body);
+    assert.strictEqual(finishBody.video_id, FAKE_VIDEO_ID, 'finish call must carry the video_id from the start-phase response — this was the actual bug (Graph API #100 "Missing parameter: video_id")');
+    assert.strictEqual(finishBody.video_state, 'PUBLISHED');
+    assert.strictEqual(finishBody.description, 'a caption');
+
+    const uploadCall = calls.find(c => c.url.includes('rupload.facebook.com'));
+    assert.ok(uploadCall, 'the file was uploaded via rupload.facebook.com');
+    assert.strictEqual(uploadCall.url, FAKE_UPLOAD_URL, 'must upload to the upload_url the start phase returned, not a hand-built guess');
+    assert.strictEqual(uploadCall.opts.headers['file_url'], 'https://cdn.example.com/x.mp4');
+
+    assert.strictEqual(result.videoId, FAKE_VIDEO_ID);
+    assert.strictEqual(result.status, 'ready');
+
+    pass++;
+    console.log('  ok   finish call carries video_id; upload uses the start phase\'s upload_url');
+  } catch (e) {
+    console.error('  FAIL publishReel fake 3-phase sequence\n       ' + e.message);
+    process.exitCode = 1;
+  } finally {
+    global.fetch = realFetch;
+  }
+}
+
+testPublishReel().then(() => console.log(`\n${pass} passed`));

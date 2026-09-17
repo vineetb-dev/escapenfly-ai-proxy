@@ -154,7 +154,10 @@ async function publishReel({ pageId, pageToken, videoUrl, description }) {
   const videoId = start.video_id;
   if (!videoId) throw new Error('video_reels start did not return a video_id');
 
-  const uploadUrl = `https://rupload.facebook.com/video-upload/${GRAPH_VERSION}/${videoId}`;
+  // Meta's own docs say the start-phase response carries upload_url — prefer
+  // it over hand-building the rupload URL (same GRAPH_VERSION either way
+  // today, but the returned URL is the one actually guaranteed to work).
+  const uploadUrl = start.upload_url || `https://rupload.facebook.com/video-upload/${GRAPH_VERSION}/${videoId}`;
   const uploadRes = await fetch(uploadUrl, {
     method: 'POST',
     headers: { 'Authorization': `OAuth ${pageToken}`, 'file_url': videoUrl }
@@ -164,7 +167,11 @@ async function publishReel({ pageId, pageToken, videoUrl, description }) {
     throw new Error(`rupload failed: ${uploadRes.status} ${JSON.stringify(uploadData).slice(0, 200)}`);
   }
 
+  // video_id is required here too — omitting it fails with "(#100) Missing
+  // parameter: video_id" (found on the first real run with a working token;
+  // start/upload had already succeeded, so this was the only untested leg).
   const finish = await graphPost(`/${pageId}/video_reels`, {
+    video_id: videoId,
     upload_phase: 'finish',
     video_state: 'PUBLISHED',
     description
@@ -412,6 +419,10 @@ module.exports = {
   publishFbRow,
   fbSafetyCrosspost,
   teamDailyContent,
+  // exported for tests — publishReel needs a fake 3-phase Graph sequence
+  // (global.fetch mocked), not the "pure, no network" discipline the rest
+  // of this list follows
+  publishReel,
   // exported for tests — pure, no network/Supabase
   isVideoUrl,
   hasFbId,

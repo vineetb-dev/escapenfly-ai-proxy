@@ -3461,12 +3461,19 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     chat.known = mergeLeadData(chat.known || {}, freshData);
 
     // ── WEBSITE SESSION → PHONE GRADUATION (§11) ──
-    // testMode (set only by a test runner sending a real request against a
-    // test_-prefixed session key — see /webhook/website-chat) skips
-    // graduation entirely, so effectivePhone never becomes a real-looking
-    // phone number. That alone also disables the LEAD CAPTURE block below,
-    // since it's gated on validPhone(effectivePhone) — one flag closes both
-    // gaps the 16 Sep production test-data incident hit.
+    // testMode (set only by a test runner — see /webhook/website-chat, or a
+    // direct mayaTurn() call from a runner like tests/run-tests-whatsapp.js)
+    // skips graduation entirely, so effectivePhone never becomes a
+    // real-looking phone number on website. That was enough to close the
+    // 16 Sep production test-data incident for website, since testMode
+    // there indirectly disabled the LEAD CAPTURE block via
+    // validPhone(effectivePhone). It was NOT enough for whatsapp/messenger/
+    // instagram, whose phone/psid/igsid is real (or deliberately
+    // test_-prefixed, which already fails validPhone) from the first turn —
+    // graduation never applies to them, so testMode had no effect on lead
+    // capture there at all. The LEAD CAPTURE gate below now checks
+    // !testMode directly so it's channel-agnostic instead of relying on an
+    // indirect, website-only side effect.
     let effectivePhone = phone;
     const capturedPhoneRaw = parsed.lead?.phone ? String(parsed.lead.phone).replace(/\D/g, '') : '';
     if (!testMode && channel === 'website' && !validPhone(phone) && validPhone(capturedPhoneRaw)) {
@@ -3534,7 +3541,7 @@ async function mayaTurn(phone, message, onReply, channel = 'whatsapp', resultRef
     }
 
     // ── LEAD CAPTURE (background from customer's perspective) ──
-    if ((parsed.ready || parsed.handover) && validPhone(effectivePhone)) {
+    if (!testMode && (parsed.ready || parsed.handover) && validPhone(effectivePhone)) {
       const recent = await findRecentLeadDB(effectivePhone);
       if (recent) {
         const merged = mergeLeadData(recent.existing, chat.known);

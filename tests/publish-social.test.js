@@ -30,7 +30,7 @@
 const assert = require('assert');
 const {
   isVideoUrl, hasFbId, extractIgMediaId, appendFbId, trimCaption, planFbPublish,
-  pickAiSensyTemplate, selectPrimaryContent, todayIST, publishReel, pollReelStatus
+  pickAiSensyTemplate, selectPrimaryContent, todayIST, publishReel, pollReelStatus, deriveCarouselImageUrls
 } = require('../publish-social');
 
 let pass = 0;
@@ -100,8 +100,18 @@ t('a plain image asset without allow_text refuses rather than silently posting',
 });
 
 console.log('\npickAiSensyTemplate');
-t('video -> the video variant', () => assert.strictEqual(pickAiSensyTemplate(true), 'team_daily_content_video'));
-t('not video -> the image variant', () => assert.strictEqual(pickAiSensyTemplate(false), 'team_daily_content_image'));
+t('video -> the approved video template name', () => assert.strictEqual(pickAiSensyTemplate(true), 'team_daily_content'));
+t('not video -> the approved image template name', () => assert.strictEqual(pickAiSensyTemplate(false), 'team_daily_content_pcwls'));
+t('AISENSY_TEMPLATE_VIDEO env override', () => {
+  process.env.AISENSY_TEMPLATE_VIDEO = 'custom_video_tpl';
+  try { assert.strictEqual(pickAiSensyTemplate(true), 'custom_video_tpl'); }
+  finally { delete process.env.AISENSY_TEMPLATE_VIDEO; }
+});
+t('AISENSY_TEMPLATE_IMAGE env override', () => {
+  process.env.AISENSY_TEMPLATE_IMAGE = 'custom_image_tpl';
+  try { assert.strictEqual(pickAiSensyTemplate(false), 'custom_image_tpl'); }
+  finally { delete process.env.AISENSY_TEMPLATE_IMAGE; }
+});
 
 console.log('\nselectPrimaryContent');
 t('prefers a reel over a status set, even with status images available', () => {
@@ -121,6 +131,17 @@ t('falls back to a whatsapp status set only when status_image_urls was actually 
 });
 t('no eligible rows and no status images -> null, never fabricates a send', () => {
   assert.strictEqual(selectPrimaryContent([], null), null);
+});
+t('a carousel row is eligible off its ig: id, not asset.asset_url — header image deferred to the caller', () => {
+  const rows = [{ row: { channel: 'ig_carousel', platform_post_id: 'ig:18120496165921301' }, asset: { asset_url: null } }];
+  const p = selectPrimaryContent(rows, null);
+  assert.strictEqual(p.row.channel, 'ig_carousel');
+  assert.strictEqual(p.mediaUrl, null);
+  assert.strictEqual(p.needsCarouselImage, true);
+});
+t('a carousel row with no ig: id is not eligible, even with asset.asset_url set', () => {
+  const rows = [{ row: { channel: 'ig_carousel', platform_post_id: null }, asset: { asset_url: 'https://x/legacy.jpg' } }];
+  assert.strictEqual(selectPrimaryContent(rows, null), null);
 });
 
 console.log('\ntodayIST');
@@ -247,7 +268,38 @@ async function testFinishSuccessThenPollError() {
   }
 }
 
+console.log('\nderiveCarouselImageUrls (fake Graph response, no real network)');
+async function testDeriveCarouselImageUrls() {
+  try {
+    const noIgId = await deriveCarouselImageUrls('fb:67890');
+    assert.strictEqual(noIgId, null, 'no ig: id -> null, no network call attempted');
+
+    const realFetch = global.fetch;
+    const realToken = process.env.META_ACCESS_TOKEN;
+    process.env.META_ACCESS_TOKEN = 'fake-token';
+    global.fetch = async (url) => {
+      assert.ok(String(url).includes('/18120496165921301/children'), 'requests the ig media id\'s children edge');
+      assert.ok(String(url).includes('fields=media_url'), 'requests media_url specifically');
+      return { ok: true, json: async () => ({ data: [{ media_url: 'https://x/1.jpg' }, { media_url: 'https://x/2.jpg' }, {}] }) };
+    };
+    try {
+      const urls = await deriveCarouselImageUrls('ig:18120496165921301');
+      assert.deepStrictEqual(urls, ['https://x/1.jpg', 'https://x/2.jpg'], 'filters out entries with no media_url');
+    } finally {
+      global.fetch = realFetch;
+      if (realToken === undefined) delete process.env.META_ACCESS_TOKEN; else process.env.META_ACCESS_TOKEN = realToken;
+    }
+
+    pass++;
+    console.log('  ok   returns null with no ig: id; derives + filters the media_url list from the children edge');
+  } catch (e) {
+    console.error('  FAIL deriveCarouselImageUrls\n       ' + e.message);
+    process.exitCode = 1;
+  }
+}
+
 testPublishReel()
   .then(testPollReelStatusError)
   .then(testFinishSuccessThenPollError)
+  .then(testDeriveCarouselImageUrls)
   .then(() => console.log(`\n${pass} passed`));

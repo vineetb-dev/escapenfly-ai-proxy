@@ -104,8 +104,16 @@ function selectPrimaryContent(eligibleRows, statusImageUrls) {
   const reel = eligibleRows.find(e => e.row.channel === 'ig_fb_reel' && e.asset.asset_url);
   if (reel) return { row: reel.row, asset: reel.asset, mediaUrl: reel.asset.asset_url, isVideo: true };
 
-  const carousel = eligibleRows.find(e => e.row.channel === 'ig_carousel' && e.asset.asset_url);
-  if (carousel) return { row: carousel.row, asset: carousel.asset, mediaUrl: carousel.asset.asset_url, isVideo: isVideoUrl(carousel.asset.asset_url) };
+  // A carousel asset's own asset_url is a Canva design/edit link (for
+  // production, not posting) — never real, fetchable media, unlike a
+  // reel's asset_url, which genuinely is the MP4. Confirmed against real
+  // production rows: every ig_carousel asset_url is a
+  // canva.com/design/.../edit URL. mediaUrl is deliberately left null here
+  // — teamDailyContent() resolves the real image afterward (derived from
+  // the row's own ig: id) as a separate async step, since this function
+  // stays pure/synchronous for its own unit tests.
+  const carousel = eligibleRows.find(e => e.row.channel === 'ig_carousel');
+  if (carousel) return { row: carousel.row, asset: carousel.asset, mediaUrl: null, isVideo: false };
 
   const firstStatusImage = statusImageUrls && statusImageUrls.length ? statusImageUrls[0] : null;
   const waRow = eligibleRows.find(e => e.row.channel === 'whatsapp');
@@ -361,6 +369,24 @@ async function fbSafetyCrosspost({ dry }) {
 
 // ── 2. POST /internal/team-daily-content?date=YYYY-MM-DD ──
 
+// Same Graph call shape publishFbRow's own carousel-image derivation uses
+// (extractIgMediaId + GET /{ig_media_id}/children?fields=media_url — see PR
+// #9), but with different error semantics: that one fails the whole publish
+// loudly (real error_text write); this one is a best-effort lookup for a
+// WhatsApp media header — a missing ig: id (row not posted to Instagram
+// yet) or a Graph error just means "no media", logged and returned as null
+// rather than thrown, so the caller can fall back to a text-only template.
+async function deriveFirstCarouselImageUrl(igMediaId) {
+  if (!igMediaId) return null;
+  try {
+    const children = await graphGet(`/${igMediaId}/children`, { fields: 'media_url' }, requireEnv('META_ACCESS_TOKEN'));
+    return (children.data || []).map(d => d.media_url).filter(Boolean)[0] || null;
+  } catch (e) {
+    console.error(`deriveFirstCarouselImageUrl: ig children lookup failed for ${igMediaId}: ${e.message}`);
+    return null;
+  }
+}
+
 async function sendAiSensyMediaTemplate({ phone, userName, templateName, params, media }) {
   if (!process.env.AISENSY_KEY) {
     console.error('sendAiSensyMediaTemplate skipped: AISENSY_KEY not set');
@@ -412,8 +438,22 @@ async function teamDailyContent({ date, to, dry, statusImageUrls }) {
 
   const title = primary.asset.title || "Today's post";
   const caption = trimCaption(primary.row.caption || primary.asset.content || '', 900);
-  const template = pickAiSensyTemplate(primary.isVideo);
-  const mediaFilename = primary.isVideo ? 'reel.mp4' : 'content.jpg';
+
+  // selectPrimaryContent() never fills mediaUrl for a carousel (see its own
+  // comment) — derive the real image from the row's own ig: id here. Runs
+  // unconditionally (dry or not, like publishFbRow's own derivation) so
+  // ?dry=1 shows the real template + media a live run would use. A carousel
+  // not yet posted to Instagram (no ig: id in platform_post_id yet) or a
+  // Graph lookup failure both just leave mediaUrl null — that's the signal
+  // to fall back to a text-only template below instead of failing.
+  let mediaUrl = primary.mediaUrl;
+  if (!mediaUrl && primary.row.channel === 'ig_carousel') {
+    mediaUrl = await deriveFirstCarouselImageUrl(extractIgMediaId(primary.row.platform_post_id));
+  }
+
+  const isVideo = !!mediaUrl && primary.isVideo;
+  const template = mediaUrl ? pickAiSensyTemplate(isVideo) : 'team_daily_content_text';
+  const mediaFilename = isVideo ? 'reel.mp4' : (mediaUrl ? 'content.jpg' : null);
 
   let recipients;
   if (to) {
@@ -425,28 +465,41 @@ async function teamDailyContent({ date, to, dry, statusImageUrls }) {
     recipients = (team || []).filter(t => t.phone);
   }
 
+  if (dry) {
+    return { sent: recipients.length, failed: [], date: targetDate, template, title, media_url: mediaUrl || undefined, dry: true };
+  }
+
   let sent = 0;
   const failed = [];
   for (const r of recipients) {
-    if (dry) { sent++; continue; }
     const result = await sendAiSensyMediaTemplate({
       phone: r.phone,
       userName: r.name,
       templateName: template,
-      params: [title, caption, primary.mediaUrl],
-      media: { url: primary.mediaUrl, filename: mediaFilename }
+      params: mediaUrl ? [title, caption, mediaUrl] : [title, caption],
+      media: mediaUrl ? { url: mediaUrl, filename: mediaFilename } : undefined
     });
     if (result.ok) sent++; else failed.push({ phone: r.phone, error: result.error });
   }
 
-  if (!dry) {
+  // Surface WHY, not just how many — a bare count left "Lapland Carousel —
+  // 17 Sep" showing sent:0/failed:1 with no way to tell what actually
+  // failed. failed[].error already carries AiSensy's own message (or
+  // 'AISENSY_KEY not set'); this just stops it from being discarded here.
+  if (failed.length) {
+    const detail = failed.map(f => `${f.phone}: ${f.error}`).join('; ').slice(0, 300);
     await writeNotification(sb, {
       type: 'team_content',
-      summary: `Today's content sent to ${sent} team member${sent === 1 ? '' : 's'}${failed.length ? `, ${failed.length} failed` : ''} — "${title}"`
+      summary: `Today's content sent to ${sent} team member${sent === 1 ? '' : 's'}, ${failed.length} failed (${detail}) — "${title}"`
+    });
+  } else {
+    await writeNotification(sb, {
+      type: 'team_content',
+      summary: `Today's content sent to ${sent} team member${sent === 1 ? '' : 's'} — "${title}"`
     });
   }
 
-  return { sent, failed, date: targetDate, template, title, dry: !!dry };
+  return { sent, failed, date: targetDate, template, title, media_url: mediaUrl || undefined, dry: !!dry };
 }
 
 module.exports = {
@@ -454,11 +507,12 @@ module.exports = {
   publishFbRow,
   fbSafetyCrosspost,
   teamDailyContent,
-  // exported for tests — publishReel/pollReelStatus need a fake Graph
-  // sequence (global.fetch mocked), not the "pure, no network" discipline
-  // the rest of this list follows
+  // exported for tests — publishReel/pollReelStatus/deriveFirstCarouselImageUrl
+  // need a fake Graph sequence (global.fetch mocked), not the "pure, no
+  // network" discipline the rest of this list follows
   publishReel,
   pollReelStatus,
+  deriveFirstCarouselImageUrl,
   // exported for tests — pure, no network/Supabase
   isVideoUrl,
   hasFbId,

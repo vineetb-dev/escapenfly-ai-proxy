@@ -19,6 +19,10 @@
  *   AISENSY_KEY                - already set (server.js's sendWA/sendSessionMessage use it)
  *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY - already set (shared with meta-sync.js)
  *   PUBLISH_MAX_PER_RUN        - optional, defaults to 20 (caps the safety-cron batch)
+ *   AISENSY_TEMPLATE_VIDEO     - optional, defaults to 'team_daily_content' (the
+ *                                 approved video-header template name)
+ *   AISENSY_TEMPLATE_IMAGE     - optional, defaults to 'team_daily_content_pcwls'
+ *                                 (the approved image-header template name)
  */
 
 const { createClient } = require('@supabase/supabase-js');
@@ -92,20 +96,33 @@ function planFbPublish(asset, { allowText, imageUrls } = {}) {
 // team_daily_content has two approved variants, one per header media type —
 // there is no text-only variant, so a day with no available media has
 // nothing it can send (see teamDailyContent()'s selectPrimaryContent below).
+// The two variants' real AiSensy-approved names don't share a clean naming
+// convention (image carries a "_pcwls" suffix AiSensy generated at template
+// creation, not this codebase's choice) — configurable via env so a future
+// re-approval under different names doesn't need a code deploy.
 function pickAiSensyTemplate(isVideo) {
-  return isVideo ? 'team_daily_content_video' : 'team_daily_content_image';
+  const video = process.env.AISENSY_TEMPLATE_VIDEO || 'team_daily_content';
+  const image = process.env.AISENSY_TEMPLATE_IMAGE || 'team_daily_content_pcwls';
+  return isVideo ? video : image;
 }
 
 // Prefers content that always carries its own media (a reel's asset_url is
 // never optional) over the WhatsApp status-set row, whose media depends on
 // the caller having passed status_image_urls this run. That keeps a day's
 // send from depending on an optional body field whenever a reel exists.
+//
+// A carousel's eligibility is keyed on its platform_post_id carrying an
+// extractable ig: id, not on asset.asset_url — a carousel has many images,
+// asset_url was never meant to hold "the" one. mediaUrl comes back null
+// with needsCarouselImage:true; the caller (teamDailyContent, which already
+// does network/Supabase calls) resolves the real header image via
+// deriveCarouselImageUrls before sending, same source publishFbRow uses.
 function selectPrimaryContent(eligibleRows, statusImageUrls) {
   const reel = eligibleRows.find(e => e.row.channel === 'ig_fb_reel' && e.asset.asset_url);
   if (reel) return { row: reel.row, asset: reel.asset, mediaUrl: reel.asset.asset_url, isVideo: true };
 
-  const carousel = eligibleRows.find(e => e.row.channel === 'ig_carousel' && e.asset.asset_url);
-  if (carousel) return { row: carousel.row, asset: carousel.asset, mediaUrl: carousel.asset.asset_url, isVideo: isVideoUrl(carousel.asset.asset_url) };
+  const carousel = eligibleRows.find(e => e.row.channel === 'ig_carousel' && extractIgMediaId(e.row.platform_post_id));
+  if (carousel) return { row: carousel.row, asset: carousel.asset, mediaUrl: null, isVideo: false, needsCarouselImage: true };
 
   const firstStatusImage = statusImageUrls && statusImageUrls.length ? statusImageUrls[0] : null;
   const waRow = eligibleRows.find(e => e.row.channel === 'whatsapp');
@@ -147,6 +164,20 @@ async function getPageAccessToken(pageId, systemUserToken) {
   const data = await graphGet(`/${pageId}`, { fields: 'access_token' }, systemUserToken);
   if (!data.access_token) throw new Error('Could not obtain Page Access Token — check the system user has admin access on the Page');
   return data.access_token;
+}
+
+// A carousel's real images live on the Instagram post itself (its ig: id),
+// not on marketing_assets.asset_url — that field was never meant to hold
+// more than one image. Originally written for publishFbRow's FB cross-post
+// (PR #9); reused as-is by teamDailyContent for the WhatsApp header image so
+// there's one source of truth for "what are this carousel's images",
+// not two independent guesses. Returns null (not an error) when the row
+// carries no ig: id at all — same "nothing to derive" case as before.
+async function deriveCarouselImageUrls(platformPostId) {
+  const igMediaId = extractIgMediaId(platformPostId);
+  if (!igMediaId) return null;
+  const children = await graphGet(`/${igMediaId}/children`, { fields: 'media_url' }, requireEnv('META_ACCESS_TOKEN'));
+  return (children.data || []).map(d => d.media_url).filter(Boolean);
 }
 
 async function publishReel({ pageId, pageToken, videoUrl, description }) {
@@ -275,19 +306,15 @@ async function publishFbRow({ publishId, dry, allowText, imageUrls }) {
   // before a real run: it shows the derived URLs without ever writing.
   let derivedImageUrls = null;
   if (asset.type === 'carousel' && (!imageUrls || !imageUrls.length)) {
-    const igMediaId = extractIgMediaId(row.platform_post_id);
-    if (igMediaId) {
-      try {
-        const children = await graphGet(`/${igMediaId}/children`, { fields: 'media_url' }, requireEnv('META_ACCESS_TOKEN'));
-        derivedImageUrls = (children.data || []).map(d => d.media_url).filter(Boolean);
-      } catch (e) {
-        if (!dry) {
-          await sb.from('marketing_publishes').update({
-            error_text: String(e.message).slice(0, 500), updated_at: new Date().toISOString()
-          }).eq('id', publishId);
-        }
-        return { ok: false, error: `ig children lookup failed: ${e.message}` };
+    try {
+      derivedImageUrls = await deriveCarouselImageUrls(row.platform_post_id);
+    } catch (e) {
+      if (!dry) {
+        await sb.from('marketing_publishes').update({
+          error_text: String(e.message).slice(0, 500), updated_at: new Date().toISOString()
+        }).eq('id', publishId);
       }
+      return { ok: false, error: `ig children lookup failed: ${e.message}` };
     }
   }
   const effectiveImageUrls = (imageUrls && imageUrls.length) ? imageUrls : derivedImageUrls;
@@ -410,6 +437,19 @@ async function teamDailyContent({ date, to, dry, statusImageUrls }) {
   const primary = selectPrimaryContent(eligibleRows, statusImageUrls);
   if (!primary) return { sent: 0, failed: [], reason: 'no eligible content with available media for this date' };
 
+  if (primary.needsCarouselImage) {
+    let images;
+    try {
+      images = await deriveCarouselImageUrls(primary.row.platform_post_id);
+    } catch (e) {
+      return { sent: 0, failed: [], reason: `carousel image derivation failed: ${e.message}` };
+    }
+    if (!images || !images.length) {
+      return { sent: 0, failed: [], reason: 'carousel has no derivable images from its ig: id' };
+    }
+    primary.mediaUrl = images[0];
+  }
+
   const title = primary.asset.title || "Today's post";
   const caption = trimCaption(primary.row.caption || primary.asset.content || '', 900);
   const template = pickAiSensyTemplate(primary.isVideo);
@@ -454,11 +494,12 @@ module.exports = {
   publishFbRow,
   fbSafetyCrosspost,
   teamDailyContent,
-  // exported for tests — publishReel/pollReelStatus need a fake Graph
-  // sequence (global.fetch mocked), not the "pure, no network" discipline
-  // the rest of this list follows
+  // exported for tests — publishReel/pollReelStatus/deriveCarouselImageUrls
+  // need a fake Graph response (global.fetch mocked), not the "pure, no
+  // network" discipline the rest of this list follows
   publishReel,
   pollReelStatus,
+  deriveCarouselImageUrls,
   // exported for tests — pure, no network/Supabase
   isVideoUrl,
   hasFbId,

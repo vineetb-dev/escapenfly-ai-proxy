@@ -1,8 +1,8 @@
 /**
  * prompt-caching.test.js — guards the cache_control structure on
  * callMayaJSON's system prompt (added 18 Aug 2026, see server.js's CLAUDE.md
- * writeup) and the /debug/cache-usage-log hit-rate logging (added 18 Sep
- * 2026) against silent regression.
+ * writeup) and the console.log hit-rate visibility line (added 18 Sep 2026)
+ * against silent regression.
  *
  * Run with: node tests/prompt-caching.test.js
  *
@@ -104,18 +104,26 @@ async function main() {
       assert.strictEqual(resultB.intent, 'holiday');
     });
 
-    console.log('\n/debug/cache-usage-log — logs a cache-read vs cache-creation entry per call');
-    t('two entries logged, most recent first', () => {
-      assert.ok(server.cacheUsageLog.length >= 2);
-      assert.strictEqual(server.cacheUsageLog[0].channel, 'whatsapp');
-      assert.strictEqual(server.cacheUsageLog[0].intent, 'holiday');
-    });
-    t('first call was a cache write, second was a cache read', () => {
-      const [second, first] = server.cacheUsageLog; // unshift -> most recent at [0]
-      assert.strictEqual(first.cache_creation_input_tokens, 12118);
-      assert.strictEqual(first.cache_read_input_tokens, 0);
-      assert.strictEqual(second.cache_creation_input_tokens, 0);
-      assert.strictEqual(second.cache_read_input_tokens, 12118);
+    console.log('\ncache hit-rate console.log line — visible in Render logs per call');
+    // Still inside the faked-fetch scope — a real network call here would
+    // just hang/fail with no ANTHROPIC_API_KEY in this environment.
+    const realLog = console.log;
+    const logged = [];
+    console.log = (...args) => logged.push(args.join(' '));
+    try {
+      await server.callMayaJSON(
+        [{ role: 'user', content: 'Hi again' }],
+        { name: 'Gamma Traveller' }, 'test_session_c', 'whatsapp', [], [], 'holiday'
+      );
+    } finally {
+      console.log = realLog;
+    }
+    const cacheLine = logged.find(l => l.includes('Maya cache usage'));
+    t('a cache-usage line was logged for this call', () => assert.ok(cacheLine, 'no "Maya cache usage" line found in console.log output'));
+    t('it names the channel and intent', () => assert.ok(cacheLine.includes('[whatsapp/holiday]')));
+    t('it carries both cache_read_input_tokens and cache_creation_input_tokens', () => {
+      assert.ok(cacheLine.includes('cache_read_input_tokens='));
+      assert.ok(cacheLine.includes('cache_creation_input_tokens='));
     });
   } finally {
     global.fetch = realFetch;

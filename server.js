@@ -3255,7 +3255,16 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
         // already constrains this, but guard against edge-case drift)
         if (!VALID_INTENTS.includes(parsed.intent)) parsed.intent = 'other_travel';
         if (debugRef) { debugRef.usage = d.usage; debugRef.model = d.model; }
-        if (d.usage) logCacheUsage(channel, intent, d.usage);
+        // Cache hit-rate visibility (18 Sep 2026) — the system prompt's static
+        // prefix has carried a cache_control breakpoint since 18 Aug 2026 (see
+        // that date's comment above), verified once at the time with real API
+        // calls, but nothing has logged usage.cache_read_input_tokens/
+        // cache_creation_input_tokens on an ongoing basis since. Plain
+        // console.log, visible directly in Render's log stream — deliberately
+        // not a new ring-buffer/debug endpoint, this is meant to be small.
+        if (d.usage) {
+          console.log(`💰 Maya cache usage [${channel}/${intent}]: cache_read_input_tokens=${d.usage.cache_read_input_tokens || 0} cache_creation_input_tokens=${d.usage.cache_creation_input_tokens || 0} input_tokens=${d.usage.input_tokens} output_tokens=${d.usage.output_tokens}`);
+        }
         return parsed;
       }
       if (debugRef) { debugRef.status = r.status; debugRef.errorType = 'no_tool_use_block'; debugRef.errorMessage = JSON.stringify(d).slice(0, 300); }
@@ -3266,31 +3275,6 @@ async function callMayaJSON(msgs, known, phone, channel = 'whatsapp', founderNot
   }
   return null;
 }
-
-// Cache hit-rate visibility (18 Sep 2026) — callMayaJSON's system prompt has
-// carried a cache_control breakpoint on its static prefix since 18 Aug 2026
-// (see that date's comment above), verified once at the time with real API
-// calls, but nothing logged usage.cache_read_input_tokens/
-// cache_creation_input_tokens on an ongoing basis since. Same ring-buffer +
-// /debug/ endpoint pattern as every other observability log in this file —
-// self-verifiable without Render dashboard access (see "Debug endpoints" in
-// CLAUDE.md).
-const cacheUsageLog = [];
-function logCacheUsage(channel, intent, usage) {
-  cacheUsageLog.unshift({
-    at: new Date().toISOString(),
-    channel, intent,
-    input_tokens: usage.input_tokens,
-    cache_creation_input_tokens: usage.cache_creation_input_tokens || 0,
-    cache_read_input_tokens: usage.cache_read_input_tokens || 0,
-    output_tokens: usage.output_tokens
-  });
-  if (cacheUsageLog.length > 200) cacheUsageLog.length = 200;
-}
-app.get('/debug/cache-usage-log', (req, res) => {
-  if (!cronAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
-  res.json(cacheUsageLog);
-});
 
 // ── PER-PHONE CONCURRENCY LOCK (prevents race → duplicate leads) ──
 const locks = new Map(); // phone -> promise chain
@@ -5540,9 +5524,6 @@ if (require.main === module) {
 module.exports = {
   callMayaJSON,
   mayaTurn,
-  // exported for tests/prompt-caching.test.js only — asserts entries land
-  // here on a real (faked-fetch) callMayaJSON call
-  cacheUsageLog,
   guessDestinationKeyFromMessage,
   allFounderDestinationKeyMatches,
   loadFounderNotes,

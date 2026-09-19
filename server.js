@@ -23,6 +23,10 @@ const { runSync: runGoogleSync } = require('./google-sync');
 // route actually calls into it, so a missing META_ACCESS_TOKEN/AISENSY_KEY
 // fails closed on that specific request, not at server startup.
 const { publishFbRow, teamDailyContent, fbSafetyCrosspost } = require('./publish-social');
+// Ads (19 Sept 2026) — Meta Marketing API for the ad account. Same
+// eager-require-is-safe reasoning as above: ads.js's own requireEnv()
+// checks don't fire until a route actually calls into it.
+const ads = require('./ads');
 // Maya on Messenger + Instagram DMs (16 Sept 2026) — see maya-messaging.js.
 // mayaTurn/validPhone are passed into handleMessagingEntry() as a `deps`
 // object at the call site rather than required back here, to avoid a
@@ -5466,6 +5470,76 @@ app.post('/internal/team-daily-content', async (req, res) => {
   }
 });
 
+// ── ADS (19 Sept 2026) — Meta Marketing API for the EscapeNFly ad
+// account. Real logic lives in ads.js, same "thin wrapper" shape as
+// publish-social.js above. Reads (overview/audiences) need no confirm;
+// every write (pause/enable/budget/engagement-from-post) requires
+// ?confirm=1 or it only returns a preview of what would happen — see
+// ads.js's own SAFETY MODEL comment for the full reasoning, including why
+// engagement-from-post never activates anything it creates. Auth reuses
+// ADMIN_WRITE_SECRET/adminWriteAuthOk — same family as every other
+// CRM-triggered /internal/* write, not a new secret.
+app.get('/internal/ads/overview', async (req, res) => {
+  if (!adminWriteAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const result = await ads.getAdsOverview({ since: req.query.since || null, until: req.query.until || null });
+    res.status(result.ok === false ? 400 : 200).json(result);
+  } catch (err) {
+    console.error('ads/overview failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/internal/ads/audiences', async (req, res) => {
+  if (!adminWriteAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const result = await ads.getAdAudiences();
+    res.status(result.ok === false ? 400 : 200).json(result);
+  } catch (err) {
+    console.error('ads/audiences failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Small shared wrapper for the four write routes below — same auth gate,
+// same confirm=1 handling, same try/catch shape; each just calls a
+// different ads.js function with its own body fields.
+function adsWriteRoute(fn) {
+  return async (req, res) => {
+    if (!adminWriteAuthOk(req)) return res.status(401).json({ error: 'unauthorized' });
+    try {
+      const result = await fn(req);
+      res.status(result.ok === false ? 400 : 200).json(result);
+    } catch (err) {
+      console.error('ads write failed:', err);
+      res.status(500).json({ error: err.message });
+    }
+  };
+}
+
+const adsConfirmed = req => req.query.confirm === '1';
+
+app.post('/internal/ads/pause', adsWriteRoute(req => ads.setAdsObjectStatus({
+  level: req.body && req.body.level, id: req.body && req.body.id, status: 'PAUSED', confirm: adsConfirmed(req)
+})));
+app.post('/internal/ads/enable', adsWriteRoute(req => ads.setAdsObjectStatus({
+  level: req.body && req.body.level, id: req.body && req.body.id, status: 'ACTIVE', confirm: adsConfirmed(req)
+})));
+app.post('/internal/ads/budget', adsWriteRoute(req => ads.updateAdsBudget({
+  level: req.body && req.body.level, id: req.body && req.body.id,
+  dailyBudgetInr: req.body && req.body.daily_budget_inr, confirm: adsConfirmed(req)
+})));
+app.post('/internal/ads/engagement-from-post', adsWriteRoute(req => ads.createEngagementFromPost({
+  campaignName: req.body && req.body.campaign_name,
+  postId: req.body && req.body.post_id,
+  audienceIds: (req.body && req.body.audience_ids) || [],
+  lookalikeFromAudienceId: (req.body && req.body.lookalike_from_audience_id) || null,
+  dailyBudgetInr: req.body && req.body.daily_budget_inr,
+  placements: (req.body && req.body.placements) || [],
+  goals: (req.body && req.body.goals) || [],
+  confirm: adsConfirmed(req)
+})));
+
 // Everyday path is Cowork calling /internal/publish-fb per row right after
 // it posts on Windsor — this cron only catches rows that fell through
 // (Cowork skipped/failed the call), gated like every other /cron/* route
@@ -5495,6 +5569,7 @@ app.get('/health', (req, res) => res.json({
     '/internal/documents-upload', '/internal/documents-download', '/internal/documents-bulk-fix-sharing',
     '/internal/sync-meta', '/internal/sync-google',
     '/internal/publish-fb', '/internal/team-daily-content',
+    '/internal/ads/overview', '/internal/ads/audiences', '/internal/ads/pause', '/internal/ads/enable', '/internal/ads/budget', '/internal/ads/engagement-from-post',
     '/cron/daily-digest', '/cron/stale-check', '/cron/visa-appointments', '/cron/booking-check', '/cron/eod-summary', '/cron/visa-intelligence-refresh', '/cron/refresh-exchange-rates', '/cron/fb-safety-crosspost'
   ]
 }));
